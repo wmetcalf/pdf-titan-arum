@@ -10,13 +10,15 @@
 </p>
 
 <p align="center">
-  🎵 <a href="https://suno.com/s/1ICR65q7HIpjFrLV">Theme song</a>
+  <a href="https://suno.com/s/1ICR65q7HIpjFrLV"><strong>🎵 &nbsp; Listen to the theme song &nbsp; 🎵</strong></a>
 </p>
 
 <p align="center">
+  <img src="docs/screenshot-job-list.png" alt="Job list" width="780">
+  <br><br>
   <img src="docs/screenshot-job-detail.png" alt="Job detail — AI threat analysis, screenshot, revision diff, URL table" width="780">
   <br><br>
-  <img src="docs/screenshot-job-list.png" alt="Job detail — document metadata and extracted artifacts" width="780">
+  <img src="docs/screenshot-job-detail2.png" alt="Job detail — document metadata, object hash, AI analysis, screenshot" width="780">
   <br><br>
   <img src="docs/screenshot-extracted-images.png" alt="Extracted images with phash, colorhash, SHA-256, and drawn image detection" width="780">
 </p>

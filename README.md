@@ -22,13 +22,13 @@
 | **Name**                    | pdf-titan-arum                         |
 | **Version**                 | 1.3.0                                 |
 | **Group**                   | com.oai                               |
-| **Creator**                 | coz                                   |
+| **Creator**                 | node5                                   |
 | **Generator**               | Claude Sonnet 4.6 (claude-sonnet-4-6) |
 | **Date Created**            | 2026-03-02                            |
 | **Last Modified**           | 2026-03-12                            |
 | **Days Since Creation**     | 10                                    |
 | **Days Since Last Modified**| 0                                     |
-| **License**                 | Private                               |
+| **License**                 | Apache 2.0                               |
 
 ---
 

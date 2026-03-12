@@ -17,6 +17,8 @@
   <img src="docs/screenshot-job-detail.png" alt="Job detail — AI threat analysis, screenshot, revision diff, URL table" width="780">
   <br><br>
   <img src="docs/screenshot-job-list.png" alt="Job detail — document metadata and extracted artifacts" width="780">
+  <br><br>
+  <img src="docs/screenshot-extracted-images.png" alt="Extracted images with phash, colorhash, SHA-256, and drawn image detection" width="780">
 </p>
 
 ---

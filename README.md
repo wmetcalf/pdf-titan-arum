@@ -13,6 +13,12 @@
   🎵 <a href="https://suno.com/s/1ICR65q7HIpjFrLV">Theme song</a>
 </p>
 
+<p align="center">
+  <img src="docs/screenshot-job-detail.png" alt="Job detail — AI threat analysis, screenshot, revision diff, URL table" width="780">
+  <br><br>
+  <img src="docs/screenshot-job-list.png" alt="Job detail — document metadata and extracted artifacts" width="780">
+</p>
+
 ---
 
 ## Metadata

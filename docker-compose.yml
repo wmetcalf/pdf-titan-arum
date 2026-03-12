@@ -1,0 +1,49 @@
+name: pdf-titan-arum
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: titanarum
+      POSTGRES_USER: titanarum
+      POSTGRES_PASSWORD: titanarum
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U titanarum"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db/titanarum
+      DB_USER: titanarum
+      DB_PASSWORD: titanarum
+      # PORT: 7272        # override listen port
+      # WORKERS: 4        # override worker thread count
+      # TIMEOUT: 60       # per-job timeout in seconds
+      # OCR_LANG: eng     # tesseract language(s), e.g. eng+deu+fra
+      # --- AI analysis (optional) ---
+      # Local model (e.g. llama.cpp / vLLM on the host):
+      # OPENAI_BASE_URL: http://host.docker.internal:8001/v1
+      # OPENAI_API_KEY: none
+      # OPENAI_MODEL: ""   # auto-detected from /v1/models if blank
+      # OpenAI:
+      # OPENAI_BASE_URL: https://api.openai.com/v1
+      # OPENAI_API_KEY: sk-...
+      # OPENAI_MODEL: gpt-5-nano
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "7272:7272"
+    volumes:
+      - artifacts:/data/artifacts
+
+volumes:
+  pgdata:
+  artifacts:

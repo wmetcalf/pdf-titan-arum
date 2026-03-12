@@ -1,0 +1,7 @@
+target/
+samples/
+output/
+fixedsamples/
+docs/
+*.md
+.git/

@@ -1,0 +1,146 @@
+{% extends "templates/layout.html" %}
+
+{% block title %}Jobs — pdf-titan-arum{% endblock %}
+
+{% block content %}
+<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px">
+  <h2 style="margin:0">Jobs</h2>
+  <form id="upload-form" style="display:flex; flex-direction:column; gap:6px; align-items:flex-end">
+    <div style="display:flex; gap:8px; align-items:center">
+      <input type="file" name="file" accept=".pdf" required style="color:#ccc">
+      <input type="password" name="password" placeholder="PDF password (optional)" autocomplete="off" style="color:#ccc; background:#111; border:1px solid #444; padding:2px 6px; border-radius:3px; font-size:12px; width:180px">
+      <button type="submit" class="btn">Submit PDF</button>
+    </div>
+    <details style="font-size:11px; color:#999; align-self:flex-end">
+      <summary style="cursor:pointer; user-select:none">Speed options</summary>
+      <div style="margin-top:6px; display:flex; flex-direction:column; gap:3px; padding-left:2px">
+        <label><input type="checkbox" name="skipScreenshots"> Skip screenshots &amp; URL crops</label>
+        <label><input type="checkbox" name="skipImages"> Skip image extraction</label>
+        <label><input type="checkbox" name="skipPhones"> Skip phone number extraction</label>
+        <label><input type="checkbox" name="skipPageExport"> Skip per-page PDF export</label>
+        <label><input type="checkbox" name="skipTextUrls"> Skip text-based URL extraction</label>
+        <label><input type="checkbox" name="skipQr"> Skip QR code detection</label>
+      </div>
+      <div style="margin-top:6px; display:flex; flex-direction:column; gap:3px; padding-left:2px; border-top:1px solid #333; padding-top:6px">
+        <label><input type="checkbox" name="ocrScreenshots"> OCR screenshots (Tesseract)</label>
+        <label><input type="checkbox" name="ocrUrlCrops"> OCR URL crops</label>
+        <label style="display:flex; gap:6px; align-items:center">
+          OCR language:
+          <input type="text" name="ocrLang" placeholder="eng" style="width:90px; color:#ccc; background:#111; border:1px solid #444; padding:1px 4px; border-radius:3px; font-size:11px">
+        </label>
+      </div>
+      <div style="margin-top:6px; display:flex; flex-direction:column; gap:3px; padding-left:2px; border-top:1px solid #333; padding-top:6px">
+        <label><input type="checkbox" name="addLinkAnnotations"> Add link annotations for bare URLs</label>
+        <label><input type="checkbox" name="noSkipBlanks"> Disable blank-page skipping</label>
+        <label style="display:flex; gap:6px; align-items:center">
+          DPI:
+          <input type="number" name="dpi" placeholder="150" min="50" max="600" style="width:60px; color:#ccc; background:#111; border:1px solid #444; padding:1px 4px; border-radius:3px; font-size:11px">
+        </label>
+        <label style="display:flex; gap:6px; align-items:center">
+          Pages:
+          <input type="text" name="pagesSpec" placeholder="default" style="width:90px; color:#ccc; background:#111; border:1px solid #444; padding:1px 4px; border-radius:3px; font-size:11px" title="e.g. 1-4,z  or  all">
+        </label>
+        <label style="display:flex; gap:6px; align-items:center">
+          Timeout (s):
+          <input type="number" name="timeoutSeconds" placeholder="server default" min="5" max="3600" style="width:80px; color:#ccc; background:#111; border:1px solid #444; padding:1px 4px; border-radius:3px; font-size:11px">
+        </label>
+      </div>
+    </details>
+  </form>
+</div>
+
+<script>
+document.getElementById('upload-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch('/api/jobs', {method:'POST', body: fd, headers: {'X-Requested-With': 'XMLHttpRequest'}});
+  const j = await r.json();
+  window.location.href = '/jobs/' + j.id;
+});
+</script>
+
+<table id="job-table">
+  <thead>
+    <tr>
+      <th>Filename</th>
+      <th>Submitted</th>
+      <th>Status</th>
+      <th>Pages</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for job in jobs %}
+    <tr>
+      <td><a href="/jobs/{{ job.id }}">{{ job.filename }}</a></td>
+      <td>{{ job.submittedAt }}</td>
+      <td><span class="badge {{ job.status }}">{{ job.status }}</span></td>
+      <td style="font-size:12px; white-space:nowrap">
+        {% if job.pageCount is not null %}
+          {{ job.pageCount }}p
+          {% if job.blankRatio is not null and job.blankRatio > 0 %}
+            <span style="color:{% if job.blankRatio >= 0.5 %}#f90{% else %}#888{% endif %}" title="{{ job.blankPageCount }} blank of {{ job.pageCount }} pages">
+              {{ job.blankRatio | numberformat("0%") }} blank
+            </span>
+          {% endif %}
+        {% endif %}
+      </td>
+      <td>
+        {% if job.aiThreatLevel is not null %}<span class="badge {% if job.aiThreatLevel == 'malicious' %}failed{% elseif job.aiThreatLevel == 'likely_phishing' %}failed{% elseif job.aiThreatLevel == 'suspicious' %}processing{% else %}done{% endif %}" title="AI: {{ job.aiThreatLevel }}">{{ job.aiThreatLevel }}{% if job.aiScore is not null %} {{ job.aiScore }}{% endif %}</span> {% endif %}
+        {% if job.urlCount is not null and job.urlCount > 0 %}<span class="badge" style="background:#1a2a3a; color:#7eb3f5" title="{{ job.urlCount }} URLs">{{ job.urlCount }} url{% if job.urlCount != 1 %}s{% endif %}</span> {% endif %}
+        {% if job.jsCount is not null %}<span class="badge" style="background:#3a2a00; color:#ffd" title="{{ job.jsCount }} JavaScript blocks">{{ job.jsCount }} js</span> {% endif %}
+        {% if job.embeddedCount is not null %}<span class="badge" style="background:#2a1a3a; color:#d4a8ff" title="{{ job.embeddedCount }} embedded files">{{ job.embeddedCount }} embed</span> {% endif %}
+        {% if job.revisionCount is not null %}<span class="badge" style="background:#1a2a1a; color:#8f8" title="{{ job.revisionCount }} revisions">{{ job.revisionCount }} rev</span> {% endif %}
+        {% if job.hasQr %}<span class="badge" style="background:#6a0dad; color:#fff" title="QR code detected">QR</span> {% endif %}
+        {% if job.hasEmails %}<span class="badge" style="background:#1a5276; color:#aed6f1" title="Email addresses found">email</span> {% endif %}
+        {% if job.hasSuspiciousOcg %}<span class="badge" style="background:#7b1010; color:#ffaaaa" title="Suspicious hidden layers">OCG!</span>{% elseif job.hasOcg %}<span class="badge" style="background:#333; color:#aaa" title="Optional content layers">OCG</span>{% endif %}
+        <a class="btn" href="/jobs/{{ job.id }}">View</a>
+        {% if job.status == "done" %}
+        <a class="btn" href="/api/jobs/{{ job.id }}/download">ZIP</a>
+        {% endif %}
+        <button class="btn btn-danger"
+          hx-delete="/api/jobs/{{ job.id }}"
+          hx-confirm="Delete job {{ job.filename }}?"
+          hx-target="closest tr"
+          hx-swap="outerHTML">Delete</button>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if jobs | length == 0 %}
+<p style="color:#666">No jobs yet. Submit a PDF above.</p>
+{% endif %}
+
+{% if totalPages > 1 %}
+<div style="display:flex; gap:4px; align-items:center; margin-top:12px; flex-wrap:wrap">
+  {% if page > 0 %}
+  <a class="btn" href="/?page=0{% if statusFilter %}&status={{ statusFilter }}{% endif %}">&#171; First</a>
+  <a class="btn" href="/?page={{ page - 1 }}{% if statusFilter %}&status={{ statusFilter }}{% endif %}">&#8592; Prev</a>
+  {% else %}
+  <span class="btn" style="opacity:0.3; cursor:default">&#171; First</span>
+  <span class="btn" style="opacity:0.3; cursor:default">&#8592; Prev</span>
+  {% endif %}
+
+  {% for p in range(0, totalPages) %}
+    {% if p == page %}
+    <span class="btn" style="background:#555; cursor:default">{{ p + 1 }}</span>
+    {% elseif p == 0 or p == totalPages - 1 or (p >= page - 2 and p <= page + 2) %}
+    <a class="btn" href="/?page={{ p }}{% if statusFilter %}&status={{ statusFilter }}{% endif %}">{{ p + 1 }}</a>
+    {% elseif p == 1 or p == totalPages - 2 %}
+    <span style="color:#666; padding:0 2px">…</span>
+    {% endif %}
+  {% endfor %}
+
+  {% if page < totalPages - 1 %}
+  <a class="btn" href="/?page={{ page + 1 }}{% if statusFilter %}&status={{ statusFilter }}{% endif %}">Next &#8594;</a>
+  <a class="btn" href="/?page={{ totalPages - 1 }}{% if statusFilter %}&status={{ statusFilter }}{% endif %}">Last &#187;</a>
+  {% else %}
+  <span class="btn" style="opacity:0.3; cursor:default">Next &#8594;</span>
+  <span class="btn" style="opacity:0.3; cursor:default">Last &#187;</span>
+  {% endif %}
+  <span style="color:#666; font-size:11px; margin-left:4px">{{ totalCount }} total</span>
+</div>
+{% endif %}
+{% endblock %}

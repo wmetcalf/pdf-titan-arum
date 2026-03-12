@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}pdf-titan-arum{% endblock %}</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <script src="/htmx.min.js"></script>
+  <style>
+    body { font-family: monospace; font-size: 13px; margin: 0; background: #1a1a1a; color: #e0e0e0; }
+    a { color: #7eb3f5; }
+    nav { background: #111; padding: 8px 16px; border-bottom: 1px solid #333; }
+    nav a { color: #ccc; text-decoration: none; margin-right: 16px; }
+    main { padding: 16px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #333; padding: 6px 10px; text-align: left; }
+    th { background: #252525; }
+    tr:hover td { background: #222; }
+    .badge { padding: 2px 8px; border-radius: 3px; font-size: 11px; }
+    .pending  { background: #444; }
+    .processing { background: #5a4a00; color: #ffd; }
+    .done     { background: #1a3a1a; color: #8f8; }
+    .failed   { background: #3a1a1a; color: #f88; }
+    .btn { padding: 4px 10px; border: 1px solid #555; background: #333; color: #ccc;
+           cursor: pointer; text-decoration: none; font-size: 12px; }
+    .btn:hover { background: #444; }
+    .btn-danger { border-color: #833; color: #f88; }
+    .btn-danger:hover { background: #3a1a1a; }
+    pre { background: #111; padding: 10px; overflow-x: auto; font-size: 11px; }
+    img.screenshot { max-width: 100%; border: 1px solid #444; margin: 4px 0; }
+    .section { margin-top: 20px; }
+    h2 { font-size: 14px; border-bottom: 1px solid #333; padding-bottom: 4px; color: #aaa; }
+  </style>
+</head>
+<body>
+  <nav style="display:flex; align-items:center; gap:10px">
+    <img src="/favicon-32.png" style="width:24px;height:24px;object-fit:cover;border-radius:3px;vertical-align:middle">
+    <a href="/">pdf-titan-arum</a>
+    <span style="color:#555">| jobs</span>
+  </nav>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

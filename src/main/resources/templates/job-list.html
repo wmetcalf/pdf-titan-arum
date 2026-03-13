@@ -50,13 +50,22 @@
 </div>
 
 <script>
-document.getElementById('upload-form').addEventListener('submit', async e => {
+document.getElementById('upload-form').onsubmit = async function(e) {
   e.preventDefault();
-  const fd = new FormData(e.target);
-  const r = await fetch('/api/jobs', {method:'POST', body: fd, headers: {'X-Requested-With': 'XMLHttpRequest'}});
-  const j = await r.json();
-  window.location.href = '/jobs/' + j.id;
-});
+  const btn = this.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  try {
+    const fd = new FormData(this);
+    const r = await fetch('/api/jobs', {method:'POST', body: fd, headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    if (!r.ok) { const err = await r.text(); alert('Upload failed: ' + err); return; }
+    const j = await r.json();
+    window.location.href = '/jobs/' + j.id;
+  } catch(err) {
+    alert('Upload error: ' + err);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Submit PDF';
+  }
+};
 </script>
 
 <table id="job-table">

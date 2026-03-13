@@ -64,7 +64,24 @@ public class ServerCommand implements Callable<Integer> {
         hikariCfg.setUsername(dbUser);
         hikariCfg.setPassword(dbPassword);
         hikariCfg.setMaximumPoolSize(workerCount + 4);
+        hikariCfg.setInitializationFailTimeout(-1); // don't fail on first connect; we retry below
+
         HikariDataSource ds = new HikariDataSource(hikariCfg);
+
+        // Retry DB connection — K8s sidecar postgres may not be ready yet
+        for (int attempt = 1; attempt <= 30; attempt++) {
+            try (var conn = ds.getConnection()) {
+                System.out.println("Database connected (attempt " + attempt + ")");
+                break;
+            } catch (Exception e) {
+                if (attempt == 30) {
+                    System.err.println("FATAL: could not connect to database after 30 attempts");
+                    throw e;
+                }
+                System.err.println("Waiting for database (attempt " + attempt + "/30): " + e.getMessage());
+                Thread.sleep(2000);
+            }
+        }
 
         Flyway.configure()
               .dataSource(ds)
@@ -111,7 +128,7 @@ public class ServerCommand implements Callable<Integer> {
         WebRoutes.wire(app, repo);
 
         app.before(ctx -> {
-            ctx.header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'");
+            ctx.header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; style-src 'self' 'unsafe-inline'");
             ctx.header("X-Content-Type-Options", "nosniff");
             ctx.header("X-Frame-Options", "DENY");
         });

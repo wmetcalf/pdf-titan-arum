@@ -1365,9 +1365,9 @@ private boolean skipQrScan;
         {"[.\\['\"]execMenuItem", "app.execMenuItem", "Executes a menu item programmatically (privilege escalation vector)"},
         // File/data operations
         {"[.\\['\"]exportDataObject", "exportDataObject", "Exports embedded file to disk (used to drop malware payloads)"},
-        {"nLaunch\\s*[,:=]\\s*0", "nLaunch_save", "nLaunch:0 — saves embedded file to disk via save dialog"},
-        {"nLaunch\\s*[,:=]\\s*1", "nLaunch_open", "nLaunch:1 — saves and opens file with default system handler (blocked in modern Reader)"},
-        {"nLaunch\\s*[,:=]\\s*2", "nLaunch_autolaunch", "nLaunch:2 — auto-launches dropped file without user confirmation (blocked in modern Reader)"},
+        {"nLaunch\\s*[,:=]\\s*0\\b", "nLaunch_save", "nLaunch:0 — saves embedded file to disk via save dialog"},
+        {"nLaunch\\s*[,:=]\\s*1\\b", "nLaunch_open", "nLaunch:1 — saves and opens file with default system handler (blocked in modern Reader)"},
+        {"nLaunch\\s*[,:=]\\s*2\\b", "nLaunch_autolaunch", "nLaunch:2 — auto-launches dropped file without user confirmation (blocked in modern Reader)"},
         {"[.\\['\"]submitForm|submitForm\\s*\\(", "submitForm", "Submits form data to an external URL (data exfiltration)"},
         // Heap spray / shellcode indicators
         {"unescape\\s*\\(['\"]%u|unescape[;,]|['\"]%u[0-9a-fA-F]{4}%u", "unescape_heap_spray", "Heap spray via unescape with Unicode escapes — shellcode injection technique"},

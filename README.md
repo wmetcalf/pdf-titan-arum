@@ -325,11 +325,77 @@ Each hit saved as a `.js.txt` artifact with SHA-256.
 - Extracts `<script>` blocks with their `contentType` (JavaScript, FormCalc, etc.)
 - Each script saved as artifact with SHA-256
 
+### Exploit Detection
+
+#### JavaScript Indicators (`jsIndicators`)
+Pattern-matched analysis of all extracted JavaScript and XFA scripts (case-insensitive, matches both dot and bracket notation):
+
+| Category | Indicators |
+|----------|-----------|
+| **CVE-2026-34261 chain** | `SOAP.streamDecode`, `RSS.addFeed/getFeed`, `util.readFileIntoStream`, `util.streamFromString/stringFromStream`, `getField`, `app.beginPriv`, `global.exec` |
+| **Classic exploit APIs** | `doc.media.newPlayer` (CVE-2009-4324), `Collab.getIcon` (CVE-2009-0927), `Collab.collectEmailInfo` (CVE-2007-5659), `spell.customDictionaryOpen` (CVE-2007-5659), `util.printf` (CVE-2008-2992), `app.launchURL`, `app.execMenuItem` |
+| **Shellcode / obfuscation** | `unescape("%uXXXX")` heap spray, `String.fromCharCode` shellcode assembly, JSEff obfuscation (5+ tokens), `eval()`, prototype pollution |
+| **File / data ops** | `exportDataObject` with `nLaunch:0/1/2` differentiation, `submitForm` |
+| **Annotation manipulation** | `getAnnot`/`addAnnot`/`destroy` (CVE-2023-21608, CVE-2024-41869 UAF triggers) |
+| **XFA host APIs** | `xfa.host.exportData/importData/gotoURL` (CVE-2013-0640 sandbox escape) |
+
+Also analyzed: decoded form-field payloads (base64-in-Name technique).
+
+#### Structural Exploit Checks
+
+| Check | Detects |
+|-------|---------|
+| **FontMatrix injection** | CVE-2024-4367 — parenthesized strings in `/FontMatrix` arrays (PDF.js XSS). Raw-byte scan; PDFBox can't parse the malformed arrays. |
+| **XFA ImageField exploit** | CVE-2010-0188 — `topmostSubform` + `ImageField` pattern used to embed malformed TIFF images |
+| **Flash/RichMedia** | `/Subtype /RichMedia` or `/Subtype /Flash` annotations (SWF embeds, CVE-2009-1862) |
+| **UNC path actions** | GoToE/GoToR with `\\server\share`, `\url`, or `file:` scheme — NTLM credential theft (CVE-2018-4993) |
+
+#### CVE-2026-34261 Composite Detection
+Fires when the full exploit chain is present:
+1. Hidden Btn form field with base64-encoded Name value (payload storage)
+2. Trigger JS with `getField()` reading the field
+3. Decoded payload using `RSS.addFeed` for C2 (the defining mechanism)
+
+#### Suspicious Form Fields (`formFields`)
+- Extracts all AcroForm fields: name, type, annotation rectangle
+- Flags hidden fields (zero-area rect) and fields with base64 payloads stored as PDF Name values
+- Automatically base64-decodes payloads and saves as artifacts
+- Detects `#XX` hex escapes in Name values (the PDF Name encoding used to smuggle base64 `/` characters)
+
 ### Embedded Files
 - Name-tree embedded files (`/EmbeddedFiles`)
 - File attachment annotations (`/Filespec`)
 - All file types saved regardless of MIME type (up to configurable size limit)
 - SHA-256 on raw file bytes, MIME type detection via declared subtype or `Files.probeContentType`
+- **File magic detection**: identifies PE executables, ELF, Mach-O, ZIP, RAR, 7z, ISO, VHD/VHDX, LNK, Cabinet, OLE2, RTF, and more from content bytes
+- **MIME type mismatch flagging**: reports when declared type differs from actual content (e.g. `application/pdf` that's actually a Windows PE executable)
+- **Filename extension mismatch**: flags when extension doesn't match content (document extensions hiding executables: OOXML, Legacy Office, OpenDocument, RTF, XPS, PDF)
+- **Executable dropper detection**: composite indicator when `exportDataObject` drops a disguised executable
+- **Deduplication**: identical name-tree entries (same name + SHA-256) collapsed into single hit with `duplicateCount`
+
+### Anomaly Detection
+
+#### Stream Length Anomalies (`streamLengthAnomalies`)
+Compares declared `/Length` values in stream dictionaries against actual byte counts:
+- `truncated` — actual length shorter than declared (data missing or parser confusion)
+- `overflow` — actual length longer than declared (appended data)
+- `missing_endstream` — no `endstream` keyword found (stream boundary broken)
+
+Tolerance: ±1 byte. XRef streams excluded (intentionally variable).
+
+#### Structural Anomalies (`structuralAnomalies`)
+- `header_offset` — `%PDF` header not at byte 0 (embedded content / prepended junk)
+- `invalid_version` — PDF version not matching `1.x` or `2.x` format
+- `missing_binary_comment` — no binary comment line after header
+- `malformed_binary_comment` — binary comment has fewer than 4 high-byte characters
+- `missing_eof` — no `%%EOF` marker found
+- `data_after_eof` — significant trailing data after last `%%EOF` (appended/injected content)
+
+#### Metadata Spoofing Indicators (`metadataSpoofingIndicators`)
+- `predates_pdf_format` — creation date before June 1993 (PDF didn't exist yet)
+- `future_creation_date` / `future_modification_date` — timestamps in the future
+- `creation_after_modification` — logical inconsistency
+- `tool_mismatch` — creator/producer combination that contradicts itself (e.g. "Microsoft Word" creator with "LibreOffice" producer)
 
 ### Launch Actions
 - `/Launch` actions (Win32 `app`/`params`/`dir`, Unix, Mac subtypes)
@@ -395,6 +461,7 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
     <filename>                             # Embedded file attachments
   scripts/
     <context>.js.txt                       # JavaScript artifacts
+    field-<name>-decoded.js.txt            # Base64-decoded form field payloads
   xfa/
     xfa-script-0.txt
   launch_actions/
@@ -434,6 +501,11 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 | `pagePdfs`        | array  | `PagePdfArtifact[]`                                  |
 | `pageTexts`       | array  | Per-page extracted text (first N processed pages)    |
 | `ocgLayers`       | array  | `OcgLayer[]` — optional content groups / hidden layers |
+| `formFields`      | array  | `FormFieldHit[]` — suspicious AcroForm fields (hidden, base64 payloads, Name value encoding) |
+| `jsIndicators`    | array  | `JsIndicatorHit[]` — suspicious JS APIs, obfuscation, structural exploit patterns, CVE composite detections |
+| `streamLengthAnomalies` | array | `StreamLengthHit[]` — declared vs actual stream length mismatches |
+| `structuralAnomalies` | array | `StructuralAnomalyHit[]` — header offset, missing binary comment, data after EOF, etc. |
+| `metadataSpoofingIndicators` | array | `MetadataSpoofingHit[]` — future dates, creation after modification, tool mismatch |
 | `parseError`      | string | Set if the PDF could not be fully parsed (e.g. wrong password, corrupt structure) |
 | `timedOut`        | bool   | `true` if job hit the timeout limit (partial results) |
 | `timedOutAfterMs` | number | Elapsed ms when timeout triggered                    |

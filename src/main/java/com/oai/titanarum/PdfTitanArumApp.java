@@ -2026,6 +2026,23 @@ private boolean skipQrScan;
                 ".reg", ".rgs", ".sct", ".shb", ".psc1", ".application");
             Set<String> archiveExts = Set.of(".zip", ".rar", ".7z", ".cab", ".tar", ".gz",
                 ".iso", ".vhd", ".vhdx", ".img", ".dmg", ".wim");
+            // Document extensions — used to detect when a PE/archive masquerades as a document
+            Set<String> docExts = Set.of(
+                // OOXML
+                ".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".xltm", ".xlsb",
+                ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm",
+                // Legacy Office
+                ".doc", ".dot", ".xls", ".xlt", ".ppt", ".pps", ".pot",
+                // OpenDocument
+                ".odt", ".ott", ".fodt", ".ods", ".ots", ".fods", ".odp", ".otp", ".fodp",
+                ".odg", ".otg", ".fodg",
+                // Text/Markup
+                ".rtf", ".txt", ".csv", ".md",
+                // XPS
+                ".xps", ".oxps",
+                // PDF
+                ".pdf"
+            );
             String ext = nameLower.contains(".") ? nameLower.substring(nameLower.lastIndexOf('.')) : "";
             if (isExe) {
                 extMatchesContent = exeExts.contains(ext);
@@ -2033,8 +2050,13 @@ private boolean skipQrScan;
                 extMatchesContent = archiveExts.contains(ext);
             }
             if (!extMatchesContent) {
-                hit.mimeTypeMismatch = "filename '" + hit.originalName
-                    + "' has misleading extension — actual content is " + fileMagic;
+                if (docExts.contains(ext)) {
+                    hit.mimeTypeMismatch = "filename '" + hit.originalName
+                        + "' uses document extension but actual content is " + fileMagic;
+                } else {
+                    hit.mimeTypeMismatch = "filename '" + hit.originalName
+                        + "' has misleading extension — actual content is " + fileMagic;
+                }
             }
         }
         // Always report detected type and magic when content is executable or type mismatches

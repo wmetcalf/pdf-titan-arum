@@ -284,7 +284,7 @@ private boolean skipQrScan;
                     .analyze(report, inputPdf.getFileName().toString(), screenshotsDir);
             } catch (Exception e) {
                 System.err.println("AI analysis failed: " + e.getMessage());
-                report.aiAnalysis = java.util.Map.of("error", e.getMessage());
+                report.aiAnalysis = java.util.Map.of("error", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
             }
             // Re-write report.json with AI results (success or error)
             mapper.writeValue(outputDir.resolve("report.json").toFile(), report);

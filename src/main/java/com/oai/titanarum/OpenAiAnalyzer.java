@@ -404,6 +404,72 @@ public class OpenAiAnalyzer {
             }
         }
 
+        // JS indicators (exploit APIs, obfuscation, CVE detections)
+        if (report.jsIndicators != null && !report.jsIndicators.isEmpty()) {
+            sb.append("\n=== JS / EXPLOIT INDICATORS (").append(report.jsIndicators.size()).append(") ===\n");
+            for (var ji : report.jsIndicators) {
+                sb.append("  [").append(ji.type).append("] ").append(ji.indicator);
+                if (ji.count != null && ji.count > 1) sb.append(" (x").append(ji.count).append(")");
+                sb.append(" — ").append(ji.detail).append("\n");
+            }
+        }
+
+        // Suspicious form fields
+        if (report.formFields != null && !report.formFields.isEmpty()) {
+            sb.append("\n=== SUSPICIOUS FORM FIELDS (").append(report.formFields.size()).append(") ===\n");
+            for (var ff : report.formFields) {
+                sb.append("  field='").append(ff.name).append("' type=").append(ff.fieldType);
+                if (ff.flags != null) sb.append(" flags=").append(ff.flags);
+                if (ff.decodedLength != null) sb.append(" decodedPayload=").append(ff.decodedLength).append("bytes");
+                sb.append("\n");
+            }
+        }
+
+        // Structural anomalies
+        if (report.structuralAnomalies != null && !report.structuralAnomalies.isEmpty()) {
+            sb.append("\n=== STRUCTURAL ANOMALIES (").append(report.structuralAnomalies.size()).append(") ===\n");
+            for (var a : report.structuralAnomalies) {
+                sb.append("  ").append(a.type);
+                if (a.detail != null) sb.append(": ").append(a.detail);
+                sb.append("\n");
+            }
+        }
+
+        // Metadata spoofing
+        if (report.metadataSpoofingIndicators != null && !report.metadataSpoofingIndicators.isEmpty()) {
+            sb.append("\n=== METADATA SPOOFING (").append(report.metadataSpoofingIndicators.size()).append(") ===\n");
+            for (var m : report.metadataSpoofingIndicators) {
+                sb.append("  ").append(m.type);
+                if (m.detail != null) sb.append(": ").append(m.detail);
+                sb.append("\n");
+            }
+        }
+
+        // Stream length anomalies (summarized)
+        if (report.streamLengthAnomalies != null && !report.streamLengthAnomalies.isEmpty()) {
+            sb.append("\n=== STREAM LENGTH ANOMALIES (").append(report.streamLengthAnomalies.size()).append(") ===\n");
+            for (var s : report.streamLengthAnomalies) {
+                sb.append("  ").append(s.anomalyType);
+                if (s.objectNumber != null) sb.append(" obj=").append(s.objectNumber);
+                if (s.declaredLength != null) sb.append(" declared=").append(s.declaredLength);
+                if (s.actualLength != null) sb.append(" actual=").append(s.actualLength);
+                sb.append("\n");
+            }
+        }
+
+        // Embedded file enrichment (magic, mismatch, dropper)
+        if (report.embeddedFiles != null) {
+            for (var ef : report.embeddedFiles) {
+                if (ef.fileMagic != null || ef.mimeTypeMismatch != null) {
+                    sb.append("\n=== EMBEDDED FILE ALERT ===\n");
+                    sb.append("  name='").append(ef.originalName).append("'");
+                    if (ef.fileMagic != null) sb.append(" actualType=").append(ef.fileMagic);
+                    if (ef.mimeTypeMismatch != null) sb.append(" MISMATCH: ").append(ef.mimeTypeMismatch);
+                    sb.append("\n");
+                }
+            }
+        }
+
         return sb.toString();
     }
 }

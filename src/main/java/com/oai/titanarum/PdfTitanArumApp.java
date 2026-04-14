@@ -474,7 +474,99 @@ private boolean skipQrScan;
             report.xfaScripts.addAll(extractXfaScripts(document, xfaDir));
             report.embeddedFiles.addAll(extractNamedEmbeddedFiles(document, attachmentsDir));
             report.embeddedFiles.addAll(extractFileAttachmentAnnotations(document, attachmentsDir, pagesToProcess));
+            // Collapse duplicate embedded files (same originalName + sha256) into a single
+            // hit with a duplicateCount — avoids bloating the report when a name tree has
+            // hundreds of entries pointing to the same file spec.
+            {
+                Map<String, EmbeddedFileHit> seen = new LinkedHashMap<>();
+                for (EmbeddedFileHit ef : report.embeddedFiles) {
+                    String key = (ef.originalName != null ? ef.originalName : "") + "|" + (ef.sha256 != null ? ef.sha256 : "");
+                    EmbeddedFileHit existing = seen.get(key);
+                    if (existing != null) {
+                        existing.duplicateCount = (existing.duplicateCount != null ? existing.duplicateCount : 1) + 1;
+                    } else {
+                        seen.put(key, ef);
+                    }
+                }
+                report.embeddedFiles = new ArrayList<>(seen.values());
+            }
             checkInterrupted();
+
+            // CVE-2026-34261 detection: form-field payloads, suspicious JS APIs, JSEff
+            { List<FormFieldHit> ff = extractFormFields(document, scriptsDir); if (!ff.isEmpty()) report.formFields = ff; }
+            {
+                // Analyze trigger JS and XFA scripts for indicators
+                List<JsIndicatorHit> ji = analyzeJavaScriptIndicators(report.javascript, report.xfaScripts);
+                // Flag GoToE/GoToR actions with UNC or file: paths (NTLM credential theft)
+                for (ActionHit a : report.actions) {
+                    String rf = a.remoteFile;
+                    if (("GoToE".equals(a.type) || "GoToR".equals(a.type)) && rf != null) {
+                        boolean isUnc = rf.startsWith("\\\\") || rf.startsWith("\\")
+                            || rf.regionMatches(true, 0, "file:", 0, 5);
+                        if (isUnc) {
+                            JsIndicatorHit unc = new JsIndicatorHit();
+                            unc.context = a.context;
+                            unc.type = "suspicious_action";
+                            unc.indicator = "unc_path_" + a.type.toLowerCase();
+                            unc.detail = a.type + " action references remote/UNC path '" + rf
+                                + "' — may force SMB authentication to attacker-controlled server for NTLM credential theft";
+                            unc.count = 1;
+                            ji.add(unc);
+                        }
+                    }
+                    // Also check URI actions for file: scheme
+                    if ("URI".equals(a.type) && a.target != null
+                            && a.target.regionMatches(true, 0, "file:", 0, 5)) {
+                        JsIndicatorHit furi = new JsIndicatorHit();
+                        furi.context = a.context;
+                        furi.type = "suspicious_action";
+                        furi.indicator = "file_uri_action";
+                        furi.detail = "URI action uses file: scheme '" + a.target
+                            + "' — may access local files or force SMB authentication via UNC";
+                        furi.count = 1;
+                        ji.add(furi);
+                    }
+                }
+                // Also analyze decoded form-field payloads (the *actual* exploit code)
+                if (report.formFields != null) {
+                    for (FormFieldHit ff : report.formFields) {
+                        if (ff.decodedArtifact != null) {
+                            try {
+                                String decoded = Files.readString(outputDir.resolve(ff.decodedArtifact), StandardCharsets.UTF_8);
+                                analyzeCodeIndicators(decoded, "formField[" + ff.name + "].decodedPayload", ji);
+                            } catch (IOException ignored) {}
+                        }
+                    }
+                }
+                // Check for executable dropper: exportDataObject + embedded PE/archive with misleading name
+                boolean hasExportData = ji.stream().anyMatch(j -> "exportDataObject".equals(j.indicator));
+                if (hasExportData) {
+                    for (EmbeddedFileHit ef : report.embeddedFiles) {
+                        if (ef.mimeTypeMismatch != null || ef.fileMagic != null) {
+                            JsIndicatorHit drop = new JsIndicatorHit();
+                            drop.context = ef.context;
+                            drop.type = "executable_dropper";
+                            drop.indicator = "embedded_exe_dropper";
+                            String magic = ef.fileMagic != null ? ef.fileMagic : "unknown";
+                            drop.detail = "PDF drops disguised executable via exportDataObject: '"
+                                + ef.originalName + "' is actually " + magic
+                                + " (MITRE ATT&CK T1204.002 — User Execution: Malicious File)";
+                            drop.count = 1;
+                            ji.add(drop);
+                            break;
+                        }
+                    }
+                }
+                // Structural exploit checks
+                checkFontMatrixInjection(pdfBytes, ji);     // CVE-2024-4367
+                checkXfaImageFieldExploit(document, ji);    // CVE-2010-0188
+                checkFlashRichMedia(document, ji);           // Flash/SWF embeds
+                // GoToE in page /AA is now handled by extractActions (checks all pages)
+                // CVE-2026-34261 composite detection: check if all attack elements are present
+                checkCve202634261(report, ji);
+                if (!ji.isEmpty()) report.jsIndicators = ji;
+            }
+            profTick(_pt, "form fields + JS indicators");
 
             for (JavaScriptHit js : report.javascript) {
                 report.urls.addAll(extractUrlsFromCode(js.code, "javascript", null));
@@ -1222,6 +1314,572 @@ private boolean skipQrScan;
         return hits;
     }
 
+    // ---------------------------------------------------------------------------
+    //  CVE-2026-34621 detection: form-field payloads, suspicious JS APIs, JSEff
+    // ---------------------------------------------------------------------------
+
+    private static final Pattern JSEFF_TOKEN = Pattern.compile(
+        "\\(\\{\\}\\+\\[\\]\\)|\\(!\\!\\[\\]\\+\\[\\]\\)|\\(\\+!\\+\\[\\]\\+\\[\\]\\)|\\(!\\[\\]\\+\\[\\]\\)|\\(\\[\\]\\[\\[\\]\\]\\+\\[\\]\\)|\\(!\\+\\[\\]/\\+\\[\\]\\+\\[\\]\\)");
+    private static final int JSEFF_THRESHOLD = 5;
+
+    /** Minimum Name-value length (after unescaping) to attempt base64 decode. */
+    private static final int MIN_BASE64_NAME_LEN = 40;
+
+    private static final Pattern PDF_NAME_HEX_ESCAPE = Pattern.compile("#([0-9a-fA-F]{2})");
+
+    /**
+     * Suspicious Acrobat JavaScript API patterns — each entry is
+     * {regex, indicator-id, human-readable description}.
+     */
+    // Each pattern uses [.\\['\"] as a prefix anchor — this matches dot notation (SOAP.streamDecode),
+    // bracket notation (SOAP['streamDecode']), and bare string literals in obfuscation lookup
+    // tables ('streamDecode') in a single alternative without redundancy.
+    // For method names unique enough to not false-positive (e.g. streamDecode, addFeed),
+    // just [.\\['\"]{methodName} suffices.  For generic names (connect, exec, request),
+    // we anchor to the object name as well.
+    private static final String[][] SUSPICIOUS_JS_APIS = {
+        // CVE-2026-34261 exploit chain APIs
+        {"[.\\['\"]streamDecode", "SOAP.streamDecode", "Decodes stream data (used to base64-decode payloads)"},
+        {"[.\\['\"]addFeed", "RSS.addFeed", "Adds an RSS feed (used for C2 communication and code injection)"},
+        {"[.\\['\"]getFeed", "RSS.getFeed", "Retrieves RSS feed data from a remote server"},
+        {"[.\\['\"]readFileIntoStream", "util.readFileIntoStream", "Reads arbitrary local files into a stream"},
+        {"[.\\['\"]streamFromString", "util.streamFromString", "Converts a string to a stream (used in decode chains)"},
+        {"[.\\['\"]stringFromStream", "util.stringFromStream", "Converts a stream to a string (used in decode chains)"},
+        {"[.\\['\"]beginPriv", "app.beginPriv", "Enters privileged execution context"},
+        {"\\bgetField\\s*\\(", "getField", "Reads form field values (used to retrieve hidden payloads)"},
+        // Network APIs (anchor to object name since method names are generic)
+        {"\\bSOAP[.\\[]", "SOAP", "SOAP web services API (network access, stream decode)"},
+        {"\\bNet[.\\['\"]\\s*HTTP", "Net.HTTP", "Makes HTTP requests to external servers"},
+        {"[.\\['\"]collabDesktop", "collabDesktop", "Desktop collaboration API (privilege escalation vector)"},
+        // Delayed/dynamic execution
+        {"app[.\\['\"]\\s*set(?:Timeout|Interval)", "app.setTimeoutOrInterval", "Schedules delayed code execution (eval-like when passed a string)"},
+        {"global[.\\['\"]\\s*exec\\s*['\"]?\\]?\\s*\\(", "global.exec", "Executes a method on a global object by name (privilege escalation technique)"},
+        {"\\beval\\s*\\(", "eval", "Dynamic code execution via eval() — used to evade static detection of exploit APIs"},
+        // Classic exploit trigger APIs
+        {"[.\\['\"]newPlayer", "doc.media.newPlayer", "Creates a media player object (CVE-2009-4324 use-after-free trigger)"},
+        {"[.\\['\"]getIcon", "Collab.getIcon", "Gets a collaboration icon (CVE-2009-0927 stack buffer overflow trigger)"},
+        {"[.\\['\"]collectEmailInfo", "Collab.collectEmailInfo", "Collects email info (CVE-2007-5659 buffer overflow trigger)"},
+        {"[.\\['\"]customDictionaryOpen", "spell.customDictionaryOpen", "Opens custom dictionary (CVE-2007-5659 heap overflow trigger)"},
+        {"[.\\['\"]printf\\b", "util.printf", "Formats a string (CVE-2008-2992 stack buffer overflow when given oversized format string)"},
+        {"[.\\['\"]launchURL", "app.launchURL", "Launches a URL in the system browser (used for drive-by downloads)"},
+        {"[.\\['\"]execMenuItem", "app.execMenuItem", "Executes a menu item programmatically (privilege escalation vector)"},
+        // File/data operations
+        {"[.\\['\"]exportDataObject", "exportDataObject", "Exports embedded file to disk (used to drop malware payloads)"},
+        {"[.\\['\"]submitForm|submitForm\\s*\\(", "submitForm", "Submits form data to an external URL (data exfiltration)"},
+        // Heap spray / shellcode indicators
+        {"unescape\\s*\\(['\"]%u|unescape[;,]|['\"]%u[0-9a-fA-F]{4}%u", "unescape_heap_spray", "Heap spray via unescape with Unicode escapes — shellcode injection technique"},
+        {"String\\.fromCharCode|fromCharCode\\s*\\(", "fromCharCode", "Constructs strings from char codes (shellcode assembly / obfuscation)"},
+        // Prototype pollution / generator function abuse
+        {"Object\\.getPrototypeOf\\s*\\(\\s*function\\s*\\*|constructor\\s*=\\s*null", "prototype_pollution", "Prototype pollution via generator function constructor — sandbox escape technique"},
+        // Annotation manipulation (CVE-2023-21608, CVE-2024-41869)
+        {"[.\\['\"](?:getAnnot|addAnnot|destroy)\\s*\\(", "annotation_manipulation", "Manipulates PDF annotations (trigger for UAF exploits like CVE-2023-21608, CVE-2024-41869)"},
+        // XFA host APIs (CVE-2013-0640 sandbox escape)
+        {"xfa\\.host\\.(?:exportData|importData|gotoURL)", "xfa.host", "XFA host API for data export/import or navigation (sandbox escape vector)"},
+    };
+    private static final Pattern[] SUSPICIOUS_JS_PATTERNS;
+    static {
+        SUSPICIOUS_JS_PATTERNS = new Pattern[SUSPICIOUS_JS_APIS.length];
+        for (int i = 0; i < SUSPICIOUS_JS_APIS.length; i++) {
+            SUSPICIOUS_JS_PATTERNS[i] = Pattern.compile(SUSPICIOUS_JS_APIS[i][0], Pattern.CASE_INSENSITIVE);
+        }
+    }
+
+    /**
+     * Extracts AcroForm fields and flags suspicious ones:
+     * - hidden fields (zero-area annotation rectangle)
+     * - fields whose /V value is a PDF Name containing base64 data (#XX hex escapes)
+     */
+    private List<FormFieldHit> extractFormFields(PDDocument document, Path scriptsDir) throws IOException {
+        List<FormFieldHit> hits = new ArrayList<>();
+        PDAcroForm acroForm = document.getDocumentCatalog().getAcroForm();
+        if (acroForm == null) return hits;
+
+        for (PDField field : acroForm.getFieldTree()) {
+            COSDictionary fieldDict = field.getCOSObject();
+            String fieldName = field.getFullyQualifiedName();
+            String fieldType = fieldDict.getNameAsString(COSName.FT);
+
+            // Get annotation rectangle
+            COSArray rectArray = asArray(fieldDict.getDictionaryObject(COSName.RECT));
+            float[] rect = null;
+            boolean hidden = false;
+            if (rectArray != null && rectArray.size() == 4) {
+                rect = new float[4];
+                for (int i = 0; i < 4; i++) {
+                    COSBase item = rectArray.getObject(i);
+                    rect[i] = item instanceof COSNumber ? ((COSNumber) item).floatValue() : 0f;
+                }
+                float width = Math.abs(rect[2] - rect[0]);
+                float height = Math.abs(rect[3] - rect[1]);
+                hidden = width < 1f && height < 1f;
+            }
+
+            // Inspect the /V value at the COS level
+            COSBase rawV = deref(fieldDict.getDictionaryObject(COSName.V));
+            if (rawV == null && !hidden) continue; // nothing interesting
+
+            FormFieldHit hit = new FormFieldHit();
+            hit.name = fieldName;
+            hit.fieldType = fieldType;
+            hit.rect = rect;
+            hit.flags = new ArrayList<>();
+
+            if (hidden) hit.flags.add("hidden");
+
+            if (rawV instanceof COSName nameVal) {
+                // Value stored as a PDF Name — the exploit technique for CVE-2026-34621.
+                // The Name may contain #XX hex escapes for base64 chars like / (+) =.
+                String rawNameStr = nameVal.getName(); // PDFBox already unescapes #XX
+                hit.valueIsName = true;
+                hit.rawValueLength = rawNameStr.length();
+
+                // Count #XX escapes in the original encoded form.
+                // PDFBox unescapes automatically, so we re-scan the raw PDF bytes via the
+                // COSName's encoded form. We approximate by checking the length difference
+                // or by looking at the original bytes. Since PDFBox already decoded,
+                // we check if the raw bytes of the field dict would have had escapes.
+                // Simpler: check if the value is plausible base64 and long.
+                boolean looksBase64 = rawNameStr.length() >= MIN_BASE64_NAME_LEN
+                    && rawNameStr.matches("[A-Za-z0-9+/=]+");
+
+                if (looksBase64) {
+                    hit.flags.add("base64_payload");
+                    hit.rawValue = rawNameStr.length() > 200
+                        ? rawNameStr.substring(0, 200) + "...[" + rawNameStr.length() + " chars]"
+                        : rawNameStr;
+
+                    // Attempt base64 decode and save as artifact
+                    try {
+                        byte[] decoded = Base64.getDecoder().decode(rawNameStr);
+                        hit.decodedLength = decoded.length;
+                        hit.decodedSha256 = sha256(decoded);
+                        String artifactName = "field-" + sanitizeFileName(fieldName) + "-decoded";
+                        // Sniff: if it looks like text (JS), write as .js.txt, else .bin
+                        boolean looksText = true;
+                        for (int i = 0; i < Math.min(decoded.length, 512); i++) {
+                            int b = decoded[i] & 0xFF;
+                            if (b < 0x09 || (b > 0x0D && b < 0x20 && b != 0x1B)) {
+                                looksText = false;
+                                break;
+                            }
+                        }
+                        if (looksText) {
+                            hit.decodedArtifact = writeTextArtifact(scriptsDir, artifactName + ".js.txt",
+                                new String(decoded, StandardCharsets.UTF_8));
+                        } else {
+                            Path binPath = scriptsDir.resolve(artifactName + ".bin");
+                            Files.write(binPath, decoded);
+                            hit.decodedArtifact = relativePath(binPath);
+                        }
+                    } catch (IllegalArgumentException e) {
+                        // Not valid base64 after all
+                        hit.flags.remove("base64_payload");
+                        hit.flags.add("name_value_not_base64");
+                    }
+                } else if (rawNameStr.length() >= MIN_BASE64_NAME_LEN) {
+                    hit.flags.add("large_name_value");
+                    hit.rawValue = rawNameStr.length() > 200
+                        ? rawNameStr.substring(0, 200) + "...[" + rawNameStr.length() + " chars]"
+                        : rawNameStr;
+                }
+            } else if (rawV instanceof COSString strVal) {
+                String s = strVal.getString();
+                if (s != null && s.length() >= MIN_BASE64_NAME_LEN) {
+                    hit.rawValueLength = s.length();
+                    hit.flags.add("large_string_value");
+                }
+            }
+
+            if (hidden || !hit.flags.isEmpty()) {
+                hit.hidden = hidden ? true : null;
+                hits.add(hit);
+            }
+        }
+
+        // Second pass: scan raw PDF bytes for #XX escapes in Name values of form fields.
+        // This detects the obfuscation where base64 '/' is stored as #2f in the PDF Name.
+        // We already have decoded values from PDFBox, but we want to report the hex-escape count.
+        scanRawFieldNameEscapes(hits);
+
+        return hits;
+    }
+
+    /**
+     * Scans raw PDF bytes (from the loaded document) for #XX hex escapes within
+     * field /V Name values. This is a forensic indicator: legitimate PDFs almost
+     * never store large hex-escaped Names as field values.
+     */
+    private void scanRawFieldNameEscapes(List<FormFieldHit> hits) {
+        // For each hit with valueIsName=true, count # escapes from the raw name length difference
+        for (FormFieldHit hit : hits) {
+            if (Boolean.TRUE.equals(hit.valueIsName) && hit.rawValueLength != null && hit.rawValueLength >= MIN_BASE64_NAME_LEN) {
+                // We can estimate: if the value has base64 chars like /+= that needed escaping,
+                // those would have been #2f #2b #3d in the raw PDF. The decoded value from PDFBox
+                // already has them unescaped. Count / + = in the decoded value to estimate escapes.
+                String decoded = hit.rawValue;
+                if (decoded == null) continue;
+                // Use the full raw value (before truncation) if available via the flag
+                int escapeCount = 0;
+                // Count characters that would have been hex-escaped in the PDF Name
+                for (int i = 0; i < Math.min(decoded.length(), hit.rawValueLength); i++) {
+                    char c = decoded.charAt(i);
+                    if (c == '/' || c == '+' || c == '=' || c == '#' || c < 0x21 || c > 0x7E) {
+                        escapeCount++;
+                    }
+                }
+                // Rough extrapolation if truncated
+                if (decoded.endsWith("]") && hit.rawValueLength > decoded.length()) {
+                    double ratio = (double) escapeCount / decoded.length();
+                    escapeCount = (int) (ratio * hit.rawValueLength);
+                }
+                if (escapeCount > 0) {
+                    hit.nameHasHexEscapes = true;
+                    hit.hexEscapeCount = escapeCount;
+                    if (!hit.flags.contains("base64_name_escaped")) {
+                        hit.flags.add("base64_name_escaped");
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Analyzes extracted JavaScript snippets for suspicious API usage and JSEff obfuscation.
+     */
+    private List<JsIndicatorHit> analyzeJavaScriptIndicators(List<JavaScriptHit> jsHits, List<XfaScriptHit> xfaHits) {
+        List<JsIndicatorHit> indicators = new ArrayList<>();
+
+        // Analyze JavaScript hits
+        for (JavaScriptHit js : jsHits) {
+            if (js.code == null || js.code.isEmpty()) continue;
+            analyzeCodeIndicators(js.code, js.context, indicators);
+        }
+
+        // Analyze XFA script hits
+        for (XfaScriptHit xfa : xfaHits) {
+            if (xfa.code == null || xfa.code.isEmpty()) continue;
+            analyzeCodeIndicators(xfa.code, xfa.context, indicators);
+        }
+
+        return indicators;
+    }
+
+    /**
+     * CVE-2026-34261 composite detection: fires when the full exploit chain is present.
+     * Checks for the interaction between elements, not just their individual presence:
+     *   1. Hidden Btn form field with base64-encoded Name value (payload storage)
+     *   2. JSEff-obfuscated trigger JavaScript in the name tree
+     *   3. Trigger JS uses getField() to read the hidden field's value
+     *   4. Trigger JS uses SOAP.streamDecode with base64 encoding to decode the payload
+     *   5. Decoded payload contains privileged API abuse (RSS.addFeed, util.readFileIntoStream, etc.)
+     */
+    private void checkCve202634261(AnalysisReport report, List<JsIndicatorHit> indicators) {
+        // Element 1: hidden Btn field with base64 payload stored as a Name
+        boolean hasBase64BtnField = false;
+        String fieldName = null;
+        if (report.formFields != null) {
+            for (FormFieldHit ff : report.formFields) {
+                if ("Btn".equals(ff.fieldType)
+                        && Boolean.TRUE.equals(ff.hidden)
+                        && Boolean.TRUE.equals(ff.valueIsName)
+                        && ff.flags != null && ff.flags.contains("base64_payload")) {
+                    hasBase64BtnField = true;
+                    fieldName = ff.name;
+                    break;
+                }
+            }
+        }
+        if (!hasBase64BtnField) return;
+
+        // Element 2+3: JSEff-obfuscated trigger that calls getField
+        boolean hasJsfuckTrigger = false;
+        boolean triggerUsesGetField = false;
+        boolean triggerUsesSoapStreamDecode = false;
+        String triggerContext = null;
+        for (JsIndicatorHit ji : indicators) {
+            if ("jseff_obfuscation".equals(ji.type) && ji.context != null && ji.context.contains("names.javascript")) {
+                hasJsfuckTrigger = true;
+                triggerContext = ji.context;
+            }
+        }
+        // Check the raw trigger JS for the SOAP.streamDecode + getField + base64 chain
+        // These are obfuscated in JSEff, but the patterns are in the extracted code
+        for (JavaScriptHit js : report.javascript) {
+            if (js.code == null) continue;
+            // The trigger code contains getField() call (even obfuscated, PDFBox extracts the literal string)
+            if (js.code.contains("getField")) triggerUsesGetField = true;
+            // Direct: SOAP.streamDecode / streamDecode present as literal
+            if (js.code.contains("streamDecode") || js.code.contains("SOAP")) {
+                triggerUsesSoapStreamDecode = true;
+            }
+            // JSEff variant: "base64" is constructed char-by-char.
+            // "6" = (!+[]+!+[]+!+[]+!+[]+!+[]+!+[]+[]) and "4" = (!+[]+!+[]+!+[]+!+[]+[])
+            // Also: the method name fragments "stre"+"a"+"mD"+"e"+"cod"+"e" may appear in JSEff
+            // as partial string concatenations with ({}+[]) and (+{}+[]) expressions.
+            if (js.code.contains("!+[]+!+[]+!+[]+!+[]+!+[]+!+[]+[]")  // JSEff "6"
+                    && js.code.contains("!+[]+!+[]+!+[]+!+[]+[]")) {  // JSEff "4"
+                triggerUsesSoapStreamDecode = true;
+            }
+        }
+
+        // Element 5: decoded payload has privileged API abuse, specifically RSS C2 mechanism
+        boolean payloadHasPrivilegedApis = false;
+        boolean payloadHasRssC2 = false;
+        boolean payloadHasFileRead = false;
+        Set<String> payloadApis = new LinkedHashSet<>();
+        for (JsIndicatorHit ji : indicators) {
+            if (ji.context != null && ji.context.contains("decodedPayload") && "suspicious_api".equals(ji.type)) {
+                payloadHasPrivilegedApis = true;
+                payloadApis.add(ji.indicator);
+                if ("RSS.addFeed".equals(ji.indicator) || "RSS.getFeed".equals(ji.indicator)) {
+                    payloadHasRssC2 = true;
+                }
+                if ("util.readFileIntoStream".equals(ji.indicator)) {
+                    payloadHasFileRead = true;
+                }
+            }
+        }
+
+        // Also check trigger JS for direct (non-obfuscated) patterns:
+        // e.g. SOAP.streamDecode(util.streamFromString(getField("btn1").value), "base64")
+        for (JavaScriptHit js : report.javascript) {
+            if (js.code == null) continue;
+            // Direct API name matches (non-obfuscated variant)
+            if (js.code.contains("streamDecode")) triggerUsesSoapStreamDecode = true;
+            if (js.code.contains("getField")) triggerUsesGetField = true;
+        }
+
+        // Fire composite detection if the full exploit chain is present.
+        // Required elements:
+        //   - Hidden Btn field with base64 Name value (payload storage)
+        //   - Trigger JS that reads the field via getField()
+        //   - Decoded payload uses RSS API for C2 (the defining mechanism of CVE-2026-34261)
+        // Optional signals that increase confidence:
+        //   - JSEff obfuscation in the trigger
+        //   - SOAP.streamDecode base64 decode chain
+        //   - util.readFileIntoStream for local file exfil
+        if (hasBase64BtnField && triggerUsesGetField && payloadHasRssC2) {
+            JsIndicatorHit cveHit = new JsIndicatorHit();
+            cveHit.context = "composite";
+            cveHit.type = "cve_detection";
+            cveHit.indicator = "CVE-2026-34261";
+            StringBuilder detail = new StringBuilder();
+            detail.append("CVE-2026-34261 exploit chain detected: ");
+            detail.append("[1/payload-storage] hidden Btn field '").append(fieldName)
+                  .append("' stores ").append("base64-encoded JavaScript as a PDF Name value");
+            detail.append("; [2/trigger] JavaScript in name tree ");
+            if (hasJsfuckTrigger)
+                detail.append("(JSEff-obfuscated) ");
+            detail.append("reads field via getField()");
+            if (triggerUsesSoapStreamDecode)
+                detail.append(" → SOAP.streamDecode(…, \"base64\")");
+            detail.append(" → app.setTimeout() for execution");
+            detail.append("; [3/c2] decoded payload uses RSS.addFeed for C2 communication and remote JS injection");
+            if (payloadHasFileRead)
+                detail.append("; [4/exfil] util.readFileIntoStream used for local file exfiltration");
+            detail.append("; [APIs] ").append(String.join(", ", payloadApis));
+            cveHit.detail = detail.toString();
+            indicators.add(cveHit);
+        }
+    }
+
+    private void analyzeCodeIndicators(String code, String context, List<JsIndicatorHit> indicators) {
+        // Check for suspicious Acrobat APIs
+        for (int i = 0; i < SUSPICIOUS_JS_PATTERNS.length; i++) {
+            Matcher m = SUSPICIOUS_JS_PATTERNS[i].matcher(code);
+            int count = 0;
+            while (m.find()) count++;
+            if (count > 0) {
+                JsIndicatorHit hit = new JsIndicatorHit();
+                hit.context = context;
+                hit.type = "suspicious_api";
+                hit.indicator = SUSPICIOUS_JS_APIS[i][1];
+                hit.detail = SUSPICIOUS_JS_APIS[i][2];
+                hit.count = count;
+                indicators.add(hit);
+            }
+        }
+
+        // Check for JSEff obfuscation
+        Matcher jsfuckMatcher = JSEFF_TOKEN.matcher(code);
+        int jsfuckCount = 0;
+        while (jsfuckMatcher.find()) jsfuckCount++;
+        if (jsfuckCount >= JSEFF_THRESHOLD) {
+            JsIndicatorHit hit = new JsIndicatorHit();
+            hit.context = context;
+            hit.type = "jseff_obfuscation";
+            hit.indicator = "jseff_obfuscation";
+            hit.detail = "JavaScript contains " + jsfuckCount + " JSEff-style encoding tokens "
+                + "(e.g. ({}+[]), (!![]+[]), (+!+[]+[])) — commonly used to obfuscate API names in exploits";
+            hit.count = jsfuckCount;
+            indicators.add(hit);
+        }
+    }
+
+    /** Pattern for CVE-2024-4367: /FontMatrix followed by an array containing a parenthesized string. */
+    private static final Pattern FONTMATRIX_INJECTION = Pattern.compile(
+        "/FontMatrix\\s*\\[([^\\]]{0,500})\\(", Pattern.DOTALL);
+
+    /**
+     * CVE-2024-4367: Detects FontMatrix arrays containing parenthesized strings.
+     * PDF.js evaluates FontMatrix values unsafely; injecting a string like
+     * (1\); alert('xss')) into FontMatrix achieves arbitrary JS execution in the browser.
+     *
+     * Uses raw-byte scanning because the malformed FontMatrix breaks PDFBox's COS parser —
+     * the backslash-escaped paren in (1\); makes PDFBox unable to parse it as a proper array.
+     */
+    private void checkFontMatrixInjection(byte[] pdfBytes, List<JsIndicatorHit> indicators) {
+        String text = new String(pdfBytes, StandardCharsets.ISO_8859_1);
+        Matcher m = FONTMATRIX_INJECTION.matcher(text);
+        if (m.find()) {
+            String context = text.substring(m.start(), Math.min(m.end() + 60, text.length()));
+            // Trim to first newline or endobj
+            int nl = context.indexOf('\n');
+            if (nl > 0) context = context.substring(0, nl);
+
+            JsIndicatorHit hit = new JsIndicatorHit();
+            hit.context = "raw.fontMatrix";
+            hit.type = "suspicious_structure";
+            hit.indicator = "fontmatrix_injection";
+            hit.detail = "CVE-2024-4367: FontMatrix array contains a parenthesized string '"
+                + context.substring(0, Math.min(context.length(), 120))
+                + "' — PDF.js evaluates FontMatrix unsafely, enabling XSS/code injection";
+            hit.count = 1;
+            indicators.add(hit);
+        }
+    }
+
+    /**
+     * CVE-2010-0188: Detects XFA forms with ImageField + topmostSubform pattern
+     * used to embed malformed TIFF images that trigger libtiff integer overflow.
+     */
+    private void checkXfaImageFieldExploit(PDDocument document, List<JsIndicatorHit> indicators) {
+        try {
+            PDAcroForm acroForm = document.getDocumentCatalog().getAcroForm();
+            if (acroForm == null || !acroForm.hasXFA()) return;
+            PDXFAResource xfa = acroForm.getXFA();
+            if (xfa == null) return;
+            byte[] xfaBytes = xfa.getBytes();
+            if (xfaBytes == null || xfaBytes.length == 0) return;
+            String xml = new String(xfaBytes, StandardCharsets.UTF_8);
+
+            boolean hasTopmostSubform = xml.contains("topmostSubform");
+            boolean hasImageField = xml.contains("ImageField");
+
+            // Also look for the AcroForm field structure: /FT /Btn with /TU (ImageField...)
+            boolean hasBtnImageField = false;
+            for (PDField field : acroForm.getFieldTree()) {
+                COSDictionary fd = field.getCOSObject();
+                String tu = fd.getString(COSName.getPDFName("TU"));
+                String ft = fd.getNameAsString(COSName.FT);
+                if ("Btn".equals(ft) && tu != null && tu.contains("ImageField")) {
+                    hasBtnImageField = true;
+                    break;
+                }
+            }
+
+            if (hasTopmostSubform && (hasImageField || hasBtnImageField)) {
+                JsIndicatorHit hit = new JsIndicatorHit();
+                hit.context = "xfa.template";
+                hit.type = "suspicious_structure";
+                hit.indicator = "xfa_imagefield_exploit";
+                hit.detail = "CVE-2010-0188: XFA template contains topmostSubform + ImageField pattern "
+                    + "— structure used to embed malformed TIFF images that trigger libtiff integer overflow";
+                hit.count = 1;
+                indicators.add(hit);
+            }
+        } catch (Exception e) {
+            // XFA parsing can fail — don't crash
+        }
+    }
+
+    /**
+     * Detects Flash/RichMedia content embedded in annotations.
+     * Flash is deprecated/dead — its presence in a PDF is inherently suspicious.
+     */
+    private void checkFlashRichMedia(PDDocument document, List<JsIndicatorHit> indicators) {
+        try {
+            int pageNum = 0;
+            for (PDPage page : document.getPages()) {
+                pageNum++;
+                for (PDAnnotation annot : page.getAnnotations()) {
+                    COSDictionary ad = annot.getCOSObject();
+                    String subtype = ad.getNameAsString(COSName.SUBTYPE);
+                    if ("RichMedia".equals(subtype)) {
+                        // Check for Flash specifically in the content
+                        COSDictionary content = asDictionary(ad.getDictionaryObject(
+                            COSName.getPDFName("RichMediaContent")));
+                        String flashDetail = "RichMedia annotation";
+                        if (content != null) {
+                            COSArray configs = asArray(content.getDictionaryObject(
+                                COSName.getPDFName("Configurations")));
+                            if (configs != null) {
+                                for (int i = 0; i < configs.size(); i++) {
+                                    COSDictionary cfg = asDictionary(configs.getObject(i));
+                                    if (cfg != null && "Flash".equals(cfg.getNameAsString(COSName.SUBTYPE))) {
+                                        flashDetail = "RichMedia/Flash annotation (embedded SWF)";
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        JsIndicatorHit hit = new JsIndicatorHit();
+                        hit.context = "page[" + pageNum + "].annotation";
+                        hit.type = "suspicious_structure";
+                        hit.indicator = "flash_richmedia";
+                        hit.detail = flashDetail + " — Flash is deprecated and its presence in a PDF is suspicious; "
+                            + "historically used for exploit delivery (CVE-2009-1862, CVE-2011-0611)";
+                        hit.count = 1;
+                        indicators.add(hit);
+                        return; // one hit is enough
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Annotation parsing can fail — don't crash
+        }
+    }
+
+    /**
+     * Extracts GoToE/GoToR actions from page-level /AA (Additional Actions) dictionaries.
+     * These are missed by the standard action extractor which only walks annotations.
+     * CVE-2018-4993: UNC paths in page /AA GoToE force NTLM authentication.
+     */
+    private void checkPageAdditionalActions(PDDocument document, List<JsIndicatorHit> indicators) {
+        try {
+            int pageNum = 0;
+            for (PDPage page : document.getPages()) {
+                pageNum++;
+                COSDictionary pageDict = page.getCOSObject();
+                COSDictionary aa = asDictionary(pageDict.getDictionaryObject(COSName.AA));
+                if (aa == null) continue;
+                for (COSName key : aa.keySet()) {
+                    COSDictionary action = asDictionary(deref(aa.getDictionaryObject(key)));
+                    if (action == null) continue;
+                    COSName subtype = action.getCOSName(COSName.S);
+                    if (subtype == null) continue;
+                    String sName = subtype.getName();
+                    if ("GoToE".equals(sName) || "GoToR".equals(sName)) {
+                        String remoteFile = readFileSpecLike(action.getDictionaryObject(COSName.F));
+                        if (remoteFile != null && (remoteFile.startsWith("\\\\")
+                                || remoteFile.regionMatches(true, 0, "file:", 0, 5))) {
+                            JsIndicatorHit hit = new JsIndicatorHit();
+                            hit.context = "page[" + pageNum + "].additionalActions." + key.getName();
+                            hit.type = "suspicious_action";
+                            hit.indicator = "unc_path_page_aa";
+                            hit.detail = sName + " in page /AA references remote path '" + remoteFile
+                                + "' — forces SMB authentication for NTLM credential theft (CVE-2018-4993)";
+                            hit.count = 1;
+                            indicators.add(hit);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Page AA parsing can fail — don't crash
+        }
+    }
+
     private List<EmbeddedFileHit> extractNamedEmbeddedFiles(PDDocument document, Path attachmentsDir) throws IOException {
         List<EmbeddedFileHit> hits = new ArrayList<>();
         PDDocumentCatalog catalog = document.getDocumentCatalog();
@@ -1336,10 +1994,55 @@ private boolean skipQrScan;
         hit.page = page;
         hit.bounds = rect == null ? null : BoundingBox.fromPdfRect(rect);
         String declaredMime = embeddedFile.getSubtype();
+        String detectedMime = Files.probeContentType(out);
+        // Also check file magic bytes for common executable/archive types
+        byte[] headBytes = Files.readAllBytes(out);
+        String fileMagic = detectFileMagic(headBytes);
+        boolean isExe = fileMagic != null && (fileMagic.contains("PE") || fileMagic.contains("executable")
+                || fileMagic.contains("ELF") || fileMagic.contains("Mach-O") || fileMagic.contains("LNK") || fileMagic.contains("shortcut"));
+        boolean isArchive = fileMagic != null && (fileMagic.contains("Zip") || fileMagic.contains("RAR")
+                || fileMagic.contains("7-Zip") || fileMagic.contains("Cabinet")
+                || fileMagic.contains("ISO") || fileMagic.contains("VHD") || fileMagic.contains("disc image"));
+        // Magic-based type overrides extension-based probeContentType
+        if (isExe) detectedMime = "application/x-dosexec";
+        else if (isArchive && detectedMime == null) detectedMime = "application/zip";
         if (declaredMime != null && !declaredMime.isBlank()) {
             hit.mimeType = declaredMime;
         } else {
-            hit.mimeType = Files.probeContentType(out);
+            hit.mimeType = detectedMime;
+        }
+        // Flag filename extension mismatch with actual content type
+        if ((isExe || isArchive) && hit.originalName != null) {
+            String nameLower = hit.originalName.toLowerCase(Locale.ROOT);
+            boolean extMatchesContent = false;
+            // Windows executable extensions (PE, scripts, installers, shortcuts)
+            Set<String> exeExts = Set.of(".exe", ".dll", ".scr", ".sys", ".com", ".pif",
+                ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+                ".msi", ".msp", ".mst", ".cpl", ".hta", ".lnk", ".bin", ".ocx", ".drv",
+                ".jar", ".class", ".appref-ms", ".gadget", ".inf", ".ins", ".isp",
+                ".reg", ".rgs", ".sct", ".shb", ".psc1", ".application");
+            Set<String> archiveExts = Set.of(".zip", ".rar", ".7z", ".cab", ".tar", ".gz",
+                ".iso", ".vhd", ".vhdx", ".img", ".dmg", ".wim");
+            String ext = nameLower.contains(".") ? nameLower.substring(nameLower.lastIndexOf('.')) : "";
+            if (isExe) {
+                extMatchesContent = exeExts.contains(ext);
+            } else { // isArchive
+                extMatchesContent = archiveExts.contains(ext);
+            }
+            if (!extMatchesContent) {
+                hit.mimeTypeMismatch = "filename '" + hit.originalName
+                    + "' has misleading extension — actual content is " + fileMagic;
+            }
+        }
+        // Always report detected type and magic when content is executable or type mismatches
+        if (isExe || isArchive) {
+            hit.detectedMimeType = detectedMime;
+            hit.fileMagic = fileMagic;
+        } else if (declaredMime != null && detectedMime != null
+                && !declaredMime.equalsIgnoreCase(detectedMime)
+                && !declaredMime.contains(detectedMime) && !detectedMime.contains(declaredMime)) {
+            hit.detectedMimeType = detectedMime;
+            hit.fileMagic = fileMagic;
         }
         return hit;
     }
@@ -1865,7 +2568,8 @@ for (int pageNum : pagesToProcess) {
         int pageNumber = 0;
         for (PDPage page : document.getPages()) {
             pageNumber++;
-            if (!pageSet.contains(pageNumber)) continue;
+            // Page /AA (additional actions) are always checked — they trigger on page open
+            // regardless of whether the page is selected for screenshot/text processing.
             COSDictionary pageDict = page.getCOSObject();
             COSDictionary pageAA = asDictionary(pageDict.getDictionaryObject(COSName.AA));
             if (pageAA != null) {
@@ -1875,11 +2579,14 @@ for (int pageNum : pagesToProcess) {
                         hits, pageNumber, null, new HashSet<>());
                 }
             }
+            // Annotation actions are also checked on all pages — a malicious GoToE/Launch
+            // on a blank page is still a threat.  Bounds are only computed on processed pages.
             int annotIdx = 0;
             for (PDAnnotation annot : page.getAnnotations()) {
                 annotIdx++;
                 COSDictionary annotDict = annot.getCOSObject();
-                BoundingBox bounds = annot.getRectangle() == null ? null : BoundingBox.fromPdfRect(annot.getRectangle());
+                BoundingBox bounds = pageSet.contains(pageNumber) && annot.getRectangle() != null
+                    ? BoundingBox.fromPdfRect(annot.getRectangle()) : null;
                 String annotCtx = "page[" + pageNumber + "].annotation[" + annotIdx + "]";
                 extractActionsFromActionCos(annotDict.getDictionaryObject(COSName.A),
                     annotCtx + ".action", hits, pageNumber, bounds, new HashSet<>());
@@ -2802,7 +3509,15 @@ for (int pageNum : pagesToProcess) {
             return null;
         }
         String value = raw.trim();
-        while (!value.isEmpty() && ").,]}>\"'".indexOf(value.charAt(value.length() - 1)) >= 0) {
+        // Truncate at JS syntax boundaries that can't be part of a URL
+        // e.g. "https://example.com/file.exe';eval(..." → "https://example.com/file.exe"
+        int jsCut = -1;
+        for (String sep : new String[]{"';", "\";", "');", "\");", ");", "](", "})"}) {
+            int idx = value.indexOf(sep);
+            if (idx > 0 && (jsCut < 0 || idx < jsCut)) jsCut = idx;
+        }
+        if (jsCut > 0) value = value.substring(0, jsCut);
+        while (!value.isEmpty() && ").,]}>\"';".indexOf(value.charAt(value.length() - 1)) >= 0) {
             value = value.substring(0, value.length() - 1);
         }
         if (value.toLowerCase(Locale.ROOT).startsWith("www.")) {
@@ -3759,6 +4474,19 @@ for (int pageNum : pagesToProcess) {
         if (startsWith(b, 0, 0x7F, 0x45, 0x4C, 0x46)) return "ELF executable";
         // Cabinet
         if (startsWith(b, 0, 0x4D, 0x53, 0x43, 0x46)) return "Microsoft Cabinet";
+        // ISO 9660 disc image
+        if (b.length > 0x8005 && startsWith(b, 0x8001, 0x43, 0x44, 0x30, 0x30, 0x31)) return "ISO 9660 disc image";
+        // VHD (Virtual Hard Disk) — "conectix" at offset 0
+        if (b.length >= 8 && startsWith(b, 0, 0x63, 0x6F, 0x6E, 0x65, 0x63, 0x74, 0x69, 0x78)) return "VHD disc image";
+        // VHDX — "vhdxfile" at offset 0
+        if (b.length >= 8 && startsWith(b, 0, 0x76, 0x68, 0x64, 0x78, 0x66, 0x69, 0x6C, 0x65)) return "VHDX disc image";
+        // Mach-O (macOS executable)
+        if (startsWith(b, 0, 0xFE, 0xED, 0xFA, 0xCE) || startsWith(b, 0, 0xFE, 0xED, 0xFA, 0xCF)
+                || startsWith(b, 0, 0xCE, 0xFA, 0xED, 0xFE) || startsWith(b, 0, 0xCF, 0xFA, 0xED, 0xFE))
+            return "Mach-O executable";
+        // MSI (Windows Installer) — OLE2 compound with specific CLSID, but OLE2 check above catches it
+        // LNK (Windows Shortcut)
+        if (startsWith(b, 0, 0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00)) return "Windows shortcut (LNK)";
         // XML
         if (startsWith(b, 0, 0x3C, 0x3F, 0x78, 0x6D, 0x6C)) return "XML document";
         return String.format("unknown (magic: %02x %02x %02x %02x)",
@@ -4521,6 +5249,10 @@ for (int pageNum : pagesToProcess) {
         public List<StructuralAnomalyHit> structuralAnomalies;
         @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
         public List<MetadataSpoofingHit> metadataSpoofingIndicators;
+        @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        public List<FormFieldHit> formFields;
+        @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        public List<JsIndicatorHit> jsIndicators;
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -4571,6 +5303,19 @@ for (int pageNum : pagesToProcess) {
         public long size;
         public String sha256;
         public String mimeType;
+        /** Actual MIME type detected from file content (when different from declared mimeType). */
+        @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        public String detectedMimeType;
+        /** File magic string detected from content bytes (e.g. "Windows PE executable"). */
+        @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        public String fileMagic;
+        /** Set when filename extension doesn't match actual content type (e.g. .pdf is really an EXE). */
+        @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        public String mimeTypeMismatch;
+        /** When multiple name-tree entries share the same name+sha256, they are collapsed into one
+         *  hit with duplicateCount > 1. Null when there are no duplicates. */
+        @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+        public Integer duplicateCount;
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -4738,6 +5483,50 @@ for (int pageNum : pagesToProcess) {
         public String email;
         public String source;
         public Integer page;
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public static class FormFieldHit {
+        /** Fully-qualified field name (e.g. "btn1"). */
+        public String name;
+        /** PDF field type: Btn, Tx, Ch, Sig. */
+        public String fieldType;
+        /** Annotation rectangle [left, bottom, right, top]. */
+        public float[] rect;
+        /** True when the annotation rectangle has zero area (invisible to user). */
+        public Boolean hidden;
+        /** Raw value string — only populated when the value is suspicious. */
+        public String rawValue;
+        /** Length of the raw value in characters. */
+        public Integer rawValueLength;
+        /** True when the /V was stored as a PDF Name (exploits use this to hold base64 payloads). */
+        public Boolean valueIsName;
+        /** True when the /V Name contained #XX hex escapes (PDF name encoding used to smuggle base64 chars like '/'). */
+        public Boolean nameHasHexEscapes;
+        /** Count of #XX hex escape sequences found in the Name value. */
+        public Integer hexEscapeCount;
+        /** Flags describing the field: hidden, base64_payload, base64_name_escaped, large_value. */
+        public List<String> flags;
+        /** Path to artifact file containing the decoded payload (when base64 detected). */
+        public String decodedArtifact;
+        /** SHA-256 of the decoded payload. */
+        public String decodedSha256;
+        /** Length of the decoded payload in bytes. */
+        public Integer decodedLength;
+    }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public static class JsIndicatorHit {
+        /** Which JavaScript snippet triggered this indicator (e.g. context from JavaScriptHit). */
+        public String context;
+        /** Indicator type: suspicious_api, jseff_obfuscation. */
+        public String type;
+        /** Short identifier: e.g. "SOAP.streamDecode", "RSS.addFeed", "jseff_obfuscation". */
+        public String indicator;
+        /** Human-readable description. */
+        public String detail;
+        /** Number of occurrences in the snippet (for pattern-based indicators). */
+        public Integer count;
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)

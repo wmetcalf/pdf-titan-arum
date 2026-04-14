@@ -47,6 +47,77 @@
 
 {% if hasReport %}
 
+{% if report.jsIndicators is not empty %}
+{% for ji in report.jsIndicators %}{% if ji.type == "cve_detection" %}
+<div style="margin:12px 0; padding:12px 16px; background:#3a0a0a; border:2px solid #d32f2f; border-radius:6px">
+  <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px">
+    <span style="font-size:18px; color:#ff5252; font-weight:bold">&#9888; {{ ji.indicator }}</span>
+    <span class="badge failed" style="font-size:12px; padding:3px 8px">CVE DETECTED</span>
+  </div>
+  <div style="color:#ffaaaa; font-size:12px; line-height:1.6">{{ ji.detail }}</div>
+</div>
+{% endif %}{% endfor %}
+{% endif %}
+
+{% if report.jsIndicators is not empty %}
+<div class="section">
+  <h2>JavaScript Indicators ({{ report.jsIndicators | length }})</h2>
+  <table>
+    <thead><tr><th>Type</th><th>Indicator</th><th>Detail</th><th>Context</th><th>Count</th></tr></thead>
+    <tbody>
+    {% for ji in report.jsIndicators %}
+    <tr style="{% if ji.type == 'cve_detection' %}background:#3a0a0a{% elseif ji.type == 'jseff_obfuscation' %}background:#2a1a00{% endif %}">
+      <td>
+        {% if ji.type == "cve_detection" %}<span class="badge failed">CVE</span>
+        {% elseif ji.type == "jseff_obfuscation" %}<span class="badge processing">obfuscation</span>
+        {% else %}<span class="badge" style="background:#1a1a3a; color:#aac">{{ ji.type }}</span>{% endif %}
+      </td>
+      <td style="font-family:monospace; white-space:nowrap; color:#f0c040">{{ ji.indicator }}</td>
+      <td style="font-size:11px; color:#ccc">{{ ji.detail }}</td>
+      <td style="font-size:10px; color:#888; max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" title="{{ ji.context }}">{{ ji.context }}</td>
+      <td>{{ ji.count }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if report.formFields is not empty %}
+<div class="section">
+  <h2>Suspicious Form Fields ({{ report.formFields | length }})</h2>
+  <table>
+    <thead><tr><th>Name</th><th>Type</th><th>Flags</th><th>Value Length</th><th>Decoded</th></tr></thead>
+    <tbody>
+    {% for ff in report.formFields %}
+    <tr style="{% if ff.flags is not empty and ff.flags contains 'base64_payload' %}background:#2a1a00{% endif %}">
+      <td style="font-family:monospace; color:#f0c040">{{ ff.name }}</td>
+      <td>{{ ff.fieldType }}</td>
+      <td style="font-size:11px">
+        {% if ff.flags is not empty %}{% for f in ff.flags %}
+          {% if f == "hidden" %}<span class="badge" style="background:#555; color:#fff; margin-right:3px">hidden</span>
+          {% elseif f == "base64_payload" %}<span class="badge failed" style="margin-right:3px">base64 payload</span>
+          {% elseif f == "base64_name_escaped" %}<span class="badge processing" style="margin-right:3px">#XX escapes</span>
+          {% else %}<span style="color:#aaa; margin-right:4px">{{ f }}</span>{% endif %}
+        {% endfor %}{% endif %}
+      </td>
+      <td>
+        {% if ff.rawValueLength is not null %}{{ ff.rawValueLength }} chars{% endif %}
+        {% if ff.decodedLength is not null %}<br><span style="color:#f90; font-size:11px">→ {{ ff.decodedLength }} bytes decoded</span>{% endif %}
+      </td>
+      <td style="font-size:11px">
+        {% if ff.decodedArtifact is not null %}
+          <a href="/api/jobs/{{ job.id }}/artifacts/{{ ff.decodedArtifact }}">{{ ff.decodedArtifact }}</a>
+          {% if ff.decodedSha256 is not null %}<br><code style="font-size:9px; color:#888">{{ ff.decodedSha256 }}</code>{% endif %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 {% if report.documentInfo is not null %}
 <div class="section">
   <h2>Document Metadata</h2>
@@ -447,7 +518,7 @@
     <tbody>
     {% for ef in report.embeddedFiles %}
     <tr>
-      <td>{{ ef.originalName }}</td>
+      <td>{{ ef.originalName }}{% if ef.duplicateCount is not null %} <span class="badge" style="background:#444; color:#aaa" title="{{ ef.duplicateCount }} identical copies in name tree">&times;{{ ef.duplicateCount }}</span>{% endif %}</td>
       <td>{{ ef.mimeType }}</td>
       <td>{{ ef.size }}</td>
       <td style="font-size:11px">{{ ef.sha256 }}</td>

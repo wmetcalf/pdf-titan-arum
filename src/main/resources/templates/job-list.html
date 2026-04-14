@@ -102,6 +102,9 @@ document.getElementById('upload-form').onsubmit = async function(e) {
         {% if job.revisionCount is not null %}<span class="badge" style="background:#1a2a1a; color:#8f8" title="{{ job.revisionCount }} revisions">{{ job.revisionCount }} rev</span> {% endif %}
         {% if job.hasQr %}<span class="badge" style="background:#6a0dad; color:#fff" title="QR code detected">QR</span> {% endif %}
         {% if job.hasEmails %}<span class="badge" style="background:#1a5276; color:#aed6f1" title="Email addresses found">email</span> {% endif %}
+        {% if job.cveDetection is not null %}<span class="badge failed" style="font-weight:bold" title="CVE exploit detected">{{ job.cveDetection }}</span> {% endif %}
+        {% if job.jsIndicatorCount is not null %}<span class="badge" style="background:#3a2a00; color:#f0c040" title="{{ job.jsIndicatorCount }} suspicious JS indicators">{{ job.jsIndicatorCount }} js-ind</span> {% endif %}
+        {% if job.formFieldCount is not null %}<span class="badge" style="background:#2a1a00; color:#ffaa44" title="{{ job.formFieldCount }} suspicious form fields">{{ job.formFieldCount }} field</span> {% endif %}
         {% if job.hasSuspiciousOcg %}<span class="badge" style="background:#7b1010; color:#ffaaaa" title="Suspicious hidden layers">OCG!</span>{% elseif job.hasOcg %}<span class="badge" style="background:#333; color:#aaa" title="Optional content layers">OCG</span>{% endif %}
         <a class="btn" href="/jobs/{{ job.id }}">View</a>
         {% if job.status == "done" %}

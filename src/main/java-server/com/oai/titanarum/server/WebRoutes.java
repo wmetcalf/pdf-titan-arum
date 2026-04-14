@@ -137,6 +137,20 @@ public class WebRoutes {
                 if (embedded != null && !embedded.isEmpty()) m.put("embeddedCount", embedded.size());
                 var revisionCount = report.get("revisionCount");
                 if (revisionCount instanceof Number n && n.intValue() > 1) m.put("revisionCount", n.intValue());
+                var jsIndicators = (java.util.List<?>) report.get("jsIndicators");
+                if (jsIndicators != null && !jsIndicators.isEmpty()) {
+                    m.put("jsIndicatorCount", jsIndicators.size());
+                    for (Object ji : jsIndicators) {
+                        if (ji instanceof java.util.Map<?,?> jim) {
+                            if ("cve_detection".equals(jim.get("type"))) {
+                                m.put("cveDetection", jim.get("indicator"));
+                                break;
+                            }
+                        }
+                    }
+                }
+                var formFields = (java.util.List<?>) report.get("formFields");
+                if (formFields != null && !formFields.isEmpty()) m.put("formFieldCount", formFields.size());
                 var aiAnalysis = report.get("aiAnalysis");
                 if (aiAnalysis instanceof java.util.Map<?,?> ai) {
                     var score = ai.get("score");

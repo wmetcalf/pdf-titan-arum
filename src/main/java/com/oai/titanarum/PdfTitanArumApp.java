@@ -1,7 +1,9 @@
 package com.oai.titanarum;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import org.apache.pdfbox.Loader;
@@ -82,6 +84,7 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -155,6 +158,10 @@ public class PdfTitanArumApp implements Callable<Integer> {
 
     @Option(names = {"-o", "--output"}, required = false, description = "Output directory")
     private Path outputDir;
+
+    @Option(names = {"--run"},
+            description = "Worker mode: run a single job from the file-IPC control loop under <scratch>")
+    private Path runScratch;
 
     @Option(names = {"--dpi"}, defaultValue = "150", description = "Render DPI for screenshots")
     private float dpi;
@@ -249,6 +256,9 @@ private boolean skipQrScan;
 
     @Override
     public Integer call() throws Exception {
+        if (runScratch != null) {
+            return runWorker(runScratch);
+        }
         if (inputPdf == null) {
             System.err.println("ERROR: -i / --input is required");
             return 1;
@@ -5216,6 +5226,74 @@ for (int pageNum : pagesToProcess) {
         public Long daysSinceModified;
         /** Days between creationDate and modificationDate (positive = modified after creation). Null if either date is absent. */
         public Long daysBetweenCreatedAndModified;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record JobDescriptor(
+            @JsonProperty("input_path") String inputPath,
+            @JsonProperty("output_dir") String outputDir,
+            @JsonProperty("filename_hint") String filenameHint,
+            @JsonProperty("sha256") String sha256,
+            @JsonProperty("dpi") float dpi,
+            @JsonProperty("pages") String pages,
+            @JsonProperty("skip_qr") boolean skipQr,
+            @JsonProperty("skip_screenshots") boolean skipScreenshots,
+            @JsonProperty("skip_images") boolean skipImages,
+            @JsonProperty("skip_phones") boolean skipPhones,
+            @JsonProperty("skip_page_export") boolean skipPageExport,
+            @JsonProperty("skip_text_urls") boolean skipTextUrls,
+            @JsonProperty("no_skip_blanks") boolean noSkipBlanks,
+            @JsonProperty("ocr_screenshots") boolean ocrScreenshots,
+            @JsonProperty("ocr_url_crops") boolean ocrUrlCrops,
+            @JsonProperty("ocr_lang") String ocrLang,
+            @JsonProperty("add_link_annotations") boolean addLinkAnnotations,
+            @JsonProperty("password") String password,
+            @JsonProperty("timeout_seconds") int timeoutSeconds) {}
+
+    /** File-IPC worker mode. Announces readiness, waits for control.go, runs one job, exits. */
+    private Integer runWorker(Path scratch) throws Exception {
+        File controlDir = scratch.resolve("control").toFile();
+        controlDir.mkdirs();
+        new File(controlDir, "control.ready").createNewFile();       // (a) announce ready
+
+        File go = new File(controlDir, "control.go");                // (b) block for go
+        long deadline = System.currentTimeMillis() + 600_000L;
+        while (System.currentTimeMillis() < deadline) {
+            if (go.exists()) break;
+            Thread.sleep(100L);
+        }
+        if (!go.exists()) {
+            System.err.println("ERROR: --run timed out waiting for control.go");
+            return 2;
+        }
+
+        File jobFile = new File(controlDir, "job.json");             // (c) read job
+        JobDescriptor job = mapper.readValue(jobFile, JobDescriptor.class);
+
+        // (d) populate the field-only options via existing setters (mirrors WorkerPool.processJob)
+        setSkipScreenshots(job.skipScreenshots());
+        setSkipImages(job.skipImages());
+        setSkipPhones(job.skipPhones());
+        setSkipPageExport(job.skipPageExport());
+        setSkipTextUrls(job.skipTextUrls());
+        setNoSkipBlanks(job.noSkipBlanks());
+        setTimeout(job.timeoutSeconds());
+        setOcrScreenshots(job.ocrScreenshots());
+        setOcrUrlCrops(job.ocrUrlCrops());
+        if (job.ocrLang() != null) setOcrLang(job.ocrLang());
+
+        byte[] pdfBytes = Files.readAllBytes(Paths.get(job.inputPath()));
+        String name = job.filenameHint() != null ? job.filenameHint() : "input.pdf";
+        String pages = job.pages() != null ? job.pages() : "default";
+
+        // (e) SAME programmatic entry WorkerPool.processJob uses. callWith writes report.json
+        //     (including partial reports with parseError/timedOut) into outputDir itself.
+        callWith(pdfBytes, name, Paths.get(job.outputDir()),
+                 job.dpi(), pages, job.skipQr(), job.addLinkAnnotations(),
+                 /* modifiedPdfOutput */ null, job.password());
+
+        // (f) exit 0 whenever report.json was written (parseError/timedOut are surfaced by the adapter)
+        return 0;
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)

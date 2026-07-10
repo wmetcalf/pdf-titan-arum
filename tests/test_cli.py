@@ -1,7 +1,7 @@
 from click.testing import CliRunner
 
-from titanarum.cli import cli
 from titanarum import __version__
+from titanarum.cli import cli
 
 
 def test_version_command():

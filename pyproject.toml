@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "titanarum"
+version = "0.1.0"
+description = "pdf-titan-arum PDF forensic engine for blastbox"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+dependencies = [
+    "blastbox>=0.1.15,<0.2",
+    "click>=8.1,<9.0",
+    "structlog>=24.1.0,<26.0",
+    "jsonschema>=4.0,<5.0",
+]
+
+[project.optional-dependencies]
+host = ["blastbox[host]>=0.1.15,<0.2"]
+dev = [
+    "blastbox[host]>=0.1.15,<0.2",
+    "pytest>=8.0.0,<9.0",
+    "ruff>=0.3.0,<1.0",
+    "mypy>=1.9.0,<2.0",
+]
+
+[project.scripts]
+titanarum = "titanarum.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["titanarum*"]
+
+[tool.setuptools.package-data]
+titanarum = ["static/index.html", "static/assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra -q"
+markers = [
+    "jvm: requires JDK + the built pdf-titan-arum jar (deselect with -m 'not jvm')",
+    "docker: requires Docker daemon and pre-built images (deselect with -m 'not docker')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N"]

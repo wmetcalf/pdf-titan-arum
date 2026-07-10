@@ -34,3 +34,10 @@ def test_ai_analysis_is_open_object():
     report = _load()
     report["aiAnalysis"] = {"threatLevel": "clean", "vendorSpecificKey": 1}
     validate_report(report)  # aiAnalysis allows additionalProperties
+
+
+def test_unexpected_top_level_key_rejected():
+    report = _load()
+    report["unexpectedKey"] = 1
+    with pytest.raises(SchemaValidationError):
+        validate_report(report)

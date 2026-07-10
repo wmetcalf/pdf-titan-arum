@@ -26,23 +26,15 @@ _NUM = {"type": "number"}
 _BOOL = {"type": "boolean"}
 
 
-def _obj(props: dict[str, Any], required: list[str] | None = None,
-         additional: bool = False) -> dict[str, Any]:
-    s: dict[str, Any] = {"type": "object", "properties": props,
-                         "additionalProperties": additional}
-    if required:
-        s["required"] = required
-    return s
-
-
 def _arr(items: dict[str, Any]) -> dict[str, Any]:
     return {"type": "array", "items": items}
 
 
-# Root schema. Nested records are intentionally permissive on their OWN fields
-# (properties listed for the ones we consume; unknown inner keys rejected via
-# additionalProperties=False on the records we map, open where the report is
-# free-form). We validate presence/type of what the mapper depends on.
+# Root schema. The ROOT object is closed (additionalProperties: false, see
+# below) so an unexpected top-level key is rejected. Nested array-item
+# schemas (urls, javascript, embeddedFiles, etc.) are intentionally
+# permissive ({"type": "object"}) for now -- the mapper only reads the
+# fields it knows about and ignores the rest.
 
 _SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

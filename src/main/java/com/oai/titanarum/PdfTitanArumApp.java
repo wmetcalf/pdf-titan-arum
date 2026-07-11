@@ -200,6 +200,13 @@ public class PdfTitanArumApp implements Callable<Integer> {
             description = "Worker mode: run a single job from the file-IPC control loop under <scratch>")
     private Path runScratch;
 
+    @Option(names = {"--appcds-warmup"},
+            description = "AOT-cache warmup mode: run every PDF in <dir> through the analysis "
+                    + "pipeline once each (QR on, OCR off) to force class-load+link of the "
+                    + "PDFBox/JBIG2/JPEG2000/ZXing/phone/autolink parser path for AOT-cache "
+                    + "recording, then exit 0. Used only by the AOT-cache record build step, never at runtime.")
+    private Path appcdsWarmupDir;
+
     @Option(names = {"--dpi"}, defaultValue = "150", description = "Render DPI for screenshots")
     private float dpi;
 
@@ -297,6 +304,9 @@ private boolean skipQrScan;
     public Integer call() throws Exception {
         if (runScratch != null) {
             return runWorker(runScratch);
+        }
+        if (appcdsWarmupDir != null) {
+            return runAppcdsWarmup(appcdsWarmupDir);
         }
         if (inputPdf == null) {
             System.err.println("ERROR: -i / --input is required");
@@ -5525,6 +5535,58 @@ for (int pageNum : pagesToProcess) {
                  /* modifiedPdfOutput */ null, job.password());
 
         // (f) exit 0 whenever report.json was written (parseError/timedOut are surfaced by the adapter)
+        return 0;
+    }
+
+    /**
+     * AOT-cache warmup mode (warm-plan.md W-2 / FINDING C). Mirrors RedTusk's
+     * {@code Main.runWarmup}: run every PDF in {@code corpusDir} through the SAME
+     * {@link #callWith} entry point a real job uses, so the AOT-cache recording run (invoked
+     * once, at image-build time, under {@code -XX:AOTMode=record}) actually class-loads and
+     * links the PDFBox / JBIG2 / JPEG2000 / ZXing / phone / autolink parser path. Those classes
+     * are otherwise loaded lazily inside {@code callWith} on a document's first job, so a
+     * snapshot/AOT-cache taken before any job ran would only capture JVM bootstrap, not the
+     * expensive parser path (Finding C).
+     *
+     * <p>Each file is run with QR scanning ON ({@code skipQrScan=false}) so the ZXing
+     * subprocess path is touched too; OCR stays off (the {@code ocrScreenshots}/
+     * {@code ocrUrlCrops} instance fields default to false and are never set here). Each file
+     * gets its own throwaway output directory under the system temp dir -- the warmup run's
+     * reports are never consumed by anything.
+     *
+     * <p>A single bad/corrupt/garbage fixture must never abort the run: warmup wants to touch
+     * as many code paths as possible over the whole corpus, so per-file failures are caught and
+     * logged to stderr rather than propagated. This method always returns 0 -- including when
+     * {@code corpusDir} doesn't exist -- because a warmup failure must never fail the image
+     * build; it just means less AOT coverage.
+     */
+    private Integer runAppcdsWarmup(Path corpusDir) {
+        if (!Files.isDirectory(corpusDir)) {
+            System.err.println("ERROR: --appcds-warmup target is not a directory: " + corpusDir);
+            return 0;
+        }
+        File[] pdfFiles = corpusDir.toFile().listFiles(
+                f -> f.isFile() && f.getName().toLowerCase(Locale.ROOT).endsWith(".pdf"));
+        if (pdfFiles != null) {
+            Arrays.sort(pdfFiles);
+        } else {
+            pdfFiles = new File[0];
+        }
+        for (File pdfFile : pdfFiles) {
+            Path tmpOut = null;
+            try {
+                byte[] bytes = Files.readAllBytes(pdfFile.toPath());
+                tmpOut = Files.createTempDirectory("titanarum-appcds-warmup-");
+                callWith(bytes, pdfFile.getName(), tmpOut, dpi, "default",
+                        /* skipQrScan */ false, /* addLinkAnnotations */ false,
+                        /* modifiedPdfOutput */ null, /* password */ null);
+                System.err.println("APPCDS_WARMUP_OK " + tmpOut);
+            } catch (Exception e) {
+                System.err.println("APPCDS_WARMUP_SKIP " + pdfFile.getName() + " ("
+                        + e.getClass().getSimpleName() + ": " + e.getMessage() + ")"
+                        + (tmpOut != null ? " out=" + tmpOut : ""));
+            }
+        }
         return 0;
     }
 

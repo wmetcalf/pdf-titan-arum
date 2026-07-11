@@ -7,9 +7,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -113,5 +118,63 @@ class RunWorkerModeTest {
         boolean delivered = PdfTitanArumApp.awaitGoSignal(go, false, pastDeadlineClock);
 
         assertFalse(delivered, "cold go-wait must remain bounded by the 600s deadline, now on the monotonic clock");
+    }
+
+    // --- W-2 (warm-plan.md FINDING C): `--appcds-warmup <dir>` runs every PDF in the corpus
+    // dir through the real callWith() pipeline (QR on, OCR off) so an AOT-cache recording run
+    // actually class-loads+links the PDFBox/JBIG2/JPEG2000/ZXing/phone/autolink parser path,
+    // instead of merely booting the JVM. A bad/garbage fixture must never abort the run.
+
+    @Test
+    void appcdsWarmup_processesEveryPdfInDir_andExitsZeroEvenWithGarbageFixture(@TempDir Path tmp) throws Exception {
+        Path corpus = tmp.resolve("corpus");
+        Files.createDirectories(corpus);
+
+        // Two real, valid 1-page PDFs -- same construction as runMode_readsJobJson_writesReport.
+        for (String name : new String[] {"a.pdf", "b.pdf"}) {
+            try (PDDocument doc = new PDDocument()) {
+                doc.addPage(new PDPage());
+                doc.save(corpus.resolve(name).toFile());
+            }
+        }
+        // A garbage fixture (no %PDF header at all) -- must not abort the warmup run.
+        Files.writeString(corpus.resolve("garbage.pdf"), "this is not a pdf");
+        // A non-PDF file -- must simply be ignored, not processed.
+        Files.writeString(corpus.resolve("notes.txt"), "irrelevant, not a pdf extension");
+
+        PrintStream originalErr = System.err;
+        ByteArrayOutputStream captured = new ByteArrayOutputStream();
+        int exit;
+        try {
+            System.setErr(new PrintStream(captured, true, StandardCharsets.UTF_8));
+            exit = new CommandLine(new PdfTitanArumApp())
+                    .execute("--appcds-warmup", corpus.toString());
+        } finally {
+            System.setErr(originalErr);
+        }
+
+        assertEquals(0, exit, "--appcds-warmup must exit 0, including when the corpus contains a bad fixture");
+
+        String log = captured.toString(StandardCharsets.UTF_8);
+        List<Path> warmedOutDirs = new ArrayList<>();
+        for (String line : log.split("\\R")) {
+            if (line.startsWith("APPCDS_WARMUP_OK ")) {
+                warmedOutDirs.add(Path.of(line.substring("APPCDS_WARMUP_OK ".length()).trim()));
+            }
+        }
+        assertTrue(warmedOutDirs.size() >= 2,
+                "expected callWith to run for at least the 2 valid PDFs; log was:\n" + log);
+        for (Path outDir : warmedOutDirs) {
+            assertTrue(Files.isRegularFile(outDir.resolve("report.json")),
+                    "each warmup pass must produce report.json in its throwaway output dir: " + outDir);
+        }
+    }
+
+    @Test
+    void appcdsWarmup_missingDir_stillExitsCleanly(@TempDir Path tmp) throws Exception {
+        Path doesNotExist = tmp.resolve("nope");
+        int exit = new CommandLine(new PdfTitanArumApp())
+                .execute("--appcds-warmup", doesNotExist.toString());
+        assertEquals(0, exit, "a missing/bad corpus dir must not fail the warmup build step");
     }
 }

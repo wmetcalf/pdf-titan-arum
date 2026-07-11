@@ -10,10 +10,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -53,6 +55,14 @@ _DEFAULT_JVM_FLAGS: tuple[str, ...] = (
 )
 
 _READY_POLL_S = 0.1
+
+# Warm tier: a FIXED scratch (not per-job tempdir) so a checkpoint/restore
+# sandbox can bind-mount the same path across the JVM's pre-boot and its one
+# dispatched job. warmup() never raises, so a slow/failed boot just degrades
+# to cold with no fixed-scratch side effect other than an unused directory.
+_DEFAULT_WARM_SCRATCH = "/tmp/titanarum-warm"
+_WARMUP_READY_TIMEOUT = 60.0
+_WARMUP_POLL_S = 0.05
 
 # Warm-friendly defaults: screenshots/images ON, OCR OFF. No AI keys (network=none).
 _DEFAULT_JOB: dict[str, Any] = {
@@ -184,6 +194,49 @@ def _run_worker(input_path: Path, report_outdir: Path, *,
             stderr = result.stderr.decode("utf-8", "replace")[-2000:]
             raise RuntimeError(
                 f"titanarum-worker (jvm) exited {result.returncode}: {stderr}")
+
+
+@dataclass
+class _WarmWorker:
+    """A persistent JVM booted by `warmup()`, blocked on `control.go`, good for
+    exactly one job (fixed scratch, one-shot handshake mirrors the cold path)."""
+
+    proc: subprocess.Popen[bytes]
+    scratch: Path
+    in_dir: Path
+    control_dir: Path
+
+
+def _run_warm_job(warm: _WarmWorker, input_path: Path, report_dir: Path, *,
+                  timeout: float, sha256: str) -> None:
+    """Hand ONE job to an already-booted, already-blocked-on-go warm JVM.
+
+    Raises on any failure (timeout, nonzero exit, missing report.json); the
+    caller is expected to catch and fail closed to `_run_worker` (cold)."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+    filename_hint = input_path.name or "input.pdf"
+    staged_in = warm.in_dir / filename_hint
+    staged_in.write_bytes(input_path.read_bytes())
+
+    job = _build_job(staged_in, report_dir, sha256)
+    (warm.control_dir / "job.json").write_text(
+        json.dumps(job, ensure_ascii=False), encoding="utf-8")
+    (warm.control_dir / "control.go").touch()
+
+    try:
+        warm.proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        warm.proc.kill()
+        try:
+            warm.proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001 - best-effort reap, we're failing closed anyway
+            pass
+        raise
+
+    if warm.proc.returncode != 0:
+        raise RuntimeError(f"titanarum-warm-worker (jvm) exited {warm.proc.returncode}")
+    if not (report_dir / "report.json").is_file():
+        raise RuntimeError("titanarum-warm-worker did not produce report.json")
 
 
 # --- report.json -> DetonationResult mapping --------------------------------
@@ -483,6 +536,67 @@ class TitanArumEngine:
     name: str = "titanarum"
     formats: frozenset[str] = frozenset({"pdf"})
 
+    def __init__(self) -> None:
+        self._warm: _WarmWorker | None = None
+
+    def warmup(self) -> None:
+        """Pre-boot a persistent JVM in `--run` mode and block it on the go-wait
+        (unbounded per W-1, since `TITANARUM_WARM=1` is set). Never raises: a
+        failed/slow boot just leaves `self._warm` None, which degrades the next
+        `detonate()` to the cold path."""
+        self._warm = None
+        try:
+            scratch = Path(_DEFAULT_WARM_SCRATCH)
+            in_dir = scratch / "in"
+            control_dir = scratch / "control"
+            in_dir.mkdir(parents=True, exist_ok=True)
+            control_dir.mkdir(parents=True, exist_ok=True)
+            # Clear stale control files from a prior life of this fixed scratch
+            # so the new JVM's ready/go handshake can't be short-circuited.
+            for stale in ("control.ready", "control.go", "job.json"):
+                (control_dir / stale).unlink(missing_ok=True)
+
+            argv = _java_worker_argv(scratch)
+            env = dict(os.environ)
+            env["TITANARUM_WARM"] = "1"
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+
+            ready_file = control_dir / "control.ready"
+            deadline = time.monotonic() + _WARMUP_READY_TIMEOUT
+            while True:
+                if ready_file.exists():
+                    self._warm = _WarmWorker(proc=proc, scratch=scratch,
+                                             in_dir=in_dir, control_dir=control_dir)
+                    return
+                if proc.poll() is not None:
+                    return  # died before announcing ready -> stays cold
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
+                time.sleep(_WARMUP_POLL_S)
+        except Exception:  # noqa: BLE001 - a raised warmup fails the slot; degrade instead
+            self._warm = None
+
+    def close(self) -> None:
+        """Tear down an unused warm JVM (e.g. blastbox discards the slot without
+        ever dispatching a job to it): kill the proc and clean up its scratch."""
+        warm, self._warm = self._warm, None
+        if warm is None:
+            return
+        try:
+            if warm.proc.poll() is None:
+                warm.proc.kill()
+                warm.proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+        finally:
+            shutil.rmtree(warm.scratch, ignore_errors=True)
+
     def detonate(self, input: Path, outdir: Path, limits) -> DetonationResult:  # noqa: A002
         from blastbox.worker.engine import DetonationResult
 
@@ -504,11 +618,25 @@ class TitanArumEngine:
                                 detected=detected, warnings=warnings, status=status)
 
     def _produce_report(self, input: Path, report_dir: Path, timeout: float) -> None:
-        # Phase 1: cold only. Phase 2 adds CRaC -> warm -> cold tier selection here.
+        """Tier precedence: CRaC -> warm -> cold."""
         sha256 = _sha256_file(input)
         # titanarum's own watchdog slightly below the subprocess timeout to keep partial output.
-        _run_worker(input, report_dir, timeout=timeout if timeout > 0 else 120.0,
-                    sha256=sha256)
+        effective_timeout = timeout if timeout > 0 else 120.0
+
+        # TODO(Task 14): TITANARUM_CRAC_CHECKPOINT restore-from-checkpoint tier
+        # goes here, ahead of warm. Not implemented yet -> falls through below.
+
+        warm = self._warm
+        if warm is not None and warm.proc.poll() is None:
+            self._warm = None  # one job per warm JVM
+            try:
+                _run_warm_job(warm, input, report_dir,
+                              timeout=effective_timeout, sha256=sha256)
+                return
+            except Exception:  # noqa: BLE001 - fail-closed: fall through to cold
+                pass
+
+        _run_worker(input, report_dir, timeout=effective_timeout, sha256=sha256)
 
 
 def _sha256_file(path: Path) -> str:

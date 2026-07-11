@@ -60,15 +60,6 @@ import com.google.i18n.phonenumbers.geocoding.PhoneNumberOfflineGeocoder;
 import org.nibor.autolink.LinkExtractor;
 import org.nibor.autolink.LinkSpan;
 import org.nibor.autolink.LinkType;
-import com.google.zxing.BarcodeFormat;
-import com.google.zxing.BinaryBitmap;
-import com.google.zxing.DecodeHintType;
-import com.google.zxing.NotFoundException;
-import com.google.zxing.Result;
-import com.google.zxing.ResultPoint;
-import com.google.zxing.common.HybridBinarizer;
-import com.google.zxing.multi.qrcode.QRCodeMultiReader;
-import com.google.zxing.client.j2se.BufferedImageLuminanceSource;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -239,6 +230,8 @@ private boolean skipQrScan;
     private final ObjectMapper mapper = new ObjectMapper()
             .setSerializationInclusion(JsonInclude.Include.NON_NULL)
             .enable(SerializationFeature.INDENT_OUTPUT);
+
+    private final ZXingReaderScanner qrScanner = new ZXingReaderScanner();
 
     public static void main(String[] args) {
         CommandLine cmd = new CommandLine(new PdfTitanArumApp());
@@ -2893,50 +2886,44 @@ for (int pageNum : pagesToProcess) {
         if (input == null || input.getWidth() < 40 || input.getHeight() < 40) {
             return results;
         }
-        BufferedImage image = input;
-        int maxDim = Math.max(image.getWidth(), image.getHeight());
-        if (maxDim > 1200) {
-            double scale = 1200.0 / maxDim;
-            int w = Math.max(1, (int) Math.round(image.getWidth() * scale));
-            int h = Math.max(1, (int) Math.round(image.getHeight() * scale));
-            BufferedImage scaled = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-            Graphics2D g = scaled.createGraphics();
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.drawImage(image, 0, 0, w, h, null);
-            g.dispose();
-            image = scaled;
-        }
+        File tmp = null;
         try {
-            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(new BufferedImageLuminanceSource(image)));
-            Map<DecodeHintType, Object> hints = new HashMap<>();
-            hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
-            Result[] decoded = new QRCodeMultiReader().decodeMultiple(bitmap, hints);
-            if (decoded != null) {
-                for (Result result : decoded) {
-                    QrCodeHit hit = new QrCodeHit();
-                    hit.text = result.getText();
-                    hit.format = result.getBarcodeFormat() == null ? null : result.getBarcodeFormat().toString();
-                    if (result.getResultPoints() != null && result.getResultPoints().length > 0) {
-                        hit.points = new ArrayList<>();
-                        for (ResultPoint point : result.getResultPoints()) {
-                            if (point == null) continue;
-                            QrPoint qp = new QrPoint();
-                            qp.x = point.getX();
-                            qp.y = point.getY();
-                            hit.points.add(qp);
-                        }
-                    }
-                    results.add(hit);
-                }
+            tmp = File.createTempFile("titanarum-qr", ".png");
+            ImageIO.write(input, "png", tmp);
+            for (ZXingReaderScanner.QrResult r : qrScanner.scan(tmp.toPath())) {
+                QrCodeHit hit = new QrCodeHit();
+                hit.text = r.text();
+                hit.format = r.format();
+                hit.error = r.error();
+                hit.points = parseQrPosition(r.position());
+                results.add(hit);
             }
-        } catch (NotFoundException ignored) {
-            // no QR codes found
         } catch (Exception e) {
             QrCodeHit hit = new QrCodeHit();
             hit.error = e.getMessage();
             results.add(hit);
+        } finally {
+            if (tmp != null) tmp.delete();
         }
         return results;
+    }
+
+    private static List<QrPoint> parseQrPosition(String position) {
+        if (position == null || position.isBlank()) return null;
+        List<QrPoint> pts = new ArrayList<>();
+        for (String tok : position.trim().split("\\s+")) {
+            int xi = tok.indexOf('x');
+            if (xi <= 0) continue;
+            try {
+                QrPoint qp = new QrPoint();
+                qp.x = (float) Double.parseDouble(tok.substring(0, xi));
+                qp.y = (float) Double.parseDouble(tok.substring(xi + 1));
+                pts.add(qp);
+            } catch (NumberFormatException ignore) {
+                // skip a malformed coordinate token
+            }
+        }
+        return pts.isEmpty() ? null : pts;
     }
 
     private static double sinc(double x) {

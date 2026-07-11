@@ -114,6 +114,14 @@ RUN mv /opt/titanarum/bin/python3 /opt/titanarum/bin/python3.venv-real \
 RUN mkdir -p /opt/blastbox \
     && printf '%s' "${ENGINE}" > /opt/blastbox/engine
 
+# The blastbox gVisor warm AGENT itself: run_warm.py (the BLASTBOX_GVISOR_WARM_ARGV
+# entrypoint) + its engines.py registry (a generic module:Class loader). These live
+# in the blastbox REPO's deploy/ dir, NOT the pip package, so they are vendored into
+# titanarum's deploy/gvisor/ and COPY'd here — otherwise /opt/blastbox/run_warm.py
+# would be absent from the exported rootfs and the warm worker cannot start.
+COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
+COPY deploy/gvisor/engines.py /opt/blastbox/engines.py
+
 # Belt-and-suspenders read/execute permissions for the fixed uid 65532 the gVisor
 # runtime always runs as (see the /in /out /ctrl comment above) -- COPY/RUN default
 # umask already leaves these world-readable, but AOT-cache/jar files are large and

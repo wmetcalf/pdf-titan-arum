@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from blastbox.contract import (
     ArtifactRef,
@@ -29,6 +29,11 @@ from blastbox.contract import (
     Record,
     Warning,
 )
+
+from titanarum.schema import validate_report
+
+if TYPE_CHECKING:
+    from blastbox.worker.engine import DetonationResult
 
 # --- JVM launch configuration (all env-overridable) ------------------------
 
@@ -457,3 +462,49 @@ def _status_from_report(report: dict) -> str:
     if any(m in err for m in _ENCRYPTED_MARKERS) or any(m in err for m in _NOT_PDF_MARKERS):
         return "rejected"
     return "ok"  # e.g. "Recovered (lenient parse)" -> ok + a Warning
+
+
+# --- Engine adapter ----------------------------------------------------------
+
+class TitanArumEngine:
+    """blastbox Engine (structural Protocol) fronting the pdf-titan-arum JVM analyzer."""
+
+    name: str = "titanarum"
+    formats: frozenset[str] = frozenset({"pdf"})
+
+    def detonate(self, input: Path, outdir: Path, limits) -> DetonationResult:  # noqa: A002
+        from blastbox.worker.engine import DetonationResult
+
+        report_dir = outdir / "titan"
+        self._produce_report(input, report_dir, timeout=float(limits.timeout_s))
+
+        report_path = report_dir / "report.json"
+        if not report_path.is_file():
+            raise RuntimeError("titanarum worker did not produce report.json")
+        report = json.loads(report_path.read_bytes())
+        validate_report(report)
+
+        artifacts = _enumerate_artifacts(outdir, report_dir, report)
+        payload = _build_payload(report, artifacts)
+        detected = _build_detection(report)
+        warnings = _build_warnings(report)
+        status = _status_from_report(report)
+        return DetonationResult(payload=payload, artifacts=artifacts,
+                                detected=detected, warnings=warnings, status=status)
+
+    def _produce_report(self, input: Path, report_dir: Path, timeout: float) -> None:
+        # Phase 1: cold only. Phase 2 adds CRaC -> warm -> cold tier selection here.
+        sha256 = _sha256_file(input)
+        # titanarum's own watchdog slightly below the subprocess timeout to keep partial output.
+        _run_worker(input, report_dir, timeout=timeout if timeout > 0 else 120.0,
+                    sha256=sha256)
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()

@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from blastbox.contract import (
     ArtifactRef,
@@ -188,7 +188,8 @@ def _run_worker(input_path: Path, report_outdir: Path, *,
 
 # --- report.json -> DetonationResult mapping --------------------------------
 
-_HASH_ALGOS = {"sha256", "phash", "dhash", "colorhash"}  # contract Hash.algo (ahash n/a)
+_HASH_ALGOS: frozenset[Literal["sha256", "phash", "dhash", "colorhash"]] = frozenset(
+    {"sha256", "phash", "dhash", "colorhash"})  # contract Hash.algo (ahash n/a)
 _ID_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -217,7 +218,7 @@ def _enumerate_artifacts(outdir: Path, report_dir: Path,
     used: set[str] = set()
     arts: list[DeclaredArtifact] = []
 
-    def _declare(fp: Path) -> DeclaredArtifact | None:
+    def _declare(fp: Path) -> DeclaredArtifact:
         rel = fp.relative_to(outdir).as_posix()
         if fp.name == "report.json" and fp.parent == report_dir:
             kind = "report"
@@ -455,7 +456,7 @@ _ENCRYPTED_MARKERS = ("password-protected", "incorrect password")
 _NOT_PDF_MARKERS = ("does not contain a pdf header", "pdf parse error")
 
 
-def _status_from_report(report: dict) -> str:
+def _status_from_report(report: dict) -> Literal["ok", "rejected"]:
     err = (report.get("parseError") or "").lower()
     if not err:
         return "ok"

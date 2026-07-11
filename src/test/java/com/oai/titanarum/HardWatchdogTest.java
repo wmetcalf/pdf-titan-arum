@@ -63,23 +63,80 @@ class HardWatchdogTest {
         pb.redirectErrorStream(true);
         pb.redirectOutput(tmp.resolve("child.log").toFile());
 
-        long startNanos = System.nanoTime();
         Process proc = pb.start();
-        boolean exited = proc.waitFor(30, TimeUnit.SECONDS);
+        try {
+            long startNanos = System.nanoTime();
+            boolean exited = proc.waitFor(30, TimeUnit.SECONDS);
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+            assertTrue(exited, "the hung child JVM must hard-halt itself; it must not need to be killed by the test");
+            assertEquals(3, proc.exitValue(), "Runtime.getRuntime().halt(3) must produce exit code 3");
+            assertTrue(elapsedMs < 15_000,
+                    "the hard halt must fire close to the configured deadline (~2.5s), took " + elapsedMs + "ms");
+
+            Path report = outDir.resolve("report.json");
+            assertTrue(Files.isRegularFile(report), "a partial report.json must be flushed before halt(3)");
+            String body = Files.readString(report);
+            assertTrue(body.contains("\"documentSha256\""),
+                    "partial report must contain fields computed before the hang: " + body);
+            assertTrue(body.replaceAll("\\s", "").contains("\"timedOut\":true"),
+                    "partial report flushed by the hard watchdog must be marked timedOut: " + body);
+        } finally {
+            // Fix 5 (I2 review): if a future regression means the watchdog never fires,
+            // waitFor(...) above returns false and the assertTrue on `exited` throws --
+            // without this, the still-spinning child (TITANARUM_TEST_HANG_SPIN busy-loops
+            // forever, ignoring interrupt) would leak as an orphaned process in CI.
+            proc.destroyForcibly();
+        }
+    }
+
+    /**
+     * Fix 3 (I2 review): the safety-critical "no false halt on a healthy job" scenario. This
+     * runs {@code callWith} in-process (no child JVM needed -- a normal job never halts) with a
+     * GENEROUS cooperative timeout on a minimal valid PDF that completes in well under a second.
+     * The hard watchdog is still armed (timeoutSeconds > 0), so this exercises that it is
+     * correctly disarmed ({@code _hardWatchdog.shutdownNow()} in callWith's finally) on normal
+     * completion rather than firing spuriously. If the watchdog ever mis-fired here, {@code
+     * Runtime.getRuntime().halt(3)} would kill this very test JVM immediately -- so every
+     * assertion below executing at all is itself part of the proof that no halt occurred.
+     */
+    @Test
+    void healthyJob_withGenerousCooperativeTimeout_completesNormally_noFalseHalt(@TempDir Path tmp) throws Exception {
+        Path pdf = tmp.resolve("in.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            doc.addPage(new PDPage());
+            doc.save(pdf.toFile());
+        }
+        Path out = tmp.resolve("out");
+        Files.createDirectories(out);
+
+        PdfTitanArumApp app = new PdfTitanArumApp();
+        app.setTimeout(30); // generous cooperative deadline; job finishes in well under 1s
+        app.setSkipScreenshots(true);
+        app.setSkipPhones(true);
+        app.setSkipTextUrls(true);
+        app.setSkipPageExport(true);
+
+        byte[] pdfBytes = Files.readAllBytes(pdf);
+        long startNanos = System.nanoTime();
+        PdfTitanArumApp.AnalysisReport report = app.callWith(
+                pdfBytes, "in.pdf", out, 150f, "1",
+                /* skipQrScan */ true, /* addLinkAnnotations */ false,
+                /* modifiedPdfOutput */ null, /* password */ null);
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
 
-        assertTrue(exited, "the hung child JVM must hard-halt itself; it must not need to be killed by the test");
-        assertEquals(3, proc.exitValue(), "Runtime.getRuntime().halt(3) must produce exit code 3");
-        assertTrue(elapsedMs < 15_000,
-                "the hard halt must fire close to the configured deadline (~2.5s), took " + elapsedMs + "ms");
+        assertNotNull(report, "a healthy job on a generous cooperative timeout must return a report normally");
+        assertTrue(elapsedMs < 5_000,
+                "sanity check that this job is actually fast (well under both the 30s cooperative "
+                        + "and hard deadlines), took " + elapsedMs + "ms");
+        assertFalse(report.timedOut,
+                "the report returned to the caller must not be marked timedOut for a healthy job");
 
-        Path report = outDir.resolve("report.json");
-        assertTrue(Files.isRegularFile(report), "a partial report.json must be flushed before halt(3)");
-        String body = Files.readString(report);
-        assertTrue(body.contains("\"documentSha256\""),
-                "partial report must contain fields computed before the hang: " + body);
-        assertTrue(body.replaceAll("\\s", "").contains("\"timedOut\":true"),
-                "partial report flushed by the hard watchdog must be marked timedOut: " + body);
+        Path reportPath = out.resolve("report.json");
+        assertTrue(Files.isRegularFile(reportPath), "the normal (non-watchdog) report.json write must have happened");
+        String body = Files.readString(reportPath);
+        assertFalse(body.replaceAll("\\s", "").contains("\"timedOut\":true"),
+                "the persisted report.json must not be marked timedOut for a healthy job: " + body);
     }
 
     private static String javaBinary() {

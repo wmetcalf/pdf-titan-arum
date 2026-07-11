@@ -391,28 +391,44 @@ private boolean skipQrScan;
         // above) -- timeoutSeconds<=0 means "no limit" was requested for both.
         final java.util.concurrent.atomic.AtomicReference<AnalysisReport> _reportRef =
             new java.util.concurrent.atomic.AtomicReference<>();
-        final long _hardTimeoutMs = envLong("TITANARUM_HARD_TIMEOUT_MS", 15_000L);
+        // Clamp: a misconfigured/non-positive TITANARUM_HARD_TIMEOUT_MS must never collapse
+        // the hard deadline onto (or before) the cooperative one -- the hard halt must always
+        // fire strictly after the cooperative timeout has had a chance to complete gracefully.
+        final long _hardTimeoutMs = Math.max(1L, envLong("TITANARUM_HARD_TIMEOUT_MS", 15_000L));
         final java.util.concurrent.ScheduledExecutorService _hardWatchdog = timeoutSeconds > 0
             ? java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> { Thread t = new Thread(r, "hard-halt-watchdog"); t.setDaemon(true); return t; })
             : null;
         if (_hardWatchdog != null) {
             long hardDelayMs = timeoutSeconds * 1000L + _hardTimeoutMs;
             _hardWatchdog.schedule(() -> {
-                try {
-                    AnalysisReport partial = _reportRef.get();
-                    if (partial != null) {
-                        partial.timedOut = true;
-                        if (partial.timedOutAfterMs == null) {
-                            partial.timedOutAfterMs = (System.nanoTime() - _startNanos) / 1_000_000;
+                // I2 fix: the halt(3) below is this watchdog's one guarantee, so it must never
+                // be gated on the partial-report flush completing. If mapper.writeValue blocks
+                // (e.g. a hung filesystem) a try/finally around it alone would never reach the
+                // finally clause and halt() would never fire. Instead, run the flush on its own
+                // daemon thread, join it with a short bound, then halt unconditionally --
+                // a hung write can delay the flush but can never prevent the halt.
+                Thread flush = new Thread(() -> {
+                    try {
+                        AnalysisReport partial = _reportRef.get();
+                        if (partial != null) {
+                            partial.timedOut = true;
+                            if (partial.timedOutAfterMs == null) {
+                                partial.timedOutAfterMs = (System.nanoTime() - _startNanos) / 1_000_000;
+                            }
+                            mapper.writeValue(this.outputDir.resolve("report.json").toFile(), partial);
                         }
-                        mapper.writeValue(this.outputDir.resolve("report.json").toFile(), partial);
+                    } catch (Throwable ignored) {
+                        // Best-effort only -- must still halt below even if the flush itself fails
+                        // (e.g. disk full, or the report was mid-mutation on the hung thread).
                     }
-                } catch (Throwable ignored) {
-                    // Best-effort only -- must still halt below even if the flush itself fails
-                    // (e.g. disk full, or the report was mid-mutation on the hung thread).
-                } finally {
-                    Runtime.getRuntime().halt(3);
+                }, "titanarum-hard-flush");
+                flush.setDaemon(true);
+                flush.start();
+                try {
+                    flush.join(1500L);
+                } catch (InterruptedException ignored) {
                 }
+                Runtime.getRuntime().halt(3);
             }, hardDelayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
 

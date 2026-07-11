@@ -135,6 +135,12 @@ final class ZXingReaderScanner {
     private static final class StreamDrain implements Runnable {
         private final InputStream in;
         private final Runnable onCapExceeded;
+        // Fix 4 (I2 review): written to incrementally by readCapped(..., buf) as bytes arrive,
+        // so a mid-read IOException (destroyForcibly() closing the pipe, a hung filesystem,
+        // etc.) still leaves whatever was captured so far visible via result() -- the previous
+        // version only assigned `result` from readCapped's return value, so any exception
+        // thrown out of readCapped silently discarded the partial buffer it had accumulated.
+        private final ByteArrayOutputStream buf = new ByteArrayOutputStream();
         private volatile byte[] result = new byte[0];
 
         StreamDrain(InputStream in, Runnable onCapExceeded) {
@@ -145,10 +151,12 @@ final class ZXingReaderScanner {
         @Override
         public void run() {
             try {
-                result = readCapped(in, onCapExceeded);
+                readCapped(in, onCapExceeded, buf);
             } catch (IOException e) {
                 // Stream broke mid-read (e.g. destroyForcibly() closed the pipe after a
                 // timeout) -- keep whatever was captured before that happened.
+            } finally {
+                result = buf.toByteArray();
             }
         }
 
@@ -192,6 +200,17 @@ final class ZXingReaderScanner {
      */
     static byte[] readCapped(InputStream in, Runnable onCapExceeded) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        readCapped(in, onCapExceeded, buf);
+        return buf.toByteArray();
+    }
+
+    /**
+     * Same as {@link #readCapped(InputStream, Runnable)} but writes into a caller-supplied
+     * buffer instead of a local one, so the caller (see {@link StreamDrain}) can still read
+     * out whatever was captured so far if {@code in.read()} throws partway through -- the
+     * buffer isn't scoped to this method's stack, so it survives the exception unwinding.
+     */
+    private static void readCapped(InputStream in, Runnable onCapExceeded, ByteArrayOutputStream buf) throws IOException {
         byte[] chunk = new byte[8192];
         int n;
         while (buf.size() < MAX_STDOUT && (n = in.read(chunk)) != -1) {
@@ -202,6 +221,5 @@ final class ZXingReaderScanner {
         if (buf.size() >= MAX_STDOUT && onCapExceeded != null) {
             onCapExceeded.run();
         }
-        return buf.toByteArray();
     }
 }

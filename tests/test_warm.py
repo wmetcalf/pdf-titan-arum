@@ -165,6 +165,177 @@ def test_warm_job_failure_falls_back_to_cold(tmp_path, monkeypatch):
     assert result.status in ("ok", "rejected")
 
 
+def test_warm_job_timeout_falls_back_to_cold_and_kills_hung_proc(tmp_path, monkeypatch):
+    """A warm JVM that is alive, accepts the job, but then HANGS past the
+    communicate() timeout (e.g. wedged in a native call) must fail closed to
+    the cold _run_worker path -- and the hung proc must be killed, not
+    leaked."""
+    scratch = tmp_path / "warm-scratch"
+    monkeypatch.setattr(eng, "_DEFAULT_WARM_SCRATCH", str(scratch))
+    in_dir = scratch / "in"
+    control_dir = scratch / "control"
+    in_dir.mkdir(parents=True)
+    control_dir.mkdir(parents=True)
+    (control_dir / "control.ready").touch()
+
+    # A worker that announces ready, waits for go, then hangs forever instead
+    # of ever exiting -- simulating a wedged warm job.
+    hang_worker = tmp_path / "hang_worker.py"
+    hang_worker.write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "control = Path(sys.argv[sys.argv.index('--run') + 1]) / 'control'\n"
+        "go = control / 'control.go'\n"
+        "deadline = time.monotonic() + 30\n"
+        "while time.monotonic() < deadline and not go.exists():\n"
+        "    time.sleep(0.02)\n"
+        "time.sleep(3600)\n"  # hang well past any test timeout; killed by the test
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(hang_worker), "-jar", "dummy.jar", "--run", str(scratch)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    engine = TitanArumEngine()
+    engine._warm = _WarmWorker(proc=proc, scratch=scratch, in_dir=in_dir, control_dir=control_dir)
+
+    # Route the COLD fallback to the real fake worker so detonate() can still
+    # succeed end-to-end.
+    _route_to_fake(monkeypatch)
+
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    try:
+        # A short timeout keeps the test fast: _run_warm_job's communicate()
+        # will raise TimeoutExpired well before the worker's own 3600s sleep.
+        result = engine.detonate(pdf, outdir, Limits(timeout_s=2))
+
+        assert engine._warm is None  # consumed by the (timed-out) warm attempt
+        report_path = outdir / "titan" / "report.json"
+        assert report_path.is_file()
+        assert result.status in ("ok", "rejected")
+        # The hung warm proc was killed rather than leaked.
+        assert proc.poll() is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_warm_job_exits_zero_without_report_falls_back_to_cold(tmp_path, monkeypatch):
+    """A warm JVM that is alive, accepts the job, and exits 0 -- but never
+    writes report.json (a silent no-op instead of an error) -- must fail
+    closed to the cold _run_worker path rather than surface a missing
+    report.json all the way up to detonate()."""
+    scratch = tmp_path / "warm-scratch"
+    monkeypatch.setattr(eng, "_DEFAULT_WARM_SCRATCH", str(scratch))
+    in_dir = scratch / "in"
+    control_dir = scratch / "control"
+    in_dir.mkdir(parents=True)
+    control_dir.mkdir(parents=True)
+    (control_dir / "control.ready").touch()
+
+    # A worker that announces ready, waits for go, reads job.json, then exits
+    # 0 WITHOUT ever writing report.json.
+    noreport_worker = tmp_path / "noreport_worker.py"
+    noreport_worker.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "control = Path(sys.argv[sys.argv.index('--run') + 1]) / 'control'\n"
+        "go = control / 'control.go'\n"
+        "deadline = time.monotonic() + 10\n"
+        "while time.monotonic() < deadline and not go.exists():\n"
+        "    time.sleep(0.02)\n"
+        "job = json.loads((control / 'job.json').read_text())\n"
+        "sys.exit(0)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(noreport_worker), "-jar", "dummy.jar", "--run", str(scratch)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    engine = TitanArumEngine()
+    engine._warm = _WarmWorker(proc=proc, scratch=scratch, in_dir=in_dir, control_dir=control_dir)
+
+    # Route the COLD fallback to the real fake worker so detonate() can still
+    # succeed end-to-end.
+    _route_to_fake(monkeypatch)
+
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    result = engine.detonate(pdf, outdir, Limits())
+
+    assert engine._warm is None  # consumed by the (report-less) warm attempt
+    report_path = outdir / "titan" / "report.json"
+    assert report_path.is_file()
+    assert result.status in ("ok", "rejected")
+
+
+def test_warm_failure_clears_stale_report_dir_before_cold_fallback(tmp_path, monkeypatch):
+    """A warm attempt that dies mid-processing may leave partial output files
+    under report_dir (e.g. an attachment written before the crash). The cold
+    fallback must NOT inherit those stale files: _produce_report clears
+    report_dir before invoking _run_worker, so _enumerate_artifacts's rglob
+    sweep can't pick up a leftover file the cold report.json never
+    references (parity-critical for the cold-vs-warm gate)."""
+    scratch = tmp_path / "warm-scratch"
+    monkeypatch.setattr(eng, "_DEFAULT_WARM_SCRATCH", str(scratch))
+    in_dir = scratch / "in"
+    control_dir = scratch / "control"
+    in_dir.mkdir(parents=True)
+    control_dir.mkdir(parents=True)
+    (control_dir / "control.ready").touch()
+
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    report_dir = outdir / "titan"
+
+    # A worker that announces ready, waits for go, writes a STRAY partial file
+    # directly under report_dir (as a mid-crash warm run might), then exits
+    # nonzero without ever writing report.json.
+    stray_worker = tmp_path / "stray_worker.py"
+    stray_worker.write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "control = Path(sys.argv[sys.argv.index('--run') + 1]) / 'control'\n"
+        "go = control / 'control.go'\n"
+        "deadline = time.monotonic() + 10\n"
+        "while time.monotonic() < deadline and not go.exists():\n"
+        "    time.sleep(0.02)\n"
+        f"stray_dir = Path(r'{report_dir}') / 'attachments'\n"
+        "stray_dir.mkdir(parents=True, exist_ok=True)\n"
+        "(stray_dir / 'partial-1.bin').write_bytes(b'partial-warm-output')\n"
+        "sys.exit(3)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(stray_worker), "-jar", "dummy.jar", "--run", str(scratch)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    engine = TitanArumEngine()
+    engine._warm = _WarmWorker(proc=proc, scratch=scratch, in_dir=in_dir, control_dir=control_dir)
+
+    _route_to_fake(monkeypatch)
+
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    result = engine.detonate(pdf, outdir, Limits())
+
+    assert engine._warm is None
+    report_path = outdir / "titan" / "report.json"
+    assert report_path.is_file()
+    assert result.status in ("ok", "rejected")
+    # The stray file left by the dying warm attempt must be gone -- the cold
+    # fallback cleared report_dir before writing its own complete set.
+    assert not (report_dir / "attachments" / "partial-1.bin").is_file()
+    stray_rel = "titan/attachments/partial-1.bin"
+    assert not any(a.path == stray_rel for a in result.artifacts)
+
+
 def test_close_tears_down_unused_warm_worker(tmp_path, monkeypatch):
     _route_to_fake(monkeypatch)
     scratch = tmp_path / "warm-scratch"

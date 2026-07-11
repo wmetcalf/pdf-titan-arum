@@ -559,8 +559,15 @@ class TitanArumEngine:
             argv = _java_worker_argv(scratch)
             env = dict(os.environ)
             env["TITANARUM_WARM"] = "1"
-            proc = subprocess.Popen(
-                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            # Boot/job stdout+stderr go to a FILE (not DEVNULL) so a failed or
+            # wedged warm boot leaves a post-mortem trail -- a file, unlike a
+            # pipe, has no pipe-buffer deadlock risk, so it's safe alongside
+            # the unbounded go-wait. .stdout/.stderr on the Popen stay None
+            # (same as DEVNULL), so communicate()/wait() are unaffected.
+            log_path = scratch / "warm-boot.log"
+            with log_path.open("wb") as log_file:
+                proc = subprocess.Popen(
+                    argv, stdout=log_file, stderr=subprocess.STDOUT, env=env)
 
             ready_file = control_dir / "control.ready"
             deadline = time.monotonic() + _WARMUP_READY_TIMEOUT
@@ -627,15 +634,28 @@ class TitanArumEngine:
         # goes here, ahead of warm. Not implemented yet -> falls through below.
 
         warm = self._warm
-        if warm is not None and warm.proc.poll() is None:
-            self._warm = None  # one job per warm JVM
-            try:
-                _run_warm_job(warm, input, report_dir,
-                              timeout=effective_timeout, sha256=sha256)
-                return
-            except Exception:  # noqa: BLE001 - fail-closed: fall through to cold
-                pass
+        if warm is not None:
+            # Always consume: a warm handle is tried at most once, whether it
+            # turns out to be alive or already dead on arrival (Fix 4).
+            self._warm = None
+            if warm.proc.poll() is None:
+                try:
+                    _run_warm_job(warm, input, report_dir,
+                                  timeout=effective_timeout, sha256=sha256)
+                    return
+                except Exception:  # noqa: BLE001 - fail-closed: fall through to cold
+                    pass
 
+        # Cold fallback (first attempt, or after a failed/dead warm attempt).
+        # A warm attempt that died mid-processing may have left partial
+        # attachment/image files under report_dir (the Java uniquePath()
+        # appends -1/-2 rather than overwriting); clearing the dir before the
+        # cold retry writes its own complete set prevents _enumerate_artifacts's
+        # rglob sweep from picking up stale warm-run files that the cold
+        # report.json never references, which would break cold-vs-warm parity
+        # (Task 8). No-op when report_dir was never created (plain cold path
+        # or a warm success, which already returned above).
+        shutil.rmtree(report_dir, ignore_errors=True)
         _run_worker(input, report_dir, timeout=effective_timeout, sha256=sha256)
 
 

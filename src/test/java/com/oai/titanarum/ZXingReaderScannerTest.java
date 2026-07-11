@@ -2,7 +2,13 @@ package com.oai.titanarum;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -29,6 +35,41 @@ class ZXingReaderScannerTest {
     @Test
     void requiresFormatField() {
         assertTrue(ZXingReaderScanner.parseJsonLines("{\"Text\":\"x\"}").isEmpty());
+    }
+
+    @Test
+    void readCapped_truncatesAtExactlyOneMiB_andSignalsKill() throws IOException {
+        // Child emits well over 1 MiB of output (I1: check-before-write must never overshoot).
+        final int oneMiB = 1 << 20;
+        final int over = oneMiB + 50_000;
+        InputStream endless = new InputStream() {
+            int remaining = over;
+            @Override public int read() {
+                if (remaining <= 0) return -1;
+                remaining--;
+                return 'A';
+            }
+            @Override public int read(byte[] b, int off, int len) {
+                if (remaining <= 0) return -1;
+                int n = Math.min(len, remaining);
+                Arrays.fill(b, off, off + n, (byte) 'A');
+                remaining -= n;
+                return n;
+            }
+        };
+        AtomicBoolean killed = new AtomicBoolean(false);
+        byte[] out = ZXingReaderScanner.readCapped(endless, () -> killed.set(true));
+        assertEquals(oneMiB, out.length, "stdout must be truncated at exactly the 1 MiB cap");
+        assertTrue(killed.get(), "child must be signalled for a forced kill once the cap is exceeded");
+    }
+
+    @Test
+    void readCapped_underCap_doesNotSignalKill() throws IOException {
+        byte[] small = "hello world".getBytes(StandardCharsets.UTF_8);
+        AtomicBoolean killed = new AtomicBoolean(false);
+        byte[] out = ZXingReaderScanner.readCapped(new ByteArrayInputStream(small), () -> killed.set(true));
+        assertArrayEquals(small, out);
+        assertFalse(killed.get(), "child must not be killed when output stays under the cap");
     }
 
     @org.junit.jupiter.api.Test

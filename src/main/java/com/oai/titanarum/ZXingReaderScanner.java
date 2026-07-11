@@ -30,7 +30,20 @@ final class ZXingReaderScanner {
         this.executable = (bin == null || bin.isBlank()) ? "ZXingReader" : bin;
         String fmt = System.getenv("TITANARUM_ZXING_FORMATS");
         this.formats = (fmt == null) ? "QRCode" : fmt;   // preserves current QR-only behavior
-        this.timeoutMillis = 60_000L;
+        // I1: 60s per-scan timeout is a fork-pressure/wall-clock DoS amplifier under a
+        // QR-flood PDF, more so once a warm JVM reuses the process. Drop the default and
+        // make it operator-tunable.
+        this.timeoutMillis = envLong("TITANARUM_ZXING_TIMEOUT_MS", 5_000L);
+    }
+
+    private static long envLong(String name, long def) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) return def;
+        try {
+            return Long.parseLong(v.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
     }
 
     List<String> buildCommand(Path image) {
@@ -51,7 +64,8 @@ final class ZXingReaderScanner {
         Process proc = null;
         try {
             proc = pb.start();
-            byte[] out = readCapped(proc.getInputStream());
+            final Process forked = proc;
+            byte[] out = readCapped(proc.getInputStream(), forked::destroyForcibly);
             boolean done = proc.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
             if (!done) {
                 proc.destroyForcibly();
@@ -91,12 +105,29 @@ final class ZXingReaderScanner {
         return results;
     }
 
-    private static byte[] readCapped(InputStream in) throws IOException {
+    /**
+     * Reads {@code in} into memory, hard-capped at {@link #MAX_STDOUT} bytes.
+     *
+     * <p>I1 fix: the cap is checked <em>before</em> each write so the returned buffer never
+     * overshoots {@code MAX_STDOUT} (the previous check-after-write let a single 8 KiB chunk
+     * push the result past the cap). If the cap is reached — meaning the child produced at
+     * least that much output and may still be writing — {@code onCapExceeded} is invoked so
+     * the caller can forcibly kill the child rather than let it run to its full timeout.
+     *
+     * <p>Package-private (not private) so it can be unit-tested directly with a fake
+     * {@link InputStream} and a fake kill callback, without needing a real subprocess.
+     */
+    static byte[] readCapped(InputStream in, Runnable onCapExceeded) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         byte[] chunk = new byte[8192];
         int n;
-        while ((n = in.read(chunk)) != -1 && buf.size() < MAX_STDOUT) {
-            buf.write(chunk, 0, n);
+        while (buf.size() < MAX_STDOUT && (n = in.read(chunk)) != -1) {
+            int room = MAX_STDOUT - buf.size();
+            int toWrite = Math.min(room, n);
+            buf.write(chunk, 0, toWrite);
+        }
+        if (buf.size() >= MAX_STDOUT && onCapExceeded != null) {
+            onCapExceeded.run();
         }
         return buf.toByteArray();
     }

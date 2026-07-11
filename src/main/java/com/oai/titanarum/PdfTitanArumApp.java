@@ -144,6 +144,52 @@ public class PdfTitanArumApp implements Callable<Integer> {
     private static final int MAX_NAME_TREE_DEPTH      = 50;
     private static final int MAX_DEREF_HOPS           = 50;
 
+    // I1 (warm-plan.md): per-document QR-scan / image-extraction budgets. scanQrCodes()
+    // forks a ZXingReader subprocess per call and is invoked once per screenshot, per
+    // resource image, and per drawn image with no document-level cap; a QR-flood PDF
+    // (thousands of >=40x40 images) is a fork-pressure / wall-clock DoS, more so once a
+    // warm JVM reuses the process across jobs. Configurable via env for ops tuning;
+    // overridable via setters (below) so tests can exercise the gate without needing
+    // hundreds of images or a slow subprocess fork loop.
+    private int maxQrScans = envInt("TITANARUM_MAX_QR_SCANS", 256);
+    private long qrTotalBudgetMs = envLong("TITANARUM_QR_TOTAL_BUDGET_MS", 30_000L);
+    private int maxImagesExtracted = envInt("TITANARUM_MAX_IMAGES_EXTRACTED", 2000);
+
+    public void setMaxQrScans(int v) { this.maxQrScans = v; }
+    public void setQrTotalBudgetMs(long v) { this.qrTotalBudgetMs = v; }
+    public void setMaxImagesExtracted(int v) { this.maxImagesExtracted = v; }
+
+    /** Number of QR scans actually performed for the current/last document (test visibility). */
+    public int getQrScanCount() { return qrScanCount; }
+
+    // Per-document budget state; reset at the top of callWith() so a warm/reused JVM never
+    // carries counters over from a previous job (see PdfTitanArumApp#callWith).
+    private int qrScanCount;
+    private long qrScanBudgetStartNanos;
+    private boolean qrScanBudgetExceeded;
+    private int imagesExtractedCount;
+    private boolean imagesExtractedCapExceeded;
+
+    private static int envInt(String name, int def) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) return def;
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static long envLong(String name, long def) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) return def;
+        try {
+            return Long.parseLong(v.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
     @Option(names = {"-i", "--input"}, required = false, description = "Input PDF")
     private Path inputPdf;
 
@@ -313,6 +359,14 @@ private boolean skipQrScan;
         this.addLinkAnnotations = addLinkAnnotations;
         this.modifiedPdfOutput = modifiedPdfOutput;
         this.password = password;
+        // I1: reset per-document QR-scan / image-extraction budget counters. Required even
+        // though today's --run mode is one-job-per-process, because a warm/reused JVM must
+        // never let one document's budget bleed into the next.
+        this.qrScanCount = 0;
+        this.qrScanBudgetStartNanos = System.nanoTime();
+        this.qrScanBudgetExceeded = false;
+        this.imagesExtractedCount = 0;
+        this.imagesExtractedCapExceeded = false;
         outputDir = this.outputDir;
         Files.createDirectories(outputDir);
         Thread.interrupted(); // clear any stale interrupt from a previous timed-out job on this thread
@@ -799,6 +853,22 @@ private boolean skipQrScan;
 
         // Structural anomaly detection
         List<StructuralAnomalyHit> sah = checkStructuralAnomalies(originalPdfBytes, pdfHeaderOffset, pdfBytes);
+        // I1: surface budget/cap trips as structural anomalies so downstream consumers can
+        // tell a report is incomplete because of a QR-flood / image-flood PDF.
+        if (qrScanBudgetExceeded) {
+            StructuralAnomalyHit h = new StructuralAnomalyHit();
+            h.type = "qr_scan_budget_exceeded";
+            h.detail = "QR scan budget exceeded (" + qrScanCount + "/" + maxQrScans
+                + " scans, " + qrTotalBudgetMs + "ms budget); further QR scans were skipped";
+            sah.add(h);
+        }
+        if (imagesExtractedCapExceeded) {
+            StructuralAnomalyHit h = new StructuralAnomalyHit();
+            h.type = "images_extracted_cap_exceeded";
+            h.detail = "Image extraction cap exceeded (" + imagesExtractedCount + "/" + maxImagesExtracted
+                + "); further images were skipped";
+            sah.add(h);
+        }
         if (!sah.isEmpty()) report.structuralAnomalies = sah;
 
         // Metadata spoofing indicators
@@ -2177,6 +2247,11 @@ for (int pageNum : pagesToProcess) {
         continue; // exact duplicate page, skip screenshot
     }
 
+    // I1: per-document image-extraction cap (drawn + resource + rendered/screenshot images)
+    if (!reserveImageExtractionSlot()) {
+        continue; // extraction cap reached; skip remaining screenshots
+    }
+
     // QR scan on the full-resolution render before downscaling (better detection)
     List<QrCodeHit> qrCodes = null;
     if (!skipQrScan) {
@@ -2286,6 +2361,10 @@ for (int pageNum : pagesToProcess) {
             }
             if (xObject instanceof PDImageXObject imageXObject) {
                 seen.add(cos);
+                // I1: per-document image-extraction cap; skip decode entirely once exhausted.
+                if (!reserveImageExtractionSlot()) {
+                    continue;
+                }
                 BufferedImage image = imageXObject.getImage();
                 Path file = uniquePath(outputDir, String.format(Locale.ROOT, "resource-page-%04d-%s.png", pageNumber, name.getName()));
                 ImageIO.write(image, "PNG", file.toFile());
@@ -2881,10 +2960,52 @@ for (int pageNum : pagesToProcess) {
         return String.valueOf(base);
     }
 
+    /**
+     * I1: reserves one slot in the per-document QR-scan budget. Returns false once either
+     * {@code maxQrScans} scans have been performed or {@code qrTotalBudgetMs} wall-clock
+     * milliseconds have elapsed since the document started processing; the first time either
+     * limit trips, {@code qrScanBudgetExceeded} is latched so callWith() can record a single
+     * {@code qr_scan_budget_exceeded} structuralAnomalies entry.
+     */
+    private boolean reserveQrScanSlot() {
+        if (qrScanBudgetExceeded) {
+            return false;
+        }
+        if (qrScanCount >= maxQrScans) {
+            qrScanBudgetExceeded = true;
+            return false;
+        }
+        long elapsedMs = (System.nanoTime() - qrScanBudgetStartNanos) / 1_000_000L;
+        if (elapsedMs >= qrTotalBudgetMs) {
+            qrScanBudgetExceeded = true;
+            return false;
+        }
+        qrScanCount++;
+        return true;
+    }
+
+    /**
+     * I1: reserves one slot in the per-document image-extraction budget (drawn + resource +
+     * rendered/screenshot images combined). Extraction itself was previously unbounded;
+     * once {@code maxImagesExtracted} is reached, further images are skipped and
+     * {@code imagesExtractedCapExceeded} is latched for a single anomaly entry.
+     */
+    private boolean reserveImageExtractionSlot() {
+        if (imagesExtractedCount >= maxImagesExtracted) {
+            imagesExtractedCapExceeded = true;
+            return false;
+        }
+        imagesExtractedCount++;
+        return true;
+    }
+
     private List<QrCodeHit> scanQrCodes(BufferedImage input) {
         List<QrCodeHit> results = new ArrayList<>();
         if (input == null || input.getWidth() < 40 || input.getHeight() < 40) {
             return results;
+        }
+        if (!reserveQrScanSlot()) {
+            return results; // per-document QR-scan budget exhausted; anomaly recorded in callWith
         }
         File tmp = null;
         try {
@@ -5132,6 +5253,10 @@ for (int pageNum : pagesToProcess) {
 
         @Override
         public void drawImage(PDImage pdImage) throws IOException {
+            // I1: per-document image-extraction cap; skip decode entirely once exhausted.
+            if (!reserveImageExtractionSlot()) {
+                return;
+            }
             BufferedImage image = pdImage.getImage();
             if (image == null) {
                 return;

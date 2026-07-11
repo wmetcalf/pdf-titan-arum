@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Wrapper for `docker compose` that auto-detects the host's docker-socket
+# GID (and, with --firecracker once that overlay exists, the host's kvm GID)
+# and writes them to deploy/docker/.env so the api/dispatcher containers'
+# group_add matches. Without this, UID 10001 can't read
+# /var/run/docker.sock — and in --firecracker mode can't open /dev/kvm —
+# and fails to launch workers.
+#
+# Usage — same args as `docker compose`, with one optional flag up front:
+#   ./deploy/docker/titanarum-compose                up --build -d   # cold (runsc) only
+#   ./deploy/docker/titanarum-compose --firecracker  up --build -d   # + FC microVMs (Phase-2)
+#   ./deploy/docker/titanarum-compose                logs -f api
+#   ./deploy/docker/titanarum-compose                down
+#
+# Clone of RedTusk's deploy/docker/redtusk-compose, s/redtusk/titanarum/,
+# --project-name pinned to titanarum-bb (resolves the redtusk-bb wrapper's
+# project-name desync), and standardized on compose-file variable names
+# (TITANARUM_DATA_DIR, TITANARUM_FC_DIR, TITANARUM_PORT) rather than the
+# *_STATE_DIR name the redtusk wrapper drifted to.
+#
+# --firecracker merges docker-compose.firecracker.yml on top of the base
+# file. NOTE: as of this MVP that overlay file does not exist yet (Phase-2 —
+# the Java CRaC/vsock prerequisites are unbuilt) — --firecracker will fail
+# with "no such file" until it's authored; that failure is intentional
+# fail-closed behavior, not a bug in this wrapper.
+#
+# GIDs are detected from the actual device/socket rather than using a
+# distro default (which varies per host).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ── flag parsing: --firecracker switches in the FC overlay ───────────
+FC_MODE=0
+COMPOSE_FILES=()
+if [ "${1:-}" = "--firecracker" ] || [ "${1:-}" = "--fc" ]; then
+    FC_MODE=1
+    shift
+    COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.firecracker.yml)
+fi
+
+DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
+if [ -S "$DOCKER_SOCK" ]; then
+    SOCKET_GID="$(stat -c '%g' "$DOCKER_SOCK")"
+elif [ -n "${DOCKER_GID:-}" ]; then
+    echo "note: $DOCKER_SOCK not found; using DOCKER_GID=$DOCKER_GID from env" >&2
+    SOCKET_GID="$DOCKER_GID"
+elif [ "$FC_MODE" -eq 1 ]; then
+    # FC mode does NOT use the Docker socket: the FC dispatcher spawns microVMs
+    # via /dev/kvm, and the docker-socket-proxy is profile-disabled. Don't force
+    # the operator to produce a socket/DOCKER_GID it never consumes (matters on
+    # rootless/remote-daemon hosts). Write a harmless placeholder so the base
+    # compose's ${DOCKER_GID} still substitutes.
+    echo "note: --firecracker mode — Docker socket not required; skipping" >&2
+    SOCKET_GID=0
+else
+    echo "error: $DOCKER_SOCK not found and DOCKER_GID env is unset" >&2
+    echo "       point DOCKER_SOCK at the real socket or export DOCKER_GID" >&2
+    exit 1
+fi
+
+touch .env
+grep -v '^DOCKER_GID=' .env > .env.tmp || true
+mv .env.tmp .env
+echo "DOCKER_GID=$SOCKET_GID" >> .env
+
+# ── FC mode: detect KVM_GID from /dev/kvm; check assets exist ────────
+if [ "$FC_MODE" -eq 1 ]; then
+    if [ ! -c /dev/kvm ]; then
+        echo "error: --firecracker requires /dev/kvm on the host" >&2
+        echo "       (bare metal or AWS c8i/m8i/r8i with nested virt enabled)" >&2
+        exit 1
+    fi
+    KVM_GID="$(stat -c '%g' /dev/kvm)"
+    grep -v '^KVM_GID=' .env > .env.tmp || true
+    mv .env.tmp .env
+    echo "KVM_GID=$KVM_GID" >> .env
+
+    FC_DIR="$(grep '^TITANARUM_FC_DIR=' .env 2>/dev/null | tail -1 | cut -d= -f2-)"
+    FC_DIR="${FC_DIR:-/home/coz/titanarum-bb-fc}"
+    case "${1:-}" in
+        up|start|restart|run)
+            if [ ! -f "$FC_DIR/vmlinux" ] || [ ! -f "$FC_DIR/titanarum-rootfs.ext4" ]; then
+                echo "error: FC assets missing under $FC_DIR" >&2
+                echo "       expected $FC_DIR/{vmlinux,titanarum-rootfs.ext4}" >&2
+                echo "       these are staged by a Phase-2 setup script once the FC" >&2
+                echo "       rootfs bake lands — see the titanarum deploy plan §2d." >&2
+                echo "       or override the path in .env: TITANARUM_FC_DIR=/your/path" >&2
+                exit 1
+            fi
+            ;;
+    esac
+fi
+
+# ── pre-flight: job-root writability ────────────────────────────────────
+# The api/dispatcher containers run as UID 10001 and bind-mount
+# TITANARUM_DATA_DIR at the same path inside the container as on the host.
+# The path must exist and be owned by 10001 — otherwise every job fails with
+# `[Errno 13] Permission denied` until it hits the queued-age timeout. The
+# usual culprit is the dir being root-owned because it was created with sudo
+# during initial host setup. Catch it here before bringing up containers so
+# the operator sees one clear error instead of a log storm. Skip when the
+# command is anything other than up/start (so `down`, `logs`, etc. still work
+# even on a misconfigured host).
+case "${1:-}" in
+    up|start|restart|run)
+        DATA_DIR="$(grep '^TITANARUM_DATA_DIR=' .env | tail -1 | cut -d= -f2-)"
+        if [ -z "${DATA_DIR:-}" ]; then
+            echo "error: TITANARUM_DATA_DIR is not set in .env" >&2
+            echo "       add TITANARUM_DATA_DIR=/path/on/host/for/jobs to .env" >&2
+            exit 1
+        fi
+        TITANARUM_UID="${TITANARUM_UID:-10001}"
+        if [ ! -d "$DATA_DIR" ]; then
+            echo "error: TITANARUM_DATA_DIR=$DATA_DIR does not exist on host." >&2
+            echo "       Create it and chown to the api/dispatcher containers' UID:" >&2
+            echo "       sudo mkdir -p $DATA_DIR && sudo chown -R ${TITANARUM_UID}:${TITANARUM_UID} $DATA_DIR" >&2
+            exit 1
+        fi
+        OWNER_UID="$(stat -c '%u' "$DATA_DIR" 2>/dev/null || echo "?")"
+        if [ "$OWNER_UID" != "$TITANARUM_UID" ] && [ "$OWNER_UID" != "0" ]; then
+            # Owner is neither 10001 nor root — likely a previous bad config.
+            # Don't auto-fix; just warn so the operator confirms intent.
+            echo "warn: TITANARUM_DATA_DIR=$DATA_DIR is owned by UID $OWNER_UID, expected $TITANARUM_UID" >&2
+        fi
+        if [ "$OWNER_UID" = "0" ]; then
+            echo "error: TITANARUM_DATA_DIR=$DATA_DIR is owned by root and the api/dispatcher containers run as UID ${TITANARUM_UID}." >&2
+            echo "       run:  sudo chown -R ${TITANARUM_UID}:${TITANARUM_UID} $DATA_DIR" >&2
+            exit 1
+        fi
+        ;;
+esac
+
+exec docker compose --project-name titanarum-bb "${COMPOSE_FILES[@]}" "$@"

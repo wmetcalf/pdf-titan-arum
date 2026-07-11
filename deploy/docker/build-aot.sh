@@ -109,6 +109,13 @@ if ! grep -q '^APPCDS_WARMUP_OK' "$RECORD_LOG"; then
     cat "$RECORD_LOG" >&2
     die "record phase ran but no fixture reported APPCDS_WARMUP_OK -- corpus not actually exercised"
 fi
+if grep -q '^APPCDS_WARMUP_SKIP' "$RECORD_LOG"; then
+    cat "$RECORD_LOG" >&2
+    die "record phase reported APPCDS_WARMUP_SKIP for $(grep -c '^APPCDS_WARMUP_SKIP' "$RECORD_LOG") " \
+        "fixture(s) -- a corpus fixture silently failed to process, reducing AOT " \
+        "class-load coverage. Fix the fixture (or the parser) rather than let " \
+        "coverage quietly shrink -- see $RECORD_LOG"
+fi
 log "  -> recorded $(grep -c '^APPCDS_WARMUP_OK' "$RECORD_LOG") fixture(s), config: $AOT_CONF"
 
 # --- Phase 2: create --------------------------------------------------------

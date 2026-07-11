@@ -177,6 +177,27 @@ def test_cold_vs_warm_parity(pdf_name: str, jar: Path, aot_cache: Path,
         "_DEFAULT_JVM_FLAGS and the AOT bake), or the worker crashed before "
         f"announcing ready. warm-boot.log:\n{boot_log_text}"
     )
+    # CRITICAL (self-contained AOT-loaded proof): the ready handshake above
+    # proves the warm JVM booted, but NOT that it actually loaded the AOT
+    # cache -- JDK 25 does not fail the boot (or this ready handshake) on a
+    # flag-bundle mismatch, it silently falls back to an unshared boot and
+    # logs exactly one "[error][aot]" line (verified empirically, see
+    # build-aot.sh Phase 3 / task-8-report.md). That "[error]"-level line is
+    # emitted even at the JVM's DEFAULT log level, with no -Xlog:aot needed
+    # (also verified empirically: a clean cache load prints no aot lines at
+    # all, while a broken flag bundle prints "[error][aot] ..." on stderr with
+    # exit 0) -- so this warm boot's own log is enough, without adding any
+    # -Xlog flag. Without this assertion, a regression that breaks AOT loading
+    # while leaving the boot/handshake itself intact would still pass this
+    # test as "warm", relying entirely on build-aot.sh's separate probe boot
+    # (which could itself drift from the real runtime flags) to ever catch it.
+    assert "[error][aot]" not in boot_log_text, (
+        "warm-boot.log contains an [error][aot] line -- this warm boot's AOT "
+        "cache was REJECTED (JDK 25 does this silently: exit 0, ready "
+        "handshake still completes, only this log line is evidence). Likely a "
+        "JVM flag-bundle drift between engine.py's _DEFAULT_JVM_FLAGS and the "
+        f"AOT bake. warm-boot.log tail:\n{boot_log_text[-4000:]}"
+    )
     booted_proc = warm_engine._warm.proc  # keep a reference; detonate() clears engine._warm
 
     warm_result = warm_engine.detonate(pdf, outdir_warm, Limits())

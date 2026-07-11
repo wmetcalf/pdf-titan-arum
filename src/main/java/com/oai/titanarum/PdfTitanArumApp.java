@@ -5443,6 +5443,49 @@ for (int pageNum : pagesToProcess) {
             @JsonProperty("password") String password,
             @JsonProperty("timeout_seconds") int timeoutSeconds) {}
 
+    /**
+     * True when this worker is running in a warm tier (env {@code TITANARUM_WARM=1}, or
+     * {@code TITANARUM_CRAC_CHECKPOINT} set). See W-1 / {@link #awaitGoSignal}.
+     */
+    private static boolean isWarmMode() {
+        String cracCheckpoint = System.getenv("TITANARUM_CRAC_CHECKPOINT");
+        return "1".equals(System.getenv("TITANARUM_WARM"))
+                || (cracCheckpoint != null && !cracCheckpoint.isBlank());
+    }
+
+    /**
+     * W-1 (warm-plan.md FINDING B): blocks the file-IPC worker loop until {@code goFile}
+     * (control.go) appears, using a monotonic clock (nanoClock -- normally
+     * {@code System::nanoTime}, i.e. CLOCK_MONOTONIC) rather than wall-clock time. A
+     * warm-tier JVM can be snapshotted WHILE blocked in this loop; on restore minutes or
+     * hours later, wall-clock time has jumped forward. With the old
+     * {@code System.currentTimeMillis()}-based deadline that jump landed past the
+     * deadline baked into the snapshot, so the loop exited immediately, {@code go.exists()}
+     * was false, and the worker returned 2 -- the job was silently never delivered on
+     * every warm restore. CLOCK_MONOTONIC is frozen across an FC/gVisor restore, so a
+     * nanoTime-based deadline cannot be defeated the same way.
+     *
+     * <p>When {@code warm} is true there is NO deadline at all: blastbox owns reaping
+     * idle warm slots via {@code BLASTBOX_WARM_IDLE_TIMEOUT_S}, so this loop must keep
+     * waiting no matter what the clock reads. When {@code warm} is false (legacy cold
+     * {@code --run}) the historical 600s bound is preserved, just computed from the
+     * monotonic clock instead of the wall clock.
+     *
+     * <p>{@code nanoClock} is an injectable seam (defaults to {@code System::nanoTime} in
+     * production) so tests can simulate an arbitrary monotonic-clock jump without a real
+     * 600s sleep. Package-private for {@code RunWorkerModeTest}.
+     *
+     * @return true once goFile exists; false if the cold bound elapsed first without it appearing.
+     */
+    static boolean awaitGoSignal(File goFile, boolean warm, java.util.function.LongSupplier nanoClock) throws InterruptedException {
+        long deadlineNanos = warm ? Long.MAX_VALUE : nanoClock.getAsLong() + 600_000_000_000L;
+        while (warm || nanoClock.getAsLong() < deadlineNanos) {
+            if (goFile.exists()) return true;
+            Thread.sleep(100L);
+        }
+        return goFile.exists();
+    }
+
     /** File-IPC worker mode. Announces readiness, waits for control.go, runs one job, exits. */
     private Integer runWorker(Path scratch) throws Exception {
         File controlDir = scratch.resolve("control").toFile();
@@ -5450,12 +5493,8 @@ for (int pageNum : pagesToProcess) {
         new File(controlDir, "control.ready").createNewFile();       // (a) announce ready
 
         File go = new File(controlDir, "control.go");                // (b) block for go
-        long deadline = System.currentTimeMillis() + 600_000L;
-        while (System.currentTimeMillis() < deadline) {
-            if (go.exists()) break;
-            Thread.sleep(100L);
-        }
-        if (!go.exists()) {
+        boolean delivered = awaitGoSignal(go, isWarmMode(), System::nanoTime);
+        if (!delivered) {
             System.err.println("ERROR: --run timed out waiting for control.go");
             return 2;
         }

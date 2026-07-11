@@ -44,6 +44,30 @@ def test_enumerate_declares_report_and_files(tmp_path):
     assert report_art.kind == "report"
 
 
+def test_reconstruct_rejects_path_escapes_but_keeps_legit_files(tmp_path):
+    # gVisor C/R stale-readdir fallback: report field values are
+    # attacker-controlled PDF content. An absolute path or a ".."-laden
+    # value must never crash (relative_to raising ValueError) and must
+    # never be declared as an artifact outside report_dir.
+    outdir, report_dir = _make_tree(tmp_path)
+    report = _report(
+        embeddedFiles=[
+            {"file": "../../../../etc/passwd", "originalName": "a"},
+            {"file": "/etc/passwd", "originalName": "b"},
+        ],
+        screenshots=[{"page": 1, "path": "screenshots/page-0001.png"}],
+    )
+    arts = eng._reconstruct_artifacts_from_report(outdir, report_dir, report, set())
+    paths = {a.path for a in arts}
+    assert not any("passwd" in p for p in paths)
+    for a in arts:
+        resolved = (outdir / a.path).resolve()
+        assert resolved.is_relative_to(report_dir.resolve())
+    # legit reconstruct still finds the real on-disk artifact
+    assert "titan/report.json" in paths
+    assert "titan/screenshots/page-0001.png" in paths
+
+
 def test_build_detection_defaults_to_pdf(tmp_path):
     det = eng._build_detection(_report())
     assert isinstance(det, Detection)

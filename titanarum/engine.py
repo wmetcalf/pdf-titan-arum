@@ -256,9 +256,13 @@ def _reconstruct_artifacts_from_report(outdir: Path, report_dir: Path,
             val = hit.get(field)
             if not val:
                 continue
-            fp = report_dir / Path(val).name if "/" not in str(val) else Path(val)
-            if not fp.is_absolute():
-                fp = report_dir / val
+            # val is attacker-controlled PDF content (embeddedFiles[].file,
+            # screenshot/image paths, etc.) - confine fp to report_dir. An
+            # absolute value or one containing ".." must never escape, and
+            # relative_to() must never be allowed to throw.
+            fp = report_dir / val
+            if not fp.resolve().is_relative_to(report_dir.resolve()):
+                continue
             if fp.is_file():
                 rel = fp.relative_to(outdir).as_posix()
                 arts.append(DeclaredArtifact(id=_safe_artifact_id(rel, used),

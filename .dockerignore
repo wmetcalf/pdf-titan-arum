@@ -4,4 +4,7 @@ output/
 fixedsamples/
 docs/
 *.md
+!README.md
 .git/
+.venv/
+.superpowers/

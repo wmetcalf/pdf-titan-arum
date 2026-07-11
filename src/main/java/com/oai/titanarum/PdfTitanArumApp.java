@@ -377,6 +377,46 @@ private boolean skipQrScan;
             : null;
         if (_watchdog != null)
             _watchdog.schedule(() -> _processingThread.interrupt(), timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
+
+        // I2 (warm-plan.md): JVM hard-halt watchdog. Cooperative interruption above does not
+        // cover a hang inside a single native JBIG2/JPEG2000 decode, a ZXingReader waitFor that
+        // ignores interrupt, or catastrophic regex backtracking. Cold mode has the Python
+        // subprocess.run(timeout=) SIGKILL backstop; a persistent/warm JVM has no equivalent
+        // in-JVM hard bound without this. Scheduled strictly after the cooperative deadline
+        // (timeoutSeconds + TITANARUM_HARD_TIMEOUT_MS); if it fires the job is unrecoverably
+        // hung, so best-effort flush whatever report state exists, then halt(3) -- NOT
+        // System.exit, which runs shutdown hooks that may themselves hang. A warm JVM is
+        // one-job-disposable, so a hard self-halt is safe: the pool just reaps and boots a
+        // fresh slot. Only armed when a cooperative deadline is configured (mirrors _watchdog
+        // above) -- timeoutSeconds<=0 means "no limit" was requested for both.
+        final java.util.concurrent.atomic.AtomicReference<AnalysisReport> _reportRef =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        final long _hardTimeoutMs = envLong("TITANARUM_HARD_TIMEOUT_MS", 15_000L);
+        final java.util.concurrent.ScheduledExecutorService _hardWatchdog = timeoutSeconds > 0
+            ? java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> { Thread t = new Thread(r, "hard-halt-watchdog"); t.setDaemon(true); return t; })
+            : null;
+        if (_hardWatchdog != null) {
+            long hardDelayMs = timeoutSeconds * 1000L + _hardTimeoutMs;
+            _hardWatchdog.schedule(() -> {
+                try {
+                    AnalysisReport partial = _reportRef.get();
+                    if (partial != null) {
+                        partial.timedOut = true;
+                        if (partial.timedOutAfterMs == null) {
+                            partial.timedOutAfterMs = (System.nanoTime() - _startNanos) / 1_000_000;
+                        }
+                        mapper.writeValue(this.outputDir.resolve("report.json").toFile(), partial);
+                    }
+                } catch (Throwable ignored) {
+                    // Best-effort only -- must still halt below even if the flush itself fails
+                    // (e.g. disk full, or the report was mid-mutation on the hung thread).
+                } finally {
+                    Runtime.getRuntime().halt(3);
+                }
+            }, hardDelayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+
+        try {
         Path screenshotsDir = outputDir.resolve("screenshots");
         Path renderedImagesDir = outputDir.resolve("images_rendered");
         Path resourceImagesDir = outputDir.resolve("images_resources");
@@ -397,6 +437,7 @@ private boolean skipQrScan;
         Files.createDirectories(urlCropsDir);
 
         AnalysisReport report = new AnalysisReport();
+        _reportRef.set(report); // I2: hard watchdog flushes whatever this holds if it ever fires
         report.inputPdf = originalName;
         report.outputDirectory = outputDir.toAbsolutePath().toString();
         report.generatedAt = Instant.now().toString();
@@ -404,6 +445,22 @@ private boolean skipQrScan;
         report.addLinkAnnotations = addLinkAnnotations;
         report.documentSha256 = sha256(pdfBytes);
         report.fileMagic = detectFileMagic(pdfBytes);
+
+        // I2 TDD-only seam: simulates a hang that ignores cooperative Thread.interrupt()
+        // entirely (e.g. a wedged native codec decode, or a ZXingReader waitFor swallowing
+        // InterruptedException) so HardWatchdogTest can exercise the halt(3) path end-to-end
+        // without real native-decoder plumbing. Off by default; gated on an env var no
+        // operator sets intentionally, so this is inert in production.
+        String _hangSpin = System.getenv("TITANARUM_TEST_HANG_SPIN");
+        if (_hangSpin != null && !_hangSpin.isBlank()) {
+            while (true) {
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException ignored) {
+                    // Deliberately swallowed: simulates an interrupt-proof hang.
+                }
+            }
+        }
 
         // Acrobat-style header search: find %PDF within first 1024 bytes.
         // If found at offset > 0, slice the array so PDFBox parses from the real header.
@@ -807,7 +864,6 @@ private boolean skipQrScan;
             report.timedOut = true;
             report.timedOutAfterMs = (System.nanoTime() - _startNanos) / 1_000_000;
         }
-        if (_watchdog != null) _watchdog.shutdownNow();
 
         List<Path> hashTargets = new ArrayList<>();
         addPaths(hashTargets, report.screenshots);
@@ -882,6 +938,15 @@ private boolean skipQrScan;
         profTick(_pt, "report.json write");
         System.out.println("Wrote report: " + reportPath.toAbsolutePath());
         return report;
+        } finally {
+            // I2: cancel both watchdogs on every exit path -- the normal return above, any of
+            // the early returns for a non-PDF/encrypted/wrong-password/parse-error input, or an
+            // exception propagating out of this method. An uncancelled hard-halt watchdog left
+            // ticking after this job finishes would otherwise halt() the JVM out from under a
+            // *later* job on a warm/reused process.
+            if (_watchdog != null) _watchdog.shutdownNow();
+            if (_hardWatchdog != null) _hardWatchdog.shutdownNow();
+        }
     }
 
     /**

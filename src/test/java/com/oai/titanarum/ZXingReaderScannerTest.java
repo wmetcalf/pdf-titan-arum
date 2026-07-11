@@ -1,13 +1,17 @@
 package com.oai.titanarum;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -70,6 +74,53 @@ class ZXingReaderScannerTest {
         byte[] out = ZXingReaderScanner.readCapped(new ByteArrayInputStream(small), () -> killed.set(true));
         assertArrayEquals(small, out);
         assertFalse(killed.get(), "child must not be killed when output stays under the cap");
+    }
+
+    /**
+     * I2 (warm-plan.md, carried in from the I1 review): before the fix, {@code scan()} called
+     * {@code readCapped(stdout)} — which blocks on {@code in.read()} with NO timeout — and only
+     * reached {@code proc.waitFor(timeoutMillis,...)} AFTER {@code readCapped} returned. A child
+     * that hangs mid-decode without hitting the 1 MiB cap or closing stdout therefore blocked the
+     * calling thread indefinitely, defeating the QR wall-clock budget entirely. This fake
+     * "ZXingReader" execs {@code sleep} (replacing its own process image, so a single SIGKILL to
+     * the ProcessBuilder-spawned PID kills it with nothing left running) well beyond the
+     * configured timeout, and writes nothing to stdout/stderr.
+     */
+    @Test
+    void scan_boundsWallClockWhenChildHangsWithoutWriting_andKillsChild(@TempDir Path tmp) throws Exception {
+        Path stub = tmp.resolve("hang-zxing.sh");
+        Files.writeString(stub, "#!/bin/sh\nexec sleep 30\n");
+        assertTrue(stub.toFile().setExecutable(true), "test stub must be made executable");
+
+        Path png = tmp.resolve("dummy.png");
+        Files.write(png, new byte[]{(byte) 0x89, 'P', 'N', 'G'});
+
+        long timeoutMs = 300L;
+        ZXingReaderScanner scanner = new ZXingReaderScanner(stub.toString(), "QRCode", timeoutMs);
+
+        long startNanos = System.nanoTime();
+        List<ZXingReaderScanner.QrResult> result = scanner.scan(png);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+        assertTrue(result.isEmpty(), "a hung child that wrote nothing must yield an empty result");
+        assertTrue(elapsedMs < 5_000,
+                "scan() must return within roughly the configured timeout (" + timeoutMs
+                        + "ms) instead of blocking on the hung child; took " + elapsedMs + "ms");
+
+        // Verify the child was actually killed (destroyForcibly), not merely abandoned: poll
+        // briefly for any live process whose command line references our stub script.
+        boolean stillRunning = pollUntil(2_000L, () -> ProcessHandle.allProcesses()
+                .noneMatch(ph -> ph.info().commandLine().map(cl -> cl.contains(stub.toString())).orElse(false)));
+        assertTrue(stillRunning, "the hung child process must be killed, not left running");
+    }
+
+    private static boolean pollUntil(long timeoutMs, java.util.function.BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) return true;
+            Thread.sleep(25L);
+        }
+        return condition.getAsBoolean();
     }
 
     @org.junit.jupiter.api.Test

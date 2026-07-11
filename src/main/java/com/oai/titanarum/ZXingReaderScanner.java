@@ -36,6 +36,17 @@ final class ZXingReaderScanner {
         this.timeoutMillis = envLong("TITANARUM_ZXING_TIMEOUT_MS", 5_000L);
     }
 
+    /**
+     * Package-private constructor for tests: bypasses the env lookups so a fake executable and
+     * a tiny timeout can be injected directly, without needing to mutate process environment
+     * variables of the running JVM (there is no supported API for that).
+     */
+    ZXingReaderScanner(String executable, String formats, long timeoutMillis) {
+        this.executable = executable;
+        this.formats = formats;
+        this.timeoutMillis = timeoutMillis;
+    }
+
     private static long envLong(String name, long def) {
         String v = System.getenv(name);
         if (v == null || v.isBlank()) return def;
@@ -58,20 +69,44 @@ final class ZXingReaderScanner {
         return cmd;
     }
 
+    /**
+     * I2 (warm-plan.md, carried in from the I1 review): previously this method called
+     * {@code readCapped(stdout)} — which blocks on {@code InputStream.read()} with NO
+     * timeout — and only reached {@code proc.waitFor(timeoutMillis,...)} AFTER
+     * {@code readCapped} returned. A child that hangs mid-decode (without hitting the 1 MiB
+     * cap or closing stdout) therefore blocked the calling thread indefinitely, defeating the
+     * QR wall-clock budget entirely (worse in warm mode, where that thread is the reused JVM's
+     * only worker thread). Fix: drain stdout AND stderr on daemon threads (a full stderr pipe
+     * can stall a child too) and bound the WHOLE scan by {@code proc.waitFor(timeoutMillis)} on
+     * the calling thread, independent of whether the drain threads have finished reading. On
+     * timeout, {@code destroyForcibly()} the child; that closes the pipes, so the drain threads
+     * unblock immediately and are joined (with their own short bound, never trusted to be
+     * truly unbounded) so any bytes already captured are still returned.
+     */
     List<QrResult> scan(Path image) {
         ProcessBuilder pb = new ProcessBuilder(buildCommand(image));
         pb.redirectErrorStream(false);
         Process proc = null;
+        Thread stdoutThread = null;
+        Thread stderrThread = null;
         try {
             proc = pb.start();
             final Process forked = proc;
-            byte[] out = readCapped(proc.getInputStream(), forked::destroyForcibly);
+
+            StreamDrain stdoutDrain = new StreamDrain(proc.getInputStream(), forked::destroyForcibly);
+            StreamDrain stderrDrain = new StreamDrain(proc.getErrorStream(), forked::destroyForcibly);
+            stdoutThread = newDaemonThread(stdoutDrain, "zxing-stdout-drain");
+            stderrThread = newDaemonThread(stderrDrain, "zxing-stderr-drain");
+            stdoutThread.start();
+            stderrThread.start();
+
             boolean done = proc.waitFor(timeoutMillis, TimeUnit.MILLISECONDS);
             if (!done) {
                 proc.destroyForcibly();
-                return List.of();
             }
-            return parseJsonLines(new String(out, StandardCharsets.UTF_8));
+            joinQuietly(stdoutThread, 2_000L);
+            joinQuietly(stderrThread, 2_000L);
+            return parseJsonLines(new String(stdoutDrain.result(), StandardCharsets.UTF_8));
         } catch (IOException e) {
             return List.of();
         } catch (InterruptedException e) {
@@ -80,6 +115,44 @@ final class ZXingReaderScanner {
         } finally {
             if (proc != null && proc.isAlive()) proc.destroyForcibly();
         }
+    }
+
+    private static Thread newDaemonThread(Runnable r, String name) {
+        Thread t = new Thread(r, name);
+        t.setDaemon(true);
+        return t;
+    }
+
+    private static void joinQuietly(Thread t, long millis) {
+        try {
+            t.join(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Drains an {@link InputStream} on a background thread, capped at {@link #MAX_STDOUT} bytes. */
+    private static final class StreamDrain implements Runnable {
+        private final InputStream in;
+        private final Runnable onCapExceeded;
+        private volatile byte[] result = new byte[0];
+
+        StreamDrain(InputStream in, Runnable onCapExceeded) {
+            this.in = in;
+            this.onCapExceeded = onCapExceeded;
+        }
+
+        @Override
+        public void run() {
+            try {
+                result = readCapped(in, onCapExceeded);
+            } catch (IOException e) {
+                // Stream broke mid-read (e.g. destroyForcibly() closed the pipe after a
+                // timeout) -- keep whatever was captured before that happened.
+            }
+        }
+
+        byte[] result() { return result; }
     }
 
     /** Parse ZXingReader {@code -json} output: one JSON object per line. */

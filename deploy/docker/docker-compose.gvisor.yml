@@ -36,8 +36,12 @@ services:
     # The C/R snapshot is rebuilt fresh each boot; a leftover checkpoint image makes
     # `runsc checkpoint` fail "file exists" (it won't overwrite), so the sidecar
     # couldn't survive a restart without this. (Image default command is the API
-    # server.)
-    command: ["sh", "-c", "rm -rf /var/lib/blastbox/gvisor-snapshot /var/lib/blastbox/gvisor-base-* /var/lib/blastbox/gvisor-root 2>/dev/null; mkdir -p /var/lib/blastbox/gvisor-root; exec blastbox dispatch"]
+    # server.) NOTE: the titanarum host image sets `ENTRYPOINT ["blastbox"]`, so a bare
+    # `command: ["sh","-c",...]` would become `blastbox sh -c ...` (→ "invalid choice: sh").
+    # Override the entrypoint to a real shell so the state-clear + `exec blastbox dispatch`
+    # runs (RedTusk's host image has no ENTRYPOINT, so it didn't need this).
+    entrypoint: ["sh", "-c"]
+    command: ["rm -rf /var/lib/blastbox/gvisor-snapshot /var/lib/blastbox/gvisor-base-* /var/lib/blastbox/gvisor-root 2>/dev/null; mkdir -p /var/lib/blastbox/gvisor-root; exec blastbox dispatch"]
     restart: unless-stopped
     # Aggregate memory ceiling for the warm pool (the host memory cgroup
     # GvisorConfig defers to: it intentionally does NOT RLIMIT_AS the worker tree —

@@ -337,6 +337,10 @@ def _build_payload(report: dict, artifacts: list[DeclaredArtifact]) -> EmbeddedR
         page_1based = int(ss.get("page", 1))
         w = float(ss.get("width") or 1)
         h = float(ss.get("height") or 1)
+        if w <= 0 or h <= 0:
+            # skip rather than crash: contract Dimensions requires > 0
+            # (matches the Hash skip-don't-crash pattern)
+            continue
         page_children: list[Any] = []
         if ss.get("ocrText"):
             txt = str(ss["ocrText"])

@@ -1,7 +1,14 @@
 import json
 from pathlib import Path
 
-from blastbox.contract import DeclaredArtifact, Detection, EmbeddedResource, Warning
+from blastbox.contract import (
+    DeclaredArtifact,
+    Detection,
+    EmbeddedResource,
+    ExtractedText,
+    Page,
+    Warning,
+)
 
 from titanarum import engine as eng
 
@@ -101,3 +108,39 @@ def test_embedded_files_become_children(tmp_path):
     assert len(kids) == 1
     assert kids[0].content_type.endswith("wordprocessingml.document")
     assert kids[0].metadata.fields["original_name"] == "evil.docx"
+
+
+def test_screenshot_becomes_page(tmp_path):
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    (report_dir / "screenshots").mkdir(parents=True)
+    (report_dir / "screenshots" / "page-0001.png").write_bytes(b"\x89PNG stub")
+    (report_dir / "report.json").write_text("{}")
+    report = _report(screenshots=[{
+        "page": 1,
+        "path": str(report_dir / "screenshots" / "page-0001.png"),
+        "width": 800, "height": 1000,
+        "ocrText": "hello world",
+    }])
+    arts = eng._enumerate_artifacts(outdir, report_dir, report)
+    payload = eng._build_payload(report, arts)
+    pages = [c for c in payload.children if isinstance(c, Page)]
+    assert len(pages) == 1
+    page = pages[0]
+    assert page.index == 0                       # 1-based -> 0-based
+    assert page.dims.width == 800 and page.dims.height == 1000
+    assert page.image.id in {a.id for a in arts}  # ArtifactRef -> a DECLARED id
+    texts = [c for c in page.children if isinstance(c, ExtractedText)]
+    assert texts and texts[0].text == "hello world"
+
+
+def test_build_detection_label_is_type_not_threat():
+    # Decision (2026-07-10): Detection.label is a TYPE classifier (blastbox
+    # convention); jsIndicators surface via Warnings, never in label.
+    report = _report(fileMagic="application/pdf", jsIndicators=[
+        {"type": "suspicious_api", "indicator": "SOAP.streamDecode",
+         "detail": "present", "count": 1}])
+    det = eng._build_detection(report)
+    assert "SOAP" not in det.label
+    assert det.label  # non-empty type label
+    assert any(w.code.startswith("js_indicator.") for w in eng._build_warnings(report))

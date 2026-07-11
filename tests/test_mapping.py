@@ -87,7 +87,7 @@ def test_status_rejected_for_encrypted():
 def test_build_payload_is_embedded_resource_with_summary(tmp_path):
     outdir, report_dir = _make_tree(tmp_path)
     arts = eng._enumerate_artifacts(outdir, report_dir, _report())
-    payload = eng._build_payload(_report(pageCount=3), arts)
+    payload = eng._build_payload(_report(pageCount=3), arts, outdir, report_dir)
     assert isinstance(payload, EmbeddedResource)
     assert payload.metadata is not None
     assert payload.metadata.fields["document_sha256"]
@@ -103,7 +103,9 @@ def test_embedded_files_become_children(tmp_path):
          "mimeType": "application/octet-stream",
          "detectedMimeType": docx_mime,
          "mimeTypeMismatch": "declared octet-stream, detected docx"}])
-    payload = eng._build_payload(report, [])
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    payload = eng._build_payload(report, [], outdir, report_dir)
     kids = [c for c in payload.children if isinstance(c, EmbeddedResource)]
     assert len(kids) == 1
     assert kids[0].content_type.endswith("wordprocessingml.document")
@@ -118,12 +120,12 @@ def test_screenshot_becomes_page(tmp_path):
     (report_dir / "report.json").write_text("{}")
     report = _report(screenshots=[{
         "page": 1,
-        "path": str(report_dir / "screenshots" / "page-0001.png"),
+        "path": "screenshots/page-0001.png",
         "width": 800, "height": 1000,
         "ocrText": "hello world",
     }])
     arts = eng._enumerate_artifacts(outdir, report_dir, report)
-    payload = eng._build_payload(report, arts)
+    payload = eng._build_payload(report, arts, outdir, report_dir)
     pages = [c for c in payload.children if isinstance(c, Page)]
     assert len(pages) == 1
     page = pages[0]

@@ -62,3 +62,35 @@ def test_detonate_real_pdf(tmp_path, jar, monkeypatch):
     assert (outdir / report_arts[0].path).is_file()
     # the JVM MUST NOT have written a metadata.json (harness owns it)
     assert not (outdir / "metadata.json").exists()
+
+
+def test_detonate_real_pdf_produces_page(tmp_path, jar, monkeypatch):
+    if not shutil.which("java"):
+        pytest.skip("no java on PATH")
+    from blastbox.contract import Page
+    from blastbox.limits import Limits
+
+    from titanarum.engine import TitanArumEngine
+
+    monkeypatch.setenv("TITANARUM_WORKER_JAR", str(jar))
+    monkeypatch.delenv("TITANARUM_JAVA_OPTS", raising=False)
+    monkeypatch.delenv("TITANARUM_AOT_CACHE", raising=False)
+    # Screenshots ON (this is the C1 regression surface); skip images for speed.
+    monkeypatch.delenv("TITANARUM_SKIP_SCREENSHOTS", raising=False)
+    monkeypatch.setenv("TITANARUM_SKIP_IMAGES", "1")
+    # The minimal fixture PDF has no content stream, so it's blank; force a
+    # screenshot to be taken anyway (blank pages are skipped by default).
+    monkeypatch.setenv("TITANARUM_NO_SKIP_BLANKS", "1")
+
+    pdf = tmp_path / "in.pdf"
+    _make_pdf(pdf)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+
+    limits = Limits.from_env()
+    result = TitanArumEngine().detonate(pdf, outdir, limits)
+
+    pages = [c for c in result.payload.children if isinstance(c, Page)]
+    assert pages, "screenshots ON must produce at least one Page node"
+    art_ids = {a.id for a in result.artifacts}
+    assert pages[0].image.id in art_ids, "Page.image must reference a DECLARED artifact"

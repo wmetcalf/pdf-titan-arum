@@ -311,7 +311,8 @@ def _hashes_from(hashresult: dict) -> list[Hash]:
     return out
 
 
-def _build_payload(report: dict, artifacts: list[DeclaredArtifact]) -> EmbeddedResource:
+def _build_payload(report: dict, artifacts: list[DeclaredArtifact],
+                   outdir: Path, report_dir: Path) -> EmbeddedResource:
     by_path = {a.path: a.id for a in artifacts}
     children: list[Any] = []
 
@@ -336,7 +337,7 @@ def _build_payload(report: dict, artifacts: list[DeclaredArtifact]) -> EmbeddedR
 
     # Page children (screenshots; 1-based -> 0-based index)
     for ss in report.get("screenshots", []) or []:
-        rel = _rel_for(ss.get("path"))
+        rel = _rel_for(ss.get("path"), outdir, report_dir)
         art_id = by_path.get(rel)
         if art_id is None:
             continue  # can only reference a DECLARED artifact
@@ -365,13 +366,18 @@ def _build_payload(report: dict, artifacts: list[DeclaredArtifact]) -> EmbeddedR
         children=children)
 
 
-def _rel_for(path_value: str | None) -> str:
-    """Normalize a report path field to an outdir-relative 'titan/...' path."""
+def _rel_for(path_value: str | None, outdir: Path, report_dir: Path) -> str:
+    """Normalize a report path field to the outdir-relative path used as a
+    DeclaredArtifact key. The JVM emits screenshot/image paths RELATIVE to
+    report_dir (= outdir/titan), e.g. 'screenshots/page-0001.png'."""
     if not path_value:
         return ""
-    p = str(path_value)
-    idx = p.find("titan/")
-    return p[idx:] if idx != -1 else "titan/" + Path(p).name
+    p = Path(str(path_value))
+    base = p if p.is_absolute() else (report_dir / p)
+    try:
+        return base.resolve().relative_to(outdir.resolve()).as_posix()
+    except ValueError:
+        return ""  # outside the output tree -> won't match any declared artifact
 
 
 def _build_detection(report: dict) -> Detection:
@@ -486,7 +492,7 @@ class TitanArumEngine:
         validate_report(report)
 
         artifacts = _enumerate_artifacts(outdir, report_dir, report)
-        payload = _build_payload(report, artifacts)
+        payload = _build_payload(report, artifacts, outdir, report_dir)
         detected = _build_detection(report)
         warnings = _build_warnings(report)
         status = _status_from_report(report)

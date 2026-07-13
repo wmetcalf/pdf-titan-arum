@@ -3138,49 +3138,6 @@ for (int pageNum : pagesToProcess) {
         return pts.isEmpty() ? null : pts;
     }
 
-    private static double sinc(double x) {
-        if (x == 0.0) return 1.0;
-        double px = Math.PI * x;
-        return Math.sin(px) / px;
-    }
-
-    private static double lanczosKernel(double x) {
-        double ax = Math.abs(x);
-        if (ax < 3.0) return sinc(ax) * sinc(ax / 3.0);
-        return 0.0;
-    }
-
-    private static void fft(double[] re, double[] im) {
-        int N = re.length;
-        int j = 0;
-        for (int i = 1; i < N; i++) {
-            int bit = N >> 1;
-            for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-            j ^= bit;
-            if (i < j) {
-                double t = re[i]; re[i] = re[j]; re[j] = t;
-                t = im[i]; im[i] = im[j]; im[j] = t;
-            }
-        }
-        for (int len = 2; len <= N; len <<= 1) {
-            double ang = -2 * Math.PI / len;
-            double wRe = Math.cos(ang), wIm = Math.sin(ang);
-            for (int i = 0; i < N; i += len) {
-                double curRe = 1, curIm = 0;
-                for (int k = 0; k < len / 2; k++) {
-                    double uRe = re[i + k], uIm = im[i + k];
-                    double vRe = re[i + k + len/2] * curRe - im[i + k + len/2] * curIm;
-                    double vIm = re[i + k + len/2] * curIm + im[i + k + len/2] * curRe;
-                    re[i + k] = uRe + vRe; im[i + k] = uIm + vIm;
-                    re[i + k + len/2] = uRe - vRe; im[i + k + len/2] = uIm - vIm;
-                    double newCurRe = curRe * wRe - curIm * wIm;
-                    curIm = curRe * wIm + curIm * wRe;
-                    curRe = newCurRe;
-                }
-            }
-        }
-    }
-
     // Pre-scale cap: images larger than this are fast-downscaled by Java2D before
     // our pure-Java Lanczos kernel runs, avoiding O(srcW*srcH*kernelSupport) blowup.
     private static final int PHASH_PRESIZE = 256;

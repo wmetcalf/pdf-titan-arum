@@ -3150,78 +3150,6 @@ for (int pageNum : pagesToProcess) {
         return 0.0;
     }
 
-    private static double[][] lanczosResize(double[][] src, int srcW, int srcH, int dstW, int dstH) {
-        // Precompute horizontal kernel weights once (independent of source row).
-        // Weights are normalized so no per-row wSum division is needed in the inner loop.
-        double scaleX = (double) srcW / dstW;
-        double filterScaleX = Math.max(1.0, scaleX);
-        double supportX = 3.0 * filterScaleX;
-        int[]    hOff = new int[dstW];
-        double[][] hW = new double[dstW][];
-        for (int xd = 0; xd < dstW; xd++) {
-            double center = (xd + 0.5) * scaleX;
-            int start = Math.max(0,        (int) Math.ceil(center - supportX));
-            int end   = Math.min(srcW - 1, (int) Math.floor(center + supportX));
-            int len = end - start + 1;
-            hOff[xd] = start;
-            hW[xd] = new double[len];
-            double wSum = 0;
-            for (int i = 0; i < len; i++) {
-                double w = lanczosKernel((start + i + 0.5 - center) / filterScaleX);
-                hW[xd][i] = w;
-                wSum += w;
-            }
-            if (wSum != 0) for (int i = 0; i < len; i++) hW[xd][i] /= wSum;
-        }
-        // Horizontal pass: pure MAC loop, no trig, no per-sample clamping
-        double[][] hpass = new double[srcH][dstW];
-        for (int y = 0; y < srcH; y++) {
-            double[] row = src[y];
-            double[] out = hpass[y];
-            for (int xd = 0; xd < dstW; xd++) {
-                double[] w = hW[xd];
-                int off = hOff[xd];
-                double v = 0;
-                for (int i = 0; i < w.length; i++) v += w[i] * row[off + i];
-                out[xd] = Math.max(0.0, Math.min(255.0, v));
-            }
-        }
-        // Precompute vertical kernel weights
-        double scaleY = (double) srcH / dstH;
-        double filterScaleY = Math.max(1.0, scaleY);
-        double supportY = 3.0 * filterScaleY;
-        int[]    vOff = new int[dstH];
-        double[][] vW = new double[dstH][];
-        for (int yd = 0; yd < dstH; yd++) {
-            double center = (yd + 0.5) * scaleY;
-            int start = Math.max(0,        (int) Math.ceil(center - supportY));
-            int end   = Math.min(srcH - 1, (int) Math.floor(center + supportY));
-            int len = end - start + 1;
-            vOff[yd] = start;
-            vW[yd] = new double[len];
-            double wSum = 0;
-            for (int i = 0; i < len; i++) {
-                double w = lanczosKernel((start + i + 0.5 - center) / filterScaleY);
-                vW[yd][i] = w;
-                wSum += w;
-            }
-            if (wSum != 0) for (int i = 0; i < len; i++) vW[yd][i] /= wSum;
-        }
-        // Vertical pass: pure MAC loop
-        double[][] result = new double[dstH][dstW];
-        for (int yd = 0; yd < dstH; yd++) {
-            double[] w = vW[yd];
-            int off = vOff[yd];
-            double[] out = result[yd];
-            for (int xd = 0; xd < dstW; xd++) {
-                double v = 0;
-                for (int i = 0; i < w.length; i++) v += w[i] * hpass[off + i][xd];
-                out[xd] = Math.max(0.0, Math.min(255.0, v));
-            }
-        }
-        return result;
-    }
-
     private static void fft(double[] re, double[] im) {
         int N = re.length;
         int j = 0;
@@ -3253,24 +3181,6 @@ for (int pageNum : pagesToProcess) {
         }
     }
 
-    private static double[] dct1d(double[] x) {
-        int N = x.length;
-        double[] re = new double[N];
-        double[] im = new double[N];
-        for (int n = 0; n < N / 2; n++) {
-            re[n]       = x[2 * n];
-            re[N - 1 - n] = x[2 * n + 1];
-        }
-        if ((N & 1) == 1) re[N / 2] = x[N - 1];
-        fft(re, im);
-        double[] y = new double[N];
-        for (int k = 0; k < N; k++) {
-            double angle = -Math.PI * k / (2.0 * N);
-            y[k] = 2.0 * (re[k] * Math.cos(angle) - im[k] * Math.sin(angle));
-        }
-        return y;
-    }
-
     // Pre-scale cap: images larger than this are fast-downscaled by Java2D before
     // our pure-Java Lanczos kernel runs, avoiding O(srcW*srcH*kernelSupport) blowup.
     private static final int PHASH_PRESIZE = 256;
@@ -3281,62 +3191,9 @@ for (int pageNum : pagesToProcess) {
     private static final int SCREENSHOT_TARGET_WIDTH = 1200;
 
     private static String computePhash(BufferedImage img) {
-        // Fast pre-downscale for large images using Java2D (C-optimized area averaging)
-        if (img.getWidth() > PHASH_PRESIZE || img.getHeight() > PHASH_PRESIZE) {
-            double scale = Math.min((double) PHASH_PRESIZE / img.getWidth(),
-                                    (double) PHASH_PRESIZE / img.getHeight());
-            int pw = Math.max(32, (int) (img.getWidth()  * scale));
-            int ph = Math.max(32, (int) (img.getHeight() * scale));
-            BufferedImage pre = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_RGB);
-            java.awt.Graphics2D g = pre.createGraphics();
-            g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
-                               java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.drawImage(img, 0, 0, pw, ph, null);
-            g.dispose();
-            img = pre;
-        }
-        int srcW = img.getWidth();
-        int srcH = img.getHeight();
-        double[][] gray = new double[srcH][srcW];
-        for (int y = 0; y < srcH; y++) {
-            for (int x = 0; x < srcW; x++) {
-                int rgb = img.getRGB(x, y);
-                int r = (rgb >> 16) & 0xFF;
-                int g = (rgb >> 8)  & 0xFF;
-                int b =  rgb        & 0xFF;
-                gray[y][x] = (r * 19595 + g * 38470 + b * 7471 + 32768) >> 16;
-            }
-        }
-        double[][] resized = lanczosResize(gray, srcW, srcH, 32, 32);
-        // Round to integer pixel values, matching PIL's integer-pixel storage
-        for (int y = 0; y < 32; y++)
-            for (int x = 0; x < 32; x++)
-                resized[y][x] = Math.round(resized[y][x]);
-        double[][] tmp = new double[32][32];
-        for (int col = 0; col < 32; col++) {
-            double[] column = new double[32];
-            for (int row = 0; row < 32; row++) column[row] = resized[row][col];
-            double[] dctCol = dct1d(column);
-            for (int row = 0; row < 32; row++) tmp[row][col] = dctCol[row];
-        }
-        double[][] dct = new double[32][32];
-        for (int row = 0; row < 32; row++) dct[row] = dct1d(tmp[row]);
-        double[] lowfreq = new double[64];
-        for (int r = 0; r < 8; r++)
-            for (int c = 0; c < 8; c++)
-                lowfreq[r * 8 + c] = dct[r][c];
-        double[] sorted = lowfreq.clone();
-        Arrays.sort(sorted);
-        double median = (sorted[31] + sorted[32]) / 2.0;
-        StringBuilder sb = new StringBuilder(16);
-        for (int byteIdx = 0; byteIdx < 8; byteIdx++) {
-            int bite = 0;
-            for (int bit = 0; bit < 8; bit++) {
-                if (lowfreq[byteIdx * 8 + bit] > median) bite |= (0x80 >> bit);
-            }
-            sb.append(String.format("%02x", bite));
-        }
-        return sb.toString();
+        // pHash via the shared rosetta-squint-hash port (byte-exact with Python imagehash 4.3.2 /
+        // ClippyShot). hash_size=8 (=> 16 hex); highfreqFactor defaults to 4 in the 2-arg overload.
+        return io.github.wmetcalf.rosettasquint.hash.PHash.compute(img, 8).toString();
     }
 
     private static final int COLOR_HASH_BINBITS = 4;  // 14 bins × 4 bits = 56 bits = 14 hex chars
@@ -3348,77 +3205,10 @@ for (int pageNum : pagesToProcess) {
      * Each bin value (0 to 2^binbits-1) encoded with the exact same quirky bit formula as imagehash.
      * PIL 'L' grayscale and PIL HSV conversion replicated to match Pillow's C implementation.
      */
-    private static String computeColorHash(BufferedImage src) {
-        // Normalize to TYPE_INT_RGB to handle alpha/unusual color models
-        BufferedImage img = src;
-        if (src.getType() != BufferedImage.TYPE_INT_RGB) {
-            img = new BufferedImage(src.getWidth(), src.getHeight(), BufferedImage.TYPE_INT_RGB);
-            java.awt.Graphics2D g2 = img.createGraphics();
-            g2.drawImage(src, 0, 0, null);
-            g2.dispose();
-        }
-        int width = img.getWidth(), height = img.getHeight(), n = width * height;
-        int blackCount = 0, grayNotBlackCount = 0, colorfulCount = 0;
-        int[] faintBins  = new int[6];
-        int[] brightBins = new int[6];
-        float[] hsbBuf = new float[3];
-
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int rgb = img.getRGB(x, y);
-                int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
-
-                // PIL 'L' grayscale — matches Pillow's fixed-point C formula exactly
-                int intensity = (r * 19595 + g * 38470 + b * 7471 + 32768) >> 16;
-
-                // PIL HSV — Color.RGBtoHSB uses the same algorithm as Pillow's rgb2hsv_row
-                java.awt.Color.RGBtoHSB(r, g, b, hsbBuf);
-                int hVal = Math.round(hsbBuf[0] * 255.0f);  // roundf, not truncation
-                int sVal = Math.round(hsbBuf[1] * 255.0f);
-
-                // Thresholds: 256//8=32, 256//3=85, 256*2//3=170 (Python integer division)
-                if (intensity < 32) {
-                    blackCount++;
-                } else if (sVal < 85) {
-                    grayNotBlackCount++;
-                } else {
-                    colorfulCount++;
-                    int hueBin = Math.min(5, (int)(hVal * 6.0 / 255.0));
-                    if      (sVal < 170) faintBins[hueBin]++;
-                    else if (sVal > 170) brightBins[hueBin]++;
-                    // sVal == 170: colorful but in neither histogram (matches Python's strict >)
-                }
-            }
-        }
-
-        int binbits = COLOR_HASH_BINBITS, maxVal = 1 << binbits;
-        int c = Math.max(1, colorfulCount);
-        int[] values = new int[14];
-        values[0] = Math.min(maxVal - 1, (int)((double) blackCount       / n * maxVal));
-        values[1] = Math.min(maxVal - 1, (int)((double) grayNotBlackCount / n * maxVal));
-        for (int i = 0; i < 6; i++) {
-            values[2 + i] = Math.min(maxVal - 1, (int)((double) faintBins[i]  * maxVal / c));
-            values[8 + i] = Math.min(maxVal - 1, (int)((double) brightBins[i] * maxVal / c));
-        }
-
-        // Bit encoding — replicates Python exactly:
-        // [v // (2**(binbits-i-1)) % 2**(binbits-i) > 0 for i in range(binbits)]
-        // Note: this is NOT standard binary (e.g. value 4 with binbits=4 encodes as 0x6, not 0x4)
-        int hexChars = (14 * binbits + 3) / 4;
-        StringBuilder sb = new StringBuilder(hexChars);
-        int bitBuf = 0, bitsInBuf = 0;
-        for (int val : values) {
-            for (int i = 0; i < binbits; i++) {
-                int bit = (val / (1 << (binbits - i - 1))) % (1 << (binbits - i)) > 0 ? 1 : 0;
-                bitBuf = (bitBuf << 1) | bit;
-                if (++bitsInBuf == 4) {
-                    sb.append(Integer.toHexString(bitBuf));
-                    bitBuf = 0; bitsInBuf = 0;
-                }
-            }
-        }
-        if (bitsInBuf > 0) sb.append(Integer.toHexString(bitBuf << (4 - bitsInBuf)));
-        return sb.toString();
+    private static String computeColorHash(BufferedImage img) {
+        // colorhash via rosetta-squint-hash, binbits=4 (=> 14 hex) to match ClippyShot / titan's
+        // prior binbits and the engine.py _HASH_HEXLEN contract.
+        return io.github.wmetcalf.rosettasquint.hash.ColorHash.compute(img, 4).toString();
     }
 
     /** SHA-256 of raw pixel data for a TYPE_INT_RGB BufferedImage (no I/O, no PNG encoding). */

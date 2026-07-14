@@ -89,7 +89,9 @@ class ZXingReaderScannerTest {
     @Test
     void scan_boundsWallClockWhenChildHangsWithoutWriting_andKillsChild(@TempDir Path tmp) throws Exception {
         Path stub = tmp.resolve("hang-zxing.sh");
-        Files.writeString(stub, "#!/bin/sh\nexec sleep 30\n");
+        // Answer the -json capability probe instantly (a real ZXingReader -help is immediate);
+        // hang only on the actual scan, which is what this test bounds.
+        Files.writeString(stub, "#!/bin/sh\ncase \"$1\" in -help) echo usage; exit 0;; esac\nexec sleep 30\n");
         assertTrue(stub.toFile().setExecutable(true), "test stub must be made executable");
 
         Path png = tmp.resolve("dummy.png");
@@ -151,6 +153,65 @@ class ZXingReaderScannerTest {
         // Pin the REAL flag (--skip-qr), not the plausible-but-wrong --skip-qr-scan.
         assertTrue(err.contains("--skip-qr to silence"), "warning must reference the real --skip-qr flag");
         assertFalse(err.contains("--skip-qr-scan"), "must not reference the non-existent --skip-qr-scan flag");
+    }
+
+    @Test
+    void parsesPlaintext_bytesPreferred_fullPayload() {
+        // Real 2.2.1 block shape; Bytes is the authoritative single-line payload (Text agrees here).
+        String out = "Text:       \"https://titanarum.test/qr\"\n"
+                + "Bytes:      68 74 74 70 73 3A 2F 2F 74 69 74 61 6E 61 72 75 6D 2E 74 65 73 74 2F 71 72\n"
+                + "Format:     QRCode\n"
+                + "Position:   40x40 290x40 290x290 40x290 \n"
+                + "EC Level:   M\n";
+        List<ZXingReaderScanner.QrResult> r = ZXingReaderScanner.parsePlaintextOutput(out);
+        assertEquals(1, r.size());
+        assertEquals("https://titanarum.test/qr", r.get(0).text(), "payload decoded from Bytes");
+        assertEquals("QRCode", r.get(0).format());
+        assertEquals("40x40 290x40 290x290 40x290", r.get(0).position(), "trailing space trimmed");
+    }
+
+    @Test
+    void parsesPlaintext_textFallback_whenBytesAbsent() {
+        String out = "Text: \"https://x/qr\"\nFormat: QRCode\n";   // no Bytes field
+        List<ZXingReaderScanner.QrResult> r = ZXingReaderScanner.parsePlaintextOutput(out);
+        assertEquals(1, r.size());
+        assertEquals("https://x/qr", r.get(0).text(), "quote-stripped Text when Bytes is absent");
+    }
+
+    @Test
+    void parsesPlaintext_multilinePayload_viaBytes_notTruncated() {
+        // 2.2.1 emits a newline payload as multi-line Text (would truncate the URL); Bytes carries
+        // the full value (0A = newline). We must decode the FULL payload, not the truncated Text.
+        String out = "Text:       \"https://evil.example/a\n"
+                + "HIDDEN-SECOND-LINE\"\n"
+                + "Bytes:      68 74 74 70 73 3A 2F 2F 65 76 69 6C 2E 65 78 61 6D 70 6C 65 2F 61 0A "
+                + "48 49 44 44 45 4E 2D 53 45 43 4F 4E 44 2D 4C 49 4E 45\n"
+                + "Format:     QRCode\n";
+        List<ZXingReaderScanner.QrResult> r = ZXingReaderScanner.parsePlaintextOutput(out);
+        assertEquals(1, r.size());
+        assertEquals("https://evil.example/a\nHIDDEN-SECOND-LINE", r.get(0).text(),
+                "full payload incl. the hidden second line — not truncated at the newline");
+    }
+
+    @Test
+    void parsesPlaintext_noBarcodeFoundInPayload_notDropped_and_genuineEmpty() {
+        // A QR whose payload literally is "No barcode found" must NOT blank the result.
+        String out = "Text: \"No barcode found\"\n"
+                + "Bytes: 4E 6F 20 62 61 72 63 6F 64 65 20 66 6F 75 6E 64\n"   // "No barcode found"
+                + "Format: QRCode\n";
+        List<ZXingReaderScanner.QrResult> r = ZXingReaderScanner.parsePlaintextOutput(out);
+        assertEquals(1, r.size());
+        assertEquals("No barcode found", r.get(0).text());
+        // Genuine no-barcode output (no Format line) is still empty.
+        assertTrue(ZXingReaderScanner.parsePlaintextOutput("No barcode found\n").isEmpty());
+    }
+
+    @Test
+    void parsesPlaintext_multipleBlocks_dropsBlockWithoutFormat() {
+        String two = "Text: \"a\"\nFormat: QRCode\n\nText: \"b\"\nFormat: QRCode\n";
+        assertEquals(2, ZXingReaderScanner.parsePlaintextOutput(two).size(), "blank line separates blocks");
+        assertTrue(ZXingReaderScanner.parsePlaintextOutput("Text: \"x\"\nBytes: 78\n").isEmpty(),
+                "a block without Format is dropped, like parseJsonLines");
     }
 
     @org.junit.jupiter.api.Test

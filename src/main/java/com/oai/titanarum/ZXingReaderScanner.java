@@ -9,11 +9,21 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Decodes barcodes by shelling out to the zxing-cpp {@code ZXingReader -json} binary. */
+/**
+ * Decodes barcodes by shelling out to the zxing-cpp {@code ZXingReader} binary.
+ *
+ * <p>Version-aware (mirrors ClippyShot's {@code qr.py}): {@code ZXingReader >= 2.3} is driven
+ * with {@code -json} and parsed as JSON lines; older {@code 2.2.x} builds (which lack {@code -json}
+ * and would treat it as an input filename) are driven with {@code -format} and parsed from their
+ * plain key:value output. Support is probed once via {@code -help} and cached.
+ */
 final class ZXingReaderScanner {
 
     /** One decoded symbol (or an error entry). */
@@ -27,6 +37,13 @@ final class ZXingReaderScanner {
     private final long timeoutMillis;
     /** Warn at most once per scanner (i.e. per run) when the ZXingReader binary can't be launched. */
     private final AtomicBoolean warnedUnavailable = new AtomicBoolean(false);
+    /**
+     * Definitive {@code -json} support per executable path, cached process-wide (a binary's
+     * capability is stable within a JVM). Only DEFINITIVE probe results are stored; an
+     * undeterminable probe (exception/timeout) is NOT cached, so a transient fork failure can't
+     * poison a present-but-2.2.x binary into -json mode for the rest of the run.
+     */
+    private static final Map<String, Boolean> JSON_SUPPORT_CACHE = new ConcurrentHashMap<>();
 
     ZXingReaderScanner() {
         String bin = System.getenv("TITANARUM_ZXING_BIN");
@@ -60,16 +77,75 @@ final class ZXingReaderScanner {
         }
     }
 
-    List<String> buildCommand(Path image) {
+    List<String> buildCommand(Path image, boolean json) {
         List<String> cmd = new ArrayList<>();
         cmd.add(executable);
-        cmd.add("-json");
-        if (formats != null && !formats.isBlank()) {
-            cmd.add("-formats");
-            cmd.add(formats);
+        if (json) {
+            // ZXingReader >= 2.3: JSON-lines output, -formats (plural).
+            cmd.add("-json");
+            if (formats != null && !formats.isBlank()) {
+                cmd.add("-formats");
+                cmd.add(formats);
+            }
+        } else {
+            // ZXingReader 2.2.x: plain key:value output, -format (singular). Passing -json here
+            // makes 2.2.x treat "-json" as an input filename ("Failed to read image: -json").
+            if (formats != null && !formats.isBlank()) {
+                cmd.add("-format");
+                cmd.add(formats);
+            }
         }
         cmd.add(image.toAbsolutePath().toString());
         return cmd;
+    }
+
+    /**
+     * Returns whether {@code executable} accepts {@code -json} (ZXingReader >= 2.3). Probes
+     * {@code ZXingReader -help} once and caches the answer for the life of this scanner. Mirrors
+     * ClippyShot's {@code _zxing_supports_json}. Defaults to {@code true} (the modern deploy path,
+     * where all images build v3.x) when the probe can't run — a genuinely missing binary then
+     * surfaces on the real scan via {@link #warnUnavailableOnce}, not here.
+     */
+    boolean supportsJson() {
+        Boolean cached = JSON_SUPPORT_CACHE.get(executable);
+        if (cached != null) return cached;
+        Boolean probed = probeJsonSupport();   // null = undeterminable (exception/timeout)
+        if (probed != null) {
+            JSON_SUPPORT_CACHE.put(executable, probed);
+            return probed;
+        }
+        // Couldn't determine this time: assume modern (the deploy images build v3.x) for THIS
+        // call, but do NOT cache the guess — the next scan re-probes so a transient failure can't
+        // lock an old binary into -json mode.
+        return true;
+    }
+
+    /** @return TRUE/FALSE if definitively determined, or {@code null} if the probe couldn't run. */
+    private Boolean probeJsonSupport() {
+        ProcessBuilder pb = new ProcessBuilder(executable, "-help");
+        pb.redirectErrorStream(true);
+        Process p = null;
+        Thread drainThread = null;
+        try {
+            p = pb.start();
+            final Process forked = p;
+            // Drain on a daemon thread + bound by waitFor, same as scan(): a binary whose -help
+            // hangs (or produces unbounded output) must not block the calling thread.
+            StreamDrain drain = new StreamDrain(p.getInputStream(), forked::destroyForcibly);
+            drainThread = newDaemonThread(drain, "zxing-help-drain");
+            drainThread.start();
+            boolean done = p.waitFor(5, TimeUnit.SECONDS);
+            if (!done) {
+                p.destroyForcibly();
+                return null;   // timed out -> undeterminable; don't trust a possibly-partial read
+            }
+            joinQuietly(drainThread, 2_000L);
+            return new String(drain.result(), StandardCharsets.UTF_8).contains("-json");
+        } catch (Exception | LinkageError e) {
+            return null;   // undeterminable -> caller assumes modern for this call, re-probes later
+        } finally {
+            if (p != null && p.isAlive()) p.destroyForcibly();
+        }
     }
 
     /**
@@ -87,7 +163,8 @@ final class ZXingReaderScanner {
      * truly unbounded) so any bytes already captured are still returned.
      */
     List<QrResult> scan(Path image) {
-        ProcessBuilder pb = new ProcessBuilder(buildCommand(image));
+        boolean json = supportsJson();
+        ProcessBuilder pb = new ProcessBuilder(buildCommand(image, json));
         pb.redirectErrorStream(false);
         Process proc = null;
         Thread stdoutThread = null;
@@ -109,7 +186,10 @@ final class ZXingReaderScanner {
             }
             joinQuietly(stdoutThread, 2_000L);
             joinQuietly(stderrThread, 2_000L);
-            return parseJsonLines(new String(stdoutDrain.result(), StandardCharsets.UTF_8));
+            String out = new String(stdoutDrain.result(), StandardCharsets.UTF_8);
+            // Parse to match the argv: -json emits JSON lines (>= 2.3); 2.2.x emits plain
+            // key:value blocks. Selecting the wrong parser would silently drop findings.
+            return json ? parseJsonLines(out) : parsePlaintextOutput(out);
         } catch (IOException e) {
             // pb.start() failed — almost always because the ZXingReader binary is absent or
             // not executable. Warn (once) so this doesn't silently swallow QR findings.
@@ -210,6 +290,72 @@ final class ZXingReaderScanner {
             }
         }
         return results;
+    }
+
+    /**
+     * Parse ZXingReader 2.2.x plain key:value output (mirrors ClippyShot's
+     * {@code parse_zxing_plaintext_output}). Each detected symbol is a block of {@code Key: Value}
+     * lines (e.g. {@code Text: "..."}, {@code Format: QRCode}, {@code Position: ...}); blocks are
+     * separated by blank lines. Blocks without a usable {@code Format} are dropped, matching
+     * {@link #parseJsonLines}. Never raises on malformed input.
+     */
+    static List<QrResult> parsePlaintextOutput(String stdout) {
+        List<QrResult> results = new ArrayList<>();
+        if (stdout == null || stdout.isBlank()) return results;
+        // No "No barcode found" special-case: a block without Format is already dropped below, and
+        // a contains() check would false-empty the whole result if a decoded QR payload contained
+        // that literal string.
+        Map<String, String> current = new HashMap<>();
+        for (String raw : stdout.split("\\r?\\n")) {
+            String line = raw.strip();
+            if (line.isEmpty()) {
+                flushPlaintext(current, results);
+                current = new HashMap<>();
+                continue;
+            }
+            int colon = line.indexOf(':');
+            if (colon > 0) {
+                // split on the FIRST colon only, so a URL payload's own colons stay in the value
+                current.put(line.substring(0, colon).strip(), line.substring(colon + 1).strip());
+            }
+        }
+        flushPlaintext(current, results);
+        return results;
+    }
+
+    private static void flushPlaintext(Map<String, String> rec, List<QrResult> out) {
+        if (rec.isEmpty()) return;
+        String format = rec.get("Format");
+        if (format == null || format.isBlank()) return;   // require Format, matching parseJsonLines
+        // Prefer the single-line hex Bytes field: it carries the exact payload unambiguously. The
+        // 2.2.x plaintext Text field is emitted RAW (a payload with an embedded newline spans lines
+        // and would truncate the decoded URL — a detection-evasion gap; verified against 2.2.1).
+        // Fall back to the quote-stripped Text only when Bytes is absent.
+        String text = decodeBytesField(rec.get("Bytes"));
+        if (text == null) {
+            text = rec.getOrDefault("Text", "");
+            if (text.length() >= 2 && text.startsWith("\"") && text.endsWith("\"")) {
+                text = text.substring(1, text.length() - 1);
+            }
+        }
+        String position = rec.get("Position");
+        if (position != null) position = position.strip();
+        out.add(new QrResult(text, format, position, rec.get("Error")));
+    }
+
+    /** Decode a ZXingReader 2.2.x {@code Bytes:} hex string ("68 74 ..") to UTF-8, or null if absent/invalid. */
+    private static String decodeBytesField(String hex) {
+        if (hex == null || hex.isBlank()) return null;
+        String[] toks = hex.strip().split("\\s+");
+        byte[] b = new byte[toks.length];
+        try {
+            for (int i = 0; i < toks.length; i++) {
+                b[i] = (byte) Integer.parseInt(toks[i], 16);
+            }
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        return new String(b, StandardCharsets.UTF_8);
     }
 
     /**

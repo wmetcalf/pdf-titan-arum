@@ -30,7 +30,7 @@
 - Java 17+
 - Maven 3.9+
 - For server mode: PostgreSQL 14+, Docker (optional)
-- For QR/barcode scanning: the zxing-cpp `ZXingReader` binary on `PATH` (or set `TITANARUM_ZXING_BIN` to its path). Optional — if it is absent, titanarum prints a one-time warning and skips QR scanning; all other analysis is unaffected. Pass `--skip-qr` to opt out entirely. (The Docker images below bundle it, so QR works there out of the box.)
+- For QR/barcode scanning: the zxing-cpp `ZXingReader` binary on `PATH` (or set `TITANARUM_ZXING_BIN` to its path). Any release works — titanarum auto-detects `-json` (≥ 2.3) and falls back to the 2.2.x plaintext format. Optional — if the binary is absent, titanarum prints a one-time warning and skips QR scanning; all other analysis is unaffected. Pass `--skip-qr` to opt out entirely. (The Docker images below bundle it, so QR works there out of the box.)
 
 ---
 

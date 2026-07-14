@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Decodes barcodes by shelling out to the zxing-cpp {@code ZXingReader -json} binary. */
 final class ZXingReaderScanner {
@@ -24,6 +25,8 @@ final class ZXingReaderScanner {
     private final String executable;
     private final String formats;   // comma-separated; "" = all
     private final long timeoutMillis;
+    /** Warn at most once per scanner (i.e. per run) when the ZXingReader binary can't be launched. */
+    private final AtomicBoolean warnedUnavailable = new AtomicBoolean(false);
 
     ZXingReaderScanner() {
         String bin = System.getenv("TITANARUM_ZXING_BIN");
@@ -108,12 +111,35 @@ final class ZXingReaderScanner {
             joinQuietly(stderrThread, 2_000L);
             return parseJsonLines(new String(stdoutDrain.result(), StandardCharsets.UTF_8));
         } catch (IOException e) {
+            // pb.start() failed — almost always because the ZXingReader binary is absent or
+            // not executable. Warn (once) so this doesn't silently swallow QR findings.
+            warnUnavailableOnce(e);
             return List.of();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return List.of();
         } finally {
             if (proc != null && proc.isAlive()) proc.destroyForcibly();
+        }
+    }
+
+    /**
+     * Standalone-mode safety net. Barcode decoding shells out to the external zxing-cpp
+     * {@code ZXingReader} binary, which the blastbox deploy images bundle (and point at via
+     * {@code TITANARUM_ZXING_BIN}) but a plain {@code java -jar} user may not have installed.
+     * A missing binary makes {@link #scan} return no results; without this warning that loss is
+     * SILENT and QR findings just vanish. Emit one clear message per run (not per image — a
+     * QR-heavy PDF would otherwise spam it) naming the executable and how to fix it.
+     */
+    private void warnUnavailableOnce(IOException e) {
+        if (warnedUnavailable.compareAndSet(false, true)) {
+            // Phrased conditionally ("if it is not installed") so it is accurate whether the binary
+            // is genuinely absent (ENOENT/EACCES) or the launch hit a transient limit (fork EAGAIN,
+            // EMFILE) with the binary present — without fragile, locale-dependent errno parsing.
+            System.err.println("WARNING: QR/barcode scanning skipped — could not launch '"
+                    + executable + "' (" + e.getMessage() + "). If it is not installed, install the "
+                    + "zxing-cpp ZXingReader binary or set TITANARUM_ZXING_BIN to its path. "
+                    + "Pass --skip-qr to silence.");
         }
     }
 

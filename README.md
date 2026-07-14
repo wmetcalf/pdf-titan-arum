@@ -30,6 +30,7 @@
 - Java 17+
 - Maven 3.9+
 - For server mode: PostgreSQL 14+, Docker (optional)
+- For QR/barcode scanning: the zxing-cpp `ZXingReader` binary on `PATH` (or set `TITANARUM_ZXING_BIN` to its path). Optional — if it is absent, titanarum prints a one-time warning and skips QR scanning; all other analysis is unaffected. Pass `--skip-qr` to opt out entirely. (The Docker images below bundle it, so QR works there out of the box.)
 
 ---
 
@@ -56,6 +57,22 @@ java -jar target/pdf-titan-arum-1.3.0.jar --input suspicious.pdf --output ./out
 
 # Results
 cat out/report.json
+```
+
+### Run standalone in Docker
+
+titanarum runs two ways: **standalone** (the self-contained analysis jar — everything below) and as a **blastbox engine** (the fleet/worker deployment under `deploy/`). They are independent; the jar has no blastbox dependency. To run the standalone CLI in a container — the jar, the `ZXingReader` QR binary, and render fonts are all bundled, so QR works with no extra setup:
+
+```bash
+# Base image (jar + ZXingReader + fonts), then a thin CLI image on top:
+docker build -f deploy/docker/Dockerfile.titanarum-base -t pdf-titan-arum-base:dev .
+docker build -f deploy/docker/Dockerfile.titanarum-cli \
+  --build-arg BASE_IMAGE=pdf-titan-arum-base:dev -t titanarum-cli:dev .
+
+# Analyse a PDF (bind-mount a work dir for input + output):
+# (add --user "$(id -u):$(id -g)" if you want the output files owned by you rather than root)
+docker run --rm -v "$PWD":/work titanarum-cli:dev \
+  --input /work/suspicious.pdf --output /work/out
 ```
 
 ---

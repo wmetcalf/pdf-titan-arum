@@ -1,0 +1,26 @@
+# Standalone (NON-blastbox) CLI image for titanarum — the containerized form of
+# `java -jar pdf-titan-arum.jar --input X --output Y`. No blastbox, no Python, no
+# dispatcher/queue: just the self-contained analysis jar.
+#
+# Built ON TOP OF the base image (deploy/docker/Dockerfile.titanarum-base), which already
+# carries /app/pdf-titan-arum.jar, the zxing-cpp ZXingReader QR binary (TITANARUM_ZXING_BIN
+# is preset there, so QR/barcode scanning works out of the box — unlike a bare `java -jar`
+# on a host without ZXingReader, which now warns that QR is disabled), and the render fonts.
+# So this image adds nothing but an entrypoint.
+#
+#   docker build -f deploy/docker/Dockerfile.titanarum-cli \
+#     --build-arg BASE_IMAGE=pdf-titan-arum-base:<tag> -t titanarum-cli:<tag> .
+#
+#   # analyse a PDF (bind-mount a work dir for input + output):
+#   docker run --rm -v "$PWD":/work titanarum-cli:<tag> \
+#     --input /work/suspicious.pdf --output /work/out
+#
+# Runs as root (the base image sets no USER), so bind-mounted output lands root-owned on the
+# host; add `--user "$(id -u):$(id -g)"` to the run if you want the files owned by you.
+ARG BASE_IMAGE=pdf-titan-arum-base:dev
+FROM ${BASE_IMAGE}
+# Standalone CLI: read the PDF under /work and write report.json + artifacts to --output.
+# The base image's TITANARUM_ZXING_BIN / PATH / fonts are inherited, so no extra setup.
+WORKDIR /work
+ENTRYPOINT ["java", "-jar", "/app/pdf-titan-arum.jar"]
+CMD ["--help"]

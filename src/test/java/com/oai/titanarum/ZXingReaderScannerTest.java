@@ -123,6 +123,36 @@ class ZXingReaderScannerTest {
         return condition.getAsBoolean();
     }
 
+    @Test
+    void scan_warnsOnceWhenBinaryUnavailable_thenStaysSilent(@TempDir Path tmp) throws Exception {
+        Path png = tmp.resolve("dummy.png");
+        Files.write(png, new byte[]{(byte) 0x89, 'P', 'N', 'G'});
+        String missing = tmp.resolve("no-such-zxing-binary").toString();
+        ZXingReaderScanner scanner = new ZXingReaderScanner(missing, "QRCode", 1_000L);
+
+        // Swapping the process-global System.err is safe here because surefire runs tests
+        // sequentially in a single fork (no <parallel>/@Execution configured); if JUnit
+        // parallelism is ever enabled this capture would need a non-global seam.
+        java.io.PrintStream origErr = System.err;
+        java.io.ByteArrayOutputStream cap = new java.io.ByteArrayOutputStream();
+        System.setErr(new java.io.PrintStream(cap, true, StandardCharsets.UTF_8));
+        try {
+            assertTrue(scanner.scan(png).isEmpty(), "a missing binary must yield an empty result");
+            assertTrue(scanner.scan(png).isEmpty(), "the second scan must also yield an empty result");
+        } finally {
+            System.setErr(origErr);
+        }
+
+        String err = cap.toString(StandardCharsets.UTF_8);
+        int occurrences = err.split("QR/barcode scanning skipped", -1).length - 1;
+        assertEquals(1, occurrences,
+                "warning must be emitted exactly once across two scans (warn-once, no per-image spam); saw:\n" + err);
+        assertTrue(err.contains(missing), "warning must name the missing executable");
+        // Pin the REAL flag (--skip-qr), not the plausible-but-wrong --skip-qr-scan.
+        assertTrue(err.contains("--skip-qr to silence"), "warning must reference the real --skip-qr flag");
+        assertFalse(err.contains("--skip-qr-scan"), "must not reference the non-existent --skip-qr-scan flag");
+    }
+
     @org.junit.jupiter.api.Test
     void decodesRealQr_whenBinaryPresent() throws Exception {
         // Self-skip unless a -json-capable ZXingReader is on PATH.

@@ -144,7 +144,22 @@ final class ZXingReaderScanner {
         } catch (Exception | LinkageError e) {
             return null;   // undeterminable -> caller assumes modern for this call, re-probes later
         } finally {
-            if (p != null && p.isAlive()) p.destroyForcibly();
+            if (p != null) {
+                if (p.isAlive()) p.destroyForcibly();
+                closeStreams(p);
+            }
+        }
+    }
+
+    /** Best-effort close of a finished process's three pipe streams to reclaim FDs promptly. */
+    private static void closeStreams(Process p) {
+        for (java.io.Closeable s : new java.io.Closeable[]{
+                p.getInputStream(), p.getErrorStream(), p.getOutputStream()}) {
+            try {
+                s.close();
+            } catch (IOException ignore) {
+                // best-effort FD reclaim; the JVM reaper closes them on exit anyway
+            }
         }
     }
 
@@ -199,7 +214,13 @@ final class ZXingReaderScanner {
             Thread.currentThread().interrupt();
             return List.of();
         } finally {
-            if (proc != null && proc.isAlive()) proc.destroyForcibly();
+            if (proc != null) {
+                if (proc.isAlive()) proc.destroyForcibly();
+                // Reclaim the child's pipe FDs promptly. The JVM process reaper closes them on
+                // exit, but under a QR-flood (many rapid forks per document) the async reap can
+                // lag; closing here keeps a long-running warm/server JVM from spiking its fd use.
+                closeStreams(proc);
+            }
         }
     }
 

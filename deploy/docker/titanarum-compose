@@ -18,11 +18,10 @@
 # (TITANARUM_DATA_DIR, TITANARUM_FC_DIR, TITANARUM_PORT) rather than the
 # *_STATE_DIR name the redtusk wrapper drifted to.
 #
-# --firecracker merges docker-compose.firecracker.yml on top of the base
-# file. NOTE: as of this MVP that overlay file does not exist yet (Phase-2 —
-# the Java CRaC/vsock prerequisites are unbuilt) — --firecracker will fail
-# with "no such file" until it's authored; that failure is intentional
-# fail-closed behavior, not a bug in this wrapper.
+# --firecracker merges docker-compose.firecracker.yml on top of the base file
+# to run Firecracker microVM workers (the dispatcher-fc sidecar) instead of the
+# gVisor runsc warm pool. The overlay ships in this repo (deploy/docker/
+# docker-compose.firecracker.yml); it needs a KVM-capable host (/dev/kvm).
 #
 # GIDs are detected from the actual device/socket rather than using a
 # distro default (which varies per host).

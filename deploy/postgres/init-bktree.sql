@@ -37,7 +37,11 @@ CREATE OR REPLACE FUNCTION colorhash_bin_distance(
         -- would make the hex->bit(4) cast raise at query time. A length check alone is NOT
         -- enough — a 14-char NON-hex value (e.g. a client-supplied /v1/similar query hash)
         -- passes length yet fails ('x' || 'z')::bit(4); require exactly 14 hex chars.
-        WHEN a !~ '^[0-9a-fA-F]{14}$' OR b !~ '^[0-9a-fA-F]{14}$'
+        -- NULL must be guarded EXPLICITLY: `NULL !~ regex` is NULL (not TRUE), so the regex
+        -- alone lets a NULL arg fall through to ELSE, where sum() over all-NULL rows is NULL and
+        -- coalesce(...,0) collapses it to distance 0 = "identical" — a false similarity match.
+        WHEN a IS NULL OR b IS NULL
+             OR a !~ '^[0-9a-fA-F]{14}$' OR b !~ '^[0-9a-fA-F]{14}$'
              OR first_bin < 0 OR last_bin > 14 OR first_bin > last_bin THEN 2147483647
         ELSE coalesce((
             SELECT sum(abs(

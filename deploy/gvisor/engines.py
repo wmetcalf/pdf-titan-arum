@@ -1,8 +1,8 @@
-"""Example engines baked into the blastbox FC worker rootfs.
+"""Example engines baked into the blastbox gVisor worker rootfs.
 
-These are EXAMPLE engines for the Firecracker warm-tier demo, not part of the
+These are EXAMPLE engines for the gVisor warm-tier demo, not part of the
 blastbox core (real adopters write their own — ClippyShot's LibreOffice, etc.).
-The rootfs picks one at build time via BLASTBOX_FC_ENGINE.
+The rootfs picks one at build time via BLASTBOX_GVISOR_ENGINE (see run_warm.py).
 
 - ProbeEngine     — hashes input → one text artifact (no external tools).
 - PdfRasterizeEngine — a REAL detonation: rasterizes an untrusted PDF to per-page
@@ -30,7 +30,7 @@ from blastbox.contract import (
 from blastbox.limits import Limits
 from blastbox.worker.engine import DetonationResult
 
-_log = logging.getLogger("blastbox.fc.engines")
+_log = logging.getLogger("blastbox.gvisor.engines")
 
 
 # ---------------------------------------------------------------------------

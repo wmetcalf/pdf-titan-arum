@@ -41,7 +41,7 @@ _SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": [
         "inputPdf", "outputDirectory", "generatedAt", "documentSha256",
-        "pageCount", "blankPageCount", "pagesSpec", "dpi", "addLinkAnnotations",
+        "pageCount", "blankPageCount", "dpi", "addLinkAnnotations",
         "revisionCount",
         "urls", "javascript", "launchActions", "actions", "xfaScripts",
         "embeddedFiles", "phoneNumbers", "emails", "pagePdfs", "screenshots",
@@ -91,11 +91,21 @@ _SCHEMA: dict[str, Any] = {
         "streamLengthAnomalies": _arr({"type": "object"}),
         "structuralAnomalies": _arr({"type": "object"}),
         "metadataSpoofingIndicators": _arr({"type": "object"}),
+        # jsIndicators is emitted when the analyzer flags suspicious JS APIs / XFA / UNC-file
+        # actions -- the highest-signal malicious reports. It MUST be a declared property or the
+        # closed root below would reject exactly those reports as invalid.
+        "jsIndicators": _arr({"type": "object"}),
         # Only aiAnalysis is a fully open object (free-form LLM reply).
         "aiAnalysis": {"type": "object", "additionalProperties": True},
     },
     # Reject unexpected TOP-LEVEL keys (defense-in-depth against a tampered report).
     "additionalProperties": False,
+    # pagesSpec is only written on a SUCCESSFUL parse; parse-error reports (not-a-PDF /
+    # encrypted / wrong-password / unrecoverable) return early WITHOUT it. Require it only when
+    # parseError is absent, so those cleanly-rejected inputs still validate (else the engine would
+    # fail-closed on exactly the malformed/encrypted inputs it should classify as "rejected").
+    "if": {"not": {"required": ["parseError"]}},
+    "then": {"required": ["pagesSpec"]},
 }
 
 _VALIDATOR = Draft202012Validator(_SCHEMA, format_checker=FormatChecker())

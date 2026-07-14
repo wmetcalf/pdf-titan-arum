@@ -645,6 +645,11 @@ class TitanArumEngine:
                     return
                 except Exception:  # noqa: BLE001 - fail-closed: fall through to cold
                     pass
+            # Warm job failed, or the proc was dead on arrival: we are falling through to cold.
+            # self._warm is already None, so close() can never reclaim this handle -- reap its
+            # scratch here (the staged input PDF under in/, control files, boot log) so it does
+            # not orphan in /tmp (tmpfs) across successive warm dispatches.
+            shutil.rmtree(warm.scratch, ignore_errors=True)
 
         # Cold fallback (first attempt, or after a failed/dead warm attempt).
         # A warm attempt that died mid-processing may have left partial

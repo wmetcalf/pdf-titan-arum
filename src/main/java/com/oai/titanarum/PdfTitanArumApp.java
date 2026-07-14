@@ -2388,7 +2388,12 @@ for (int pageNum : pagesToProcess) {
     private String saveOriginalXObjectBytes(PDImage pdImage, Path outputDir, String baseName) {
         if (!(pdImage instanceof PDImageXObject xobj)) return null;
         String suffix = xobj.getSuffix();
-        if (!"jpg".equals(suffix) && !"jp2".equals(suffix)) return null;
+        // PDFBox 3.0.6 PDImageXObject.getSuffix() yields "jpg" (DCT/JPEG), "jpx" (JPX/JPEG2000),
+        // and "jb2" (JBIG2). Save the original encoded bytes for these so the hasher sees the true
+        // stream: rosetta decodes JPEG (fleet-exact), and throws UNSUPPORTED_FORMAT on JPX/JB2 --
+        // which routes decodeForHash to the PDFBox-decoded fallback image (the JP2/JBIG2 contract).
+        // ("jp2" never matches getSuffix() in PDFBox 3.x; the value is "jpx".)
+        if (!"jpg".equals(suffix) && !"jpx".equals(suffix) && !"jb2".equals(suffix)) return null;
         COSBase cosBase = xobj.getCOSObject();
         if (!(cosBase instanceof COSStream cosStream)) return null;
         try {

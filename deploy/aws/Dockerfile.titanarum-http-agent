@@ -35,11 +35,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends git cmake g++ m
 FROM eclipse-temurin:25-jre-noble
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fontconfig fonts-dejavu-core python3-venv \
+      libturbojpeg-java libheif1 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -u 10001 -m worker \
  && python3 -m venv /opt/titanarum
 ENV PATH=/opt/titanarum/bin:$PATH
 COPY --from=jarbuild  /pdf-titan-arum.jar /app/pdf-titan-arum.jar
+# rosetta-squint's JPEG/HEIC decode loads the turbojpeg JNI binding (libturbojpeg-java's
+# /usr/share/java/turbojpeg.jar). Place it next to the app jar so the uber-jar's RELATIVE manifest
+# Class-Path (turbojpeg.jar) resolves it under `java -jar`; test -f fails the build if it moves.
+RUN test -f /usr/share/java/turbojpeg.jar && cp /usr/share/java/turbojpeg.jar /app/turbojpeg.jar
 COPY --from=zxingbuild /ZXingReader        /usr/local/bin/ZXingReader
 RUN /usr/local/bin/ZXingReader -version    # fail the build on a broken arm64 binary
 COPY pyproject.toml README.md /src/titanarum/

@@ -25,9 +25,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 FROM eclipse-temurin:25-jre
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fontconfig fonts-dejavu-core python3-venv \
+      libturbojpeg-java libheif1 \
  && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /app
 COPY --from=jarbuild /pdf-titan-arum.jar /app/pdf-titan-arum.jar
+# rosetta-squint's JPEG/HEIC decode loads the turbojpeg JNI binding (libturbojpeg-java's
+# /usr/share/java/turbojpeg.jar). Place it next to the app jar so the uber-jar's RELATIVE manifest
+# Class-Path (turbojpeg.jar) resolves it under `java -jar`. test -f fails the build if the packaged
+# path ever moves (rather than silently degrading JPEG hashes to the PDFBox fallback).
+RUN test -f /usr/share/java/turbojpeg.jar && cp /usr/share/java/turbojpeg.jar /app/turbojpeg.jar
 COPY --from=zxingbuild /ZXingReader /usr/local/bin/ZXingReader
 RUN /usr/local/bin/ZXingReader -version   # sanity: fails the build if the binary is broken
 RUN python3 -m venv /opt/titanarum

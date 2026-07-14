@@ -3194,16 +3194,19 @@ for (int pageNum : pagesToProcess) {
      */
     private HashResult computeImageHashInMemory(BufferedImage img, Path hashFile) {
         HashResult hr = new HashResult();
-        hr.width     = img.getWidth();
-        hr.height    = img.getHeight();
-        hr.mode      = colorModelMode(img);
-        hr.phash     = computePhash(img);
-        hr.colorhash = computeColorHash(img);
+        BufferedImage hashImg = img;   // PDFBox-decoded fallback (JP2/JBIG2 or read error)
         try {
-            hr.sha256 = sha256(Files.readAllBytes(hashFile));
+            byte[] raw = Files.readAllBytes(hashFile);
+            hr.sha256 = sha256(raw);
+            hashImg = decodeForHash(raw, img);   // rosetta-decode the original encoded bytes
         } catch (IOException e) {
             hr.error = e.getMessage();
         }
+        hr.width     = hashImg.getWidth();
+        hr.height    = hashImg.getHeight();
+        hr.mode      = colorModelMode(hashImg);
+        hr.phash     = computePhash(hashImg);
+        hr.colorhash = computeColorHash(hashImg);
         return hr;
     }
 
@@ -3221,9 +3224,10 @@ for (int pageNum : pagesToProcess) {
                 continue;
             }
             try {
-                hr.sha256 = sha256(Files.readAllBytes(path));
-                BufferedImage img = ImageIO.read(path.toFile());
-                if (img == null) throw new IOException("ImageIO could not decode " + path.getFileName());
+                byte[] raw = Files.readAllBytes(path);
+                hr.sha256 = sha256(raw);
+                BufferedImage img = decodeForHash(raw, ImageIO.read(path.toFile()));
+                if (img == null) throw new IOException("could not decode " + path.getFileName());
                 hr.width     = img.getWidth();
                 hr.height    = img.getHeight();
                 hr.mode      = colorModelMode(img);
@@ -3244,6 +3248,17 @@ for (int pageNum : pagesToProcess) {
             case BufferedImage.TYPE_BYTE_GRAY                                  -> "L";
             default                                                             -> "RGB";
         };
+    }
+
+    // Decode via the rosetta-squint decode port (PIL-exact for PNG/JPEG/WebP/TIFF/HEIC/GIF/BMP).
+    // Falls back to the caller's already-decoded image for formats rosetta can't handle -- notably
+    // titan's PDF-specific JPEG2000 / JBIG2 embedded streams (decoded by PDFBox), or any decode error.
+    private static BufferedImage decodeForHash(byte[] bytes, BufferedImage fallback) {
+        try {
+            return io.github.wmetcalf.rosettasquint.Squint.decodeBytes(bytes);
+        } catch (Exception e) {
+            return fallback;
+        }
     }
 
     private static List<PhoneHit> extractPhonesFromText(

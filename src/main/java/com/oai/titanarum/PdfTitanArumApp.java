@@ -3138,10 +3138,6 @@ for (int pageNum : pagesToProcess) {
         return pts.isEmpty() ? null : pts;
     }
 
-    // Pre-scale cap: images larger than this are fast-downscaled by Java2D before
-    // our pure-Java Lanczos kernel runs, avoiding O(srcW*srcH*kernelSupport) blowup.
-    private static final int PHASH_PRESIZE = 256;
-
     // Screenshot pages are scaled to this width (pixels) to simulate a typical laptop
     // viewport in Adobe Reader (e.g. 1200px ≈ a 1920×1080 laptop at "Fit Width").
     // Crops and extracted images are NOT affected — they retain their natural dimensions.
@@ -3153,14 +3149,9 @@ for (int pageNum : pagesToProcess) {
         return io.github.wmetcalf.rosettasquint.hash.PHash.compute(img, 8).toString();
     }
 
-    private static final int COLOR_HASH_BINBITS = 4;  // 14 bins × 4 bits = 56 bits = 14 hex chars
-
     /**
-     * Color hash with bit-level compatibility with Python imagehash.colorhash(img, binbits=4).
-     *
-     * 14 bins: 1 black fraction + 1 gray fraction + 6 faint-color hue bins + 6 bright-color hue bins.
-     * Each bin value (0 to 2^binbits-1) encoded with the exact same quirky bit formula as imagehash.
-     * PIL 'L' grayscale and PIL HSV conversion replicated to match Pillow's C implementation.
+     * Color hash delegating to the shared rosetta-squint-hash port (byte-exact with Python
+     * imagehash.colorhash), binbits=4 (=> 14 hex chars).
      */
     private static String computeColorHash(BufferedImage img) {
         // colorhash via rosetta-squint-hash, binbits=4 (=> 14 hex) to match ClippyShot / titan's

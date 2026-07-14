@@ -82,11 +82,11 @@
         <artifactId>rosetta-squint</artifactId>
         <version>1.1.1</version>
     </dependency>
-    <!-- rosetta-squint's POM does not declare these as transitive dependencies
-         even though Squint's public API (phash/dhash/colorhash/etc.) returns
-         and consumes their types directly; without them the umbrella jar
-         does not compile against. Pinned to the newest versions published
-         on Maven Central for each submodule. -->
+    <!-- Squint's public API (phash/dhash/colorhash/etc.) returns and consumes
+         rosetta-squint-hash/-decode types directly, but the umbrella
+         rosetta-squint POM does not declare hash/decode as compile
+         dependencies, so they are pinned explicitly here. Pinned to the
+         newest versions published on Maven Central for each submodule. -->
     <dependency>
         <groupId>io.github.wmetcalf</groupId>
         <artifactId>rosetta-squint-hash</artifactId>

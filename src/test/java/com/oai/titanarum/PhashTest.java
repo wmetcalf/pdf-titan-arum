@@ -16,6 +16,12 @@ class PhashTest {
         return (String) m.invoke(null, img);
     }
 
+    private String callComputeColorHash(BufferedImage img) throws Exception {
+        Method m = PdfTitanArumApp.class.getDeclaredMethod("computeColorHash", BufferedImage.class);
+        m.setAccessible(true);
+        return (String) m.invoke(null, img);
+    }
+
     @Test
     void allWhiteImage() throws Exception {
         BufferedImage img = new BufferedImage(100, 100, BufferedImage.TYPE_INT_RGB);
@@ -42,8 +48,6 @@ class PhashTest {
         // These are str(rosetta_squint.phash_bytes(png)) / str(colorhash_bytes(png, binbits=4)) from
         // the Python port -- the Java hash port MUST produce byte-identical hex (fleet uniformity).
         assertEquals("bc3c27c3c3c31c3c", callComputePhash(img));
-        Method cm = PdfTitanArumApp.class.getDeclaredMethod("computeColorHash", BufferedImage.class);
-        cm.setAccessible(true);
-        assertEquals("0f000000000000", (String) cm.invoke(null, img));
+        assertEquals("0f000000000000", callComputeColorHash(img));
     }
 }

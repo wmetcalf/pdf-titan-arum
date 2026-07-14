@@ -2,7 +2,6 @@ package com.oai.titanarum;
 
 import org.junit.jupiter.api.Test;
 
-import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.lang.reflect.Method;
@@ -33,11 +32,18 @@ class PhashTest {
     }
 
     @Test
-    void calibrationImageMatchesPython() throws Exception {
+    void calibrationMatchesPythonRosettaSquint() throws Exception {
         File f = new File("src/test/resources/calibration.png");
         org.junit.jupiter.api.Assumptions.assumeTrue(f.exists(), "calibration.png not present, skipping");
-        BufferedImage img = ImageIO.read(f);
-        String expected = "REPLACE_ME";
-        assertEquals(expected, callComputePhash(img));
+        // Decode via the same rosetta-squint decode port production uses (Squint.decodeBytes),
+        // not ImageIO.read — this exercises decode-port + hash-port together, exactly as it ships.
+        byte[] bytes = java.nio.file.Files.readAllBytes(f.toPath());
+        BufferedImage img = io.github.wmetcalf.rosettasquint.Squint.decodeBytes(bytes);
+        // These are str(rosetta_squint.phash_bytes(png)) / str(colorhash_bytes(png, binbits=4)) from
+        // the Python port -- the Java hash port MUST produce byte-identical hex (fleet uniformity).
+        assertEquals("bc3c27c3c3c31c3c", callComputePhash(img));
+        Method cm = PdfTitanArumApp.class.getDeclaredMethod("computeColorHash", BufferedImage.class);
+        cm.setAccessible(true);
+        assertEquals("0f000000000000", (String) cm.invoke(null, img));
     }
 }

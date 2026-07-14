@@ -115,7 +115,11 @@ def validate_report(report: dict) -> None:
     """Raise SchemaValidationError on the first schema violation."""
     if not isinstance(report, dict):
         raise SchemaValidationError("$", "top-level value is not an object")
-    errors = sorted(_VALIDATOR.iter_errors(report), key=lambda e: list(e.path))
+    # Stringify each path element before sorting: e.path mixes int (array indices) and str
+    # (object keys), and Python 3 raises TypeError comparing int vs str at the same position.
+    # A malformed report with errors at both an array index and a top-level key would otherwise
+    # crash the trust gate with an unhandled TypeError instead of a SchemaValidationError.
+    errors = sorted(_VALIDATOR.iter_errors(report), key=lambda e: [str(p) for p in e.path])
     if errors:
         first = errors[0]
         path = "$" + "".join(f"[{p!r}]" for p in first.path)

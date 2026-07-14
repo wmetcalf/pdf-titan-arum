@@ -172,13 +172,19 @@ def _run_worker(input_path: Path, report_outdir: Path, *,
 
         job = _build_job(staged_in, report_outdir, sha256)
 
+        _stop = threading.Event()
+
         def _signal_worker() -> None:
             ready_file = control_dir / "control.ready"
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
+                if _stop.is_set():
+                    return
                 if ready_file.exists():
                     break
                 time.sleep(_READY_POLL_S)
+            if _stop.is_set():
+                return
             (control_dir / "job.json").write_text(
                 json.dumps(job, ensure_ascii=False), encoding="utf-8")
             (control_dir / "control.go").touch()
@@ -187,8 +193,15 @@ def _run_worker(input_path: Path, report_outdir: Path, *,
         signaller.start()
 
         argv = _java_worker_argv(scratch)
-        result = subprocess.run(argv, capture_output=True, timeout=timeout)
-        signaller.join(timeout=5)
+        try:
+            result = subprocess.run(argv, capture_output=True, timeout=timeout)
+        finally:
+            # Stop + join the signaller BEFORE the enclosing tempdir is torn down, so it can't
+            # write control files into a directory being rmtree'd. subprocess.run(timeout=...)
+            # raises TimeoutExpired, which would otherwise skip the join below and leave the
+            # thread writing into the deleted scratch (race).
+            _stop.set()
+            signaller.join(timeout=5)
 
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace")[-2000:]

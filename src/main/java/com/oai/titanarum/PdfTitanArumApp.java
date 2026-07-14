@@ -5351,6 +5351,25 @@ for (int pageNum : pagesToProcess) {
                 System.err.println("APPCDS_WARMUP_SKIP " + pdfFile.getName() + " ("
                         + e.getClass().getSimpleName() + ": " + e.getMessage() + ")"
                         + (tmpOut != null ? " out=" + tmpOut : ""));
+            } finally {
+                // Recursively delete the warmup output dir. build-aot.sh runs --appcds-warmup
+                // INSIDE a single Docker RUN layer (deploy/{gvisor,firecracker}/Dockerfile.titanarum)
+                // whose cleanup removes only the corpus + logs -- any leftover
+                // /tmp/titanarum-appcds-warmup-* (screenshots, report.json, page rasters) would
+                // otherwise bake into the image. deleteOnExit cannot remove a populated directory.
+                if (tmpOut != null) {
+                    try (java.util.stream.Stream<Path> walk = Files.walk(tmpOut)) {
+                        walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                            try {
+                                Files.deleteIfExists(p);
+                            } catch (IOException ignore) {
+                                // best-effort per-entry cleanup
+                            }
+                        });
+                    } catch (IOException ignore) {
+                        // best-effort: could not walk the temp dir for deletion
+                    }
+                }
             }
         }
         return 0;

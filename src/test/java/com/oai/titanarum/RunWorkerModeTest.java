@@ -164,9 +164,13 @@ class RunWorkerModeTest {
         }
         assertTrue(warmedOutDirs.size() >= 2,
                 "expected callWith to run for at least the 2 valid PDFs; log was:\n" + log);
+        // The APPCDS_WARMUP_OK line above is emitted only AFTER callWith() returns, i.e. after it
+        // wrote report.json + artifacts into the throwaway dir. runAppcdsWarmup then recursively
+        // removes that dir so the AOT-recording Docker RUN layer doesn't bake megabytes of
+        // screenshots/reports into the image. Assert the cleanup: no warmed dir may survive.
         for (Path outDir : warmedOutDirs) {
-            assertTrue(Files.isRegularFile(outDir.resolve("report.json")),
-                    "each warmup pass must produce report.json in its throwaway output dir: " + outDir);
+            assertFalse(Files.exists(outDir),
+                    "warmup output dir must be cleaned up (not left to bake into the image layer): " + outDir);
         }
     }
 

@@ -2398,7 +2398,12 @@ for (int pageNum : pagesToProcess) {
         if (!(cosBase instanceof COSStream cosStream)) return null;
         try {
             Path file = uniquePath(outputDir, baseName + "." + suffix);
-            try (InputStream is = cosStream.createInputStream();
+            // createRawInputStream (NOT createInputStream): we want the ORIGINAL encoded codestream
+            // (the real ffd8 JPEG / JP2 codestream / JBIG2), not PDFBox's decoded raster. That is what
+            // the hasher feeds to the rosetta decode port so JPEG hashes via turbojpeg (PIL-exact,
+            // fleet-uniform) and JP2/JBIG2 cleanly throw -> PDFBox fallback. createInputStream() here
+            // would decode the image filter to raster, which rosetta can't identify -> silent fallback.
+            try (InputStream is = cosStream.createRawInputStream();
                  OutputStream os = Files.newOutputStream(file)) {
                 // C2: use bounded copy — a decompression bomb in an XObject stream
                 // could otherwise expand to gigabytes before hitting the filesystem.
@@ -3252,7 +3257,10 @@ for (int pageNum : pagesToProcess) {
     private static BufferedImage decodeForHash(byte[] bytes, BufferedImage fallback) {
         try {
             return io.github.wmetcalf.rosettasquint.Squint.decodeBytes(bytes);
-        } catch (Exception e) {
+        } catch (Exception | LinkageError e) {
+            // Exception: formats rosetta can't decode (JP2/JBIG2/corrupt) -> PDFBox fallback.
+            // LinkageError: the turbojpeg JNI binding (NoClassDefFoundError/UnsatisfiedLinkError) is
+            // absent in this deployment -> degrade to the PDFBox-decoded image rather than crashing.
             return fallback;
         }
     }

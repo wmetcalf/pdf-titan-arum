@@ -230,6 +230,15 @@
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.oai.titanarum.PdfTitanArumApp</mainClass>
+                                    <manifestEntries>
+                                        <!-- rosetta-squint's JPEG/HEIC decode needs the turbojpeg JNI
+                                             binding (system /usr/share/java/turbojpeg.jar; not on Maven
+                                             Central). A RELATIVE Class-Path entry is honored by `java -jar`
+                                             when turbojpeg.jar sits next to this jar (deploy images copy it
+                                             to /app/), and is silently ignored when absent (decodeForHash
+                                             then degrades to the PDFBox-decoded image). -->
+                                        <Class-Path>turbojpeg.jar</Class-Path>
+                                    </manifestEntries>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
@@ -270,6 +279,12 @@
                 <excludes>
                     <exclude>${server.test.exclude}</exclude>
                 </excludes>
+                <!-- turbojpeg JNI binding for the rosetta JPEG-decode parity tests (present on
+                     Ubuntu via libturbojpeg-java at /usr/share/java/turbojpeg.jar; the tests
+                     assumeTrue-skip when it is absent, so this stays green off-Ubuntu). -->
+                <additionalClasspathElements>
+                    <additionalClasspathElement>/usr/share/java/turbojpeg.jar</additionalClasspathElement>
+                </additionalClasspathElements>
             </configuration>
         </plugin>
         </plugins>

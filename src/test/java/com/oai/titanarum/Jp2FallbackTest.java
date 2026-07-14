@@ -70,10 +70,11 @@ class Jp2FallbackTest {
         return (String) m.invoke(app, img, dir, baseName);
     }
 
+    /** The ORIGINAL encoded codestream (createRawInputStream) -- matches what saveOriginalXObjectBytes writes. */
     private static byte[] rawStreamBytes(PDImageXObject img) throws Exception {
         COSBase cos = img.getCOSObject();
         assertTrue(cos instanceof COSStream, "image XObject backed by a COSStream");
-        try (InputStream is = ((COSStream) cos).createInputStream();
+        try (InputStream is = ((COSStream) cos).createRawInputStream();
              ByteArrayOutputStream bo = new ByteArrayOutputStream()) {
             is.transferTo(bo);
             return bo.toByteArray();

@@ -305,14 +305,18 @@ dispatcher touches the Docker socket (via a locked-down `docker-socket-proxy`); 
 The cold tier (a disposable gVisor/runc worker per job) is the default:
 
 ```sh
-# 1. Build the images (base → cold-worker, plus the api/dispatcher host image)
+# 1. Build the images (base → cold-worker, plus the api/dispatcher host image).
+#    The cold-worker's BASE_IMAGE ARG defaults to :dev, so pass --build-arg to pin it to your TAG.
 docker build -f deploy/docker/Dockerfile.titanarum-base        -t pdf-titan-arum-base:pha2 .
-docker build -f deploy/docker/Dockerfile.titanarum-cold-worker -t titanarum-cold-worker:pha2 .
+docker build -f deploy/docker/Dockerfile.titanarum-cold-worker \
+             --build-arg BASE_IMAGE=pdf-titan-arum-base:pha2   -t titanarum-cold-worker:pha2 .
 docker build -f deploy/docker/Dockerfile.titanarum-host        -t titanarum:pha2 .
 
 # 2. Configure (POSTGRES_PASSWORD is required — no default; compose fails fast if unset)
 cp deploy/docker/.env.example deploy/docker/.env
-#   set POSTGRES_PASSWORD (openssl rand -base64 32), TAG, TITANARUM_DATA_DIR
+#   edit .env: POSTGRES_PASSWORD (openssl rand -base64 32), TAG, TITANARUM_DATA_DIR
+# create the shared job root (UID 10001); source .env first so $TITANARUM_DATA_DIR is set in-shell:
+set -a && . deploy/docker/.env && set +a
 sudo mkdir -p "$TITANARUM_DATA_DIR" && sudo chown -R 10001:10001 "$TITANARUM_DATA_DIR"
 
 # 3. Start (the wrapper auto-writes DOCKER_GID; everything else passes through to docker compose)
@@ -325,8 +329,9 @@ merged on top of the base stack:
 
 - **Firecracker microVM** (guest-RAM snapshot; needs a KVM host, `/dev/kvm`):
   `./deploy/docker/titanarum-compose --firecracker up --build -d`
-- **gVisor C/R** (checkpoint/restore a warmed JVM): merge the `docker-compose.gvisor.yml` overlay —
-  see its header for the exact `-f` invocation.
+- **gVisor C/R** (checkpoint/restore a warmed JVM): there's no wrapper flag — merge the overlay with
+  raw compose from `deploy/docker/`:
+  `docker compose -f docker-compose.yml -f docker-compose.gvisor.yml up -d` (see the overlay header).
 
 ### AWS / cloud workers
 
@@ -381,6 +386,10 @@ BLASTBOX_EC2_ROOT_VOLUME_GB=30            # ≥ instance RAM (RAM is saved to th
 BLASTBOX_EC2_ORPHAN_MAX_AGE_S=3600        # host-side sweep for slots parked when a dispatcher crashed
 ```
 
+> The shipped `deploy/aws/Dockerfile.titanarum-http-agent` is MVP-scoped to the **disposable**
+> `aws-ec2` tier (no AOT cache). The warm tiers above reuse the same `BLASTBOX_*` knobs, but want a
+> warm-capable image build (bake an AOT cache, and a hibernation-enabled AMI for `aws-ec2-hibernate`).
+
 Both AWS families are **fail-closed**: a tier is refused at selection unless `sts get-caller-identity`
 and a read-only service probe both pass. Instance IP is **private by default**; a public IP
 (`BLASTBOX_EC2_PUBLIC_IP=1`) requires dispatcher mTLS (`blastbox pki init` → `BLASTBOX_DISPATCH_TLS_*`
@@ -401,6 +410,11 @@ keys are dropped before the allowlist). They map onto the same knobs as the CLI 
 | `TITANARUM_OCR_SCREENSHOTS` · `_OCR_URL_CROPS` · `_OCR_LANG` | OCR toggles + language | off / `eng` |
 | `TITANARUM_NO_SKIP_BLANKS` · `_ADD_LINK_ANNOTATIONS` | blank-page + link-annotation behavior | off |
 | `TITANARUM_PASSWORD` | password for encrypted PDFs (cleared after the worker reads it) | — |
+
+**Allowlist:** the compose stack forwards only `TITANARUM_SKIP_SCREENSHOTS`, `TITANARUM_SKIP_IMAGES`,
+`TITANARUM_DPI`, `TITANARUM_PAGES` **by default** (`BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS` in
+`docker-compose.yml` / `.env`). To forward any other row above, add its key to that allowlist —
+unlisted (and any lowercase) keys are dropped before they reach the worker.
 
 Stack-level env (`deploy/docker/.env.example`): `POSTGRES_PASSWORD` (required), `TITANARUM_PORT`
 (8004), `TITANARUM_BIND_ADDR` (set `127.0.0.1` to keep it off the network — **the api does not

@@ -61,7 +61,7 @@ cat out/report.json
 
 ### Run standalone in Docker
 
-titanarum runs two ways: **standalone** (the self-contained analysis jar — everything below) and as a **blastbox engine** (the fleet/worker deployment under `deploy/`). They are independent; the jar has no blastbox dependency. To run the standalone CLI in a container — the jar, the `ZXingReader` QR binary, and render fonts are all bundled, so QR works with no extra setup:
+titanarum runs two ways: **standalone** (the self-contained analysis jar — everything below) and as a **[blastbox engine](#blastbox-fleet-engine)** (the fleet/worker deployment under `deploy/`). They are independent; the jar has no blastbox dependency. To run the standalone CLI in a container — the jar, the `ZXingReader` QR binary, and render fonts are all bundled, so QR works with no extra setup:
 
 ```bash
 # Base image (jar + ZXingReader + fonts), then a thin CLI image on top:
@@ -279,6 +279,135 @@ Each job's `report.json` (and the web UI) will include an `aiAnalysis` block:
 | `GET`    | `/api/jobs/{id}/download`         | Download all artifacts as ZIP.                                |
 | `GET`    | `/api/jobs/{id}/artifacts/{path}` | Serve individual artifact file.                               |
 | `GET`    | `/api/jobs/{id}/status`           | SSE stream of live job status updates.                        |
+
+---
+
+## Blastbox fleet engine
+
+Besides the standalone jar and the single-node [Server Mode](#server-mode), titanarum ships as a
+**blastbox fleet engine** (`titanarum.engine:TitanArumEngine`) under `deploy/`. Ingress, dispatch,
+the job store, and the worker pool are all blastbox.host's; titanarum only supplies the PDF engine
+and the prebaked worker image. The two modes are independent — **the standalone jar has no blastbox
+dependency**, and the engine adapter never runs the CLI's HTTP server.
+
+The stack is a submit → queue → dispatch → sealed-result pipeline: an `api` (blastbox core routes)
+writes each job to Postgres; a `dispatcher` claims queued jobs and launches **one hardened,
+disposable cold-worker container per job** (runsc/gVisor by default) that runs the JVM in-process
+over a file-IPC handshake; the sealed output (report + artifacts) is served back by id. Only the
+dispatcher touches the Docker socket (via a locked-down `docker-socket-proxy`); the api never does.
+
+> The compose stack is scoped by `COMPOSE_PROJECT_NAME=titanarum-bb`, so it coexists on one host
+> with sibling blastbox engines (redtusk-bb, clippyshot) without collision — it reserves a unique
+> port (8004) and a unique `TITANARUM_DATA_DIR`.
+
+### Compose deployment (on-prem)
+
+The cold tier (a disposable gVisor/runc worker per job) is the default:
+
+```sh
+# 1. Build the images (base → cold-worker, plus the api/dispatcher host image)
+docker build -f deploy/docker/Dockerfile.titanarum-base        -t pdf-titan-arum-base:pha2 .
+docker build -f deploy/docker/Dockerfile.titanarum-cold-worker -t titanarum-cold-worker:pha2 .
+docker build -f deploy/docker/Dockerfile.titanarum-host        -t titanarum:pha2 .
+
+# 2. Configure (POSTGRES_PASSWORD is required — no default; compose fails fast if unset)
+cp deploy/docker/.env.example deploy/docker/.env
+#   set POSTGRES_PASSWORD (openssl rand -base64 32), TAG, TITANARUM_DATA_DIR
+sudo mkdir -p "$TITANARUM_DATA_DIR" && sudo chown -R 10001:10001 "$TITANARUM_DATA_DIR"
+
+# 3. Start (the wrapper auto-writes DOCKER_GID; everything else passes through to docker compose)
+./deploy/docker/titanarum-compose up --build -d
+# API at http://localhost:8004/  (submit / status / list / artifacts / result / similar)
+```
+
+**Warm-tier sidecars** cut per-job latency by reusing a pre-booted JVM. They are opt-in overlays
+merged on top of the base stack:
+
+- **Firecracker microVM** (guest-RAM snapshot; needs a KVM host, `/dev/kvm`):
+  `./deploy/docker/titanarum-compose --firecracker up --build -d`
+- **gVisor C/R** (checkpoint/restore a warmed JVM): merge the `docker-compose.gvisor.yml` overlay —
+  see its header for the exact `-f` invocation.
+
+### AWS / cloud workers
+
+titanarum is a blastbox **engine**, so the AWS worker tiers are selected and configured entirely
+with `BLASTBOX_*` knobs on the dispatcher (they're blastbox.host's, engine-agnostic); titanarum only
+supplies the prebaked ARM64 worker image. The framework offers four tiers — `aws-ec2` and
+`aws-lambda-microvm` are **disposable** (one job, then terminate); `aws-ec2-hibernate` and
+`aws-lambda-snapstart` are **warm** (hibernate / SnapStart C/R keeps the same warmed JVM across
+jobs). `deploy/aws/Dockerfile.titanarum-http-agent` targets the disposable `aws-ec2` tier.
+
+**Worker image (ARM64).** It bakes the fat jar + a from-source arm64 ZXingReader v3.1.0 + blastbox's
+generic HTTP agent, which serves `GET /healthz` + `POST /detonate` and runs `engine.warmup()` before
+it binds — so a healthy `/healthz` means warm:
+
+```dockerfile
+# key env the image sets (deploy/aws/Dockerfile.titanarum-http-agent):
+ENV BLASTBOX_ENGINE=titanarum.engine:TitanArumEngine \
+    TITANARUM_WORKER_JAR=/app/pdf-titan-arum.jar \
+    TITANARUM_JAVA_LIBRARY_PATH=/app \
+    TITANARUM_ZXING_BIN=/usr/local/bin/ZXingReader \
+    BLASTBOX_WORKER_AGENT_PORT=8765
+CMD ["python", "-m", "blastbox.worker.http_agent"]
+```
+
+Build it **natively on an arm64 host** (an aarch64 EC2 instance — no QEMU) or with
+`docker buildx --platform linux/arm64`, then bake an AMI from it (or a MicroVM image for the Lambda
+tiers). The host POSTs each job's PDF and gets the sealed output tar back over blastbox's generic
+`remote_http` transport.
+
+**Disposable EC2 — one job, then terminate** (`BLASTBOX_*` on the dispatcher):
+
+```sh
+BLASTBOX_POOL_RUNTIME=aws-ec2
+BLASTBOX_AWS_REGION=us-east-1
+BLASTBOX_EC2_AMI=ami-...                  # the titanarum worker AMI (agent brought up via user-data)
+BLASTBOX_EC2_INSTANCE_TYPE=m7g.large      # ARM64
+BLASTBOX_EC2_SUBNET_ID=subnet-...
+BLASTBOX_EC2_SECURITY_GROUPS=sg-...
+BLASTBOX_EC2_AGENT_TOKEN=<bearer>         # expected on the readiness probe + /detonate
+BLASTBOX_EC2_SELF_TERMINATE=1             # guest self-kills after MAX_DURATION_S (no leaked instance)
+BLASTBOX_POOL_WARMING_TIMEOUT_S=240       # first boot can exceed the 120s default
+```
+
+**Warm EC2 hibernate — `stop --hibernate`/`start` C/R; the same warmed JVM serves the pre-hibernate
+and post-resume jobs** (reuses every `BLASTBOX_EC2_*` / `BLASTBOX_AWS_*` above):
+
+```sh
+BLASTBOX_POOL_RUNTIME=aws-ec2-hibernate
+BLASTBOX_EC2_INSTANCE_TYPE=m7g.large      # hibernation-capable (t4g/m6g/m7g, RAM ≤ 150 GB)
+BLASTBOX_EC2_AMI=ami-...                  # a hibernation-enabled build of the worker AMI
+BLASTBOX_EC2_ROOT_VOLUME_GB=30            # ≥ instance RAM (RAM is saved to the encrypted root EBS)
+BLASTBOX_EC2_ORPHAN_MAX_AGE_S=3600        # host-side sweep for slots parked when a dispatcher crashed
+```
+
+Both AWS families are **fail-closed**: a tier is refused at selection unless `sts get-caller-identity`
+and a read-only service probe both pass. Instance IP is **private by default**; a public IP
+(`BLASTBOX_EC2_PUBLIC_IP=1`) requires dispatcher mTLS (`blastbox pki init` → `BLASTBOX_DISPATCH_TLS_*`
+plus the agent's `BLASTBOX_WORKER_AGENT_CLIENT_CA`) or the runtime fails closed. For local + cloud
+overflow, use `BLASTBOX_POOL_RUNTIME=cascade` with e.g. `BLASTBOX_POOL_TIERS=static:8,aws-ec2:16`.
+See blastbox.host's `CONFIGURATION.md` / `DEPLOYMENT.md` for the full per-tier knob reference.
+
+### Per-job parameters
+
+The web UI / API forwards allowlisted **uppercase** `TITANARUM_*` params to the worker (lowercase
+keys are dropped before the allowlist). They map onto the same knobs as the CLI / REST fields:
+
+| Env | Meaning | Default |
+|---|---|---|
+| `TITANARUM_DPI` | render DPI (clamped to 1–600) | 150 |
+| `TITANARUM_PAGES` | page spec (`1-4,z`, `all`) | first 4 + last |
+| `TITANARUM_SKIP_QR` · `_SCREENSHOTS` · `_IMAGES` · `_PHONES` · `_PAGE_EXPORT` · `_TEXT_URLS` | disable a stage | off |
+| `TITANARUM_OCR_SCREENSHOTS` · `_OCR_URL_CROPS` · `_OCR_LANG` | OCR toggles + language | off / `eng` |
+| `TITANARUM_NO_SKIP_BLANKS` · `_ADD_LINK_ANNOTATIONS` | blank-page + link-annotation behavior | off |
+| `TITANARUM_PASSWORD` | password for encrypted PDFs (cleared after the worker reads it) | — |
+
+Stack-level env (`deploy/docker/.env.example`): `POSTGRES_PASSWORD` (required), `TITANARUM_PORT`
+(8004), `TITANARUM_BIND_ADDR` (set `127.0.0.1` to keep it off the network — **the api does not
+authenticate; front any exposed deploy with a reverse proxy**), `TITANARUM_DATA_DIR` (host-consistent
+job root, owned by UID 10001), and `BLASTBOX_MAX_METADATA=104857600` (titanarum inlines per-page OCR
+text, so the metadata envelope runs larger than the blastbox 4 MiB default — **must be identical on
+the api and every dispatcher**; the trust gate enforces equality).
 
 ---
 

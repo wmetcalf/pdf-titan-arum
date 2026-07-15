@@ -406,6 +406,14 @@ private boolean skipQrScan;
         // above) -- timeoutSeconds<=0 means "no limit" was requested for both.
         final java.util.concurrent.atomic.AtomicReference<AnalysisReport> _reportRef =
             new java.util.concurrent.atomic.AtomicReference<>();
+        // Set once the job has finished (any exit path, in finally before shutdownNow). The
+        // hard-halt task checks this first: shutdownNow() cannot stop a task that has ALREADY
+        // started, so without this guard a job completing right at the hard deadline would be
+        // flushed as timedOut=true and halt(3)'d despite having written a complete report. The
+        // flag is only ever set on completion, so a genuine hang (which never reaches finally)
+        // still halts -- the guard can prevent a false halt but never miss a real one.
+        final java.util.concurrent.atomic.AtomicBoolean _analysisComplete =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
         // Clamp: a misconfigured/non-positive TITANARUM_HARD_TIMEOUT_MS must never collapse
         // the hard deadline onto (or before) the cooperative one -- the hard halt must always
         // fire strictly after the cooperative timeout has had a chance to complete gracefully.
@@ -416,6 +424,12 @@ private boolean skipQrScan;
         if (_hardWatchdog != null) {
             long hardDelayMs = timeoutSeconds * 1000L + _hardTimeoutMs;
             _hardWatchdog.schedule(() -> {
+                // If the job already finished (report written, finally about to/just ran), do
+                // NOT flush-over-and-halt a completed job -- shutdownNow() may not have stopped
+                // this already-started task in time.
+                if (_analysisComplete.get()) {
+                    return;
+                }
                 // I2 fix: the halt(3) below is this watchdog's one guarantee, so it must never
                 // be gated on the partial-report flush completing. If mapper.writeValue blocks
                 // (e.g. a hung filesystem) a try/finally around it alone would never reach the
@@ -975,6 +989,9 @@ private boolean skipQrScan;
             // exception propagating out of this method. An uncancelled hard-halt watchdog left
             // ticking after this job finishes would otherwise halt() the JVM out from under a
             // *later* job on a warm/reused process.
+            // Mark complete BEFORE shutdownNow so a hard-halt task that is starting concurrently
+            // sees the flag and skips its flush+halt (shutdownNow can't stop an already-running one).
+            _analysisComplete.set(true);
             if (_watchdog != null) _watchdog.shutdownNow();
             if (_hardWatchdog != null) _hardWatchdog.shutdownNow();
         }

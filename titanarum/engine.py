@@ -375,8 +375,12 @@ def _reconstruct_artifacts_from_report(outdir: Path, report_dir: Path,
                 continue
             if not resolved.is_relative_to(report_dir.resolve()):
                 continue
-            if fp.is_file():
-                rel = fp.relative_to(outdir).as_posix()
+            # Derive the artifact path from the RESOLVED path, not the raw fp: a hostile value with
+            # a leading ".." can resolve INSIDE report_dir yet not be lexically under outdir, and
+            # fp.relative_to(outdir) on that raw path raises ValueError (matches _rel_for, which
+            # also resolves first). resolved is confined to report_dir, so this can never throw.
+            if resolved.is_file():
+                rel = resolved.relative_to(outdir.resolve()).as_posix()
                 arts.append(DeclaredArtifact(id=_safe_artifact_id(rel, used),
                                              path=rel, kind=kind))
     return arts

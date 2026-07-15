@@ -265,6 +265,21 @@ def test_build_warnings_clips_huge_timed_out_message():
     assert timed and len(timed[0].message) <= 2000
 
 
+def test_reconstruct_survives_abs_path_with_leading_dotdot(tmp_path):
+    # A hostile absolute path with a leading '..' resolves INTO report_dir (so it passes the
+    # resolve()+confinement+is_file() checks) yet is not LEXICALLY under outdir, so the unguarded
+    # fp.relative_to(outdir) on the raw (unresolved) path raised ValueError -> detonate crash.
+    # Reconstruction must derive the relative path from the resolved (confined) path.
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    (report_dir / "screenshots").mkdir(parents=True)
+    f = report_dir / "screenshots" / "page-0001.png"
+    f.write_bytes(b"\x89PNG\r\n")
+    hostile = _report(screenshots=[{"path": "/.." + str(f)}])
+    arts = eng._reconstruct_artifacts_from_report(outdir, report_dir, hostile, set())  # must NOT raise
+    assert any(a.path.endswith("titan/screenshots/page-0001.png") for a in arts)
+
+
 def test_summary_fields_drops_non_finite_dpi():
     # _summary_fields fed report dpi straight into the Record metadata, bypassing the _as_float
     # non-finite guard the mapper applies everywhere else; a hostile dpi=Infinity would otherwise

@@ -140,6 +140,10 @@ public class PdfTitanArumApp implements Callable<Integer> {
     private static final long MAX_EMBEDDED_FILE_BYTES = 100L * 1024 * 1024; // 100 MB
     private static final int MAX_SCRIPT_BYTES         = 10 * 1024 * 1024;   // 10 MB
     private static final int MAX_XFA_BYTES            = 10 * 1024 * 1024;   // 10 MB
+    // A FlateDecode cross-reference stream is a decompression-bomb vector (zlib amplifies ~1000:1);
+    // cap its inflate like the XObject/embedded-file paths. Real xref streams are small (KB-few MB
+    // even for huge PDFs), so 64 MB is generous while stopping a GB expansion.
+    private static final long MAX_XREF_STREAM_BYTES   = 64L * 1024 * 1024;  // 64 MB
     private static final int MAX_PAGES_ALL            = 1000;
     private static final int MAX_UNIQUE_PATH_ATTEMPTS = 10_000;
     private static final int MAX_NAME_TREE_DEPTH      = 50;
@@ -4755,8 +4759,11 @@ for (int pageNum : pagesToProcess) {
                 java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
                 try (java.util.zip.InflaterInputStream iis = new java.util.zip.InflaterInputStream(
                         new java.io.ByteArrayInputStream(pdf, streamStart, streamEnd - streamStart))) {
-                    byte[] buf = new byte[4096]; int n;
-                    while ((n = iis.read(buf)) >= 0) baos.write(buf, 0, n);
+                    // Bound the inflate: an attacker xref stream can be a decompression bomb, and
+                    // an unbounded copy into baos would OOM (the enclosing catch only handles
+                    // Exception, not OutOfMemoryError). copyBounded throws IOException past the cap,
+                    // which the catch below turns into a clean skip of this xref stream.
+                    copyBounded(iis, baos, MAX_XREF_STREAM_BYTES, "xref stream");
                 }
                 decompressed = baos.toByteArray();
             } catch (Exception ignored) { return; }

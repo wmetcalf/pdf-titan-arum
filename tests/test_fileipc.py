@@ -112,6 +112,25 @@ def test_run_worker_still_raises_on_nonzero_exit_without_report(tmp_path, monkey
         eng._run_worker(inp, outdir, timeout=30.0, sha256="c" * 64)
 
 
+def test_env_dpi_is_clamped_finite_and_bounded(monkeypatch):
+    # TITANARUM_DPI is dispatcher-forwarded (so potentially client-influenced) and worker mode
+    # (callWith) does NOT re-apply the CLI's 1..MAX_DPI clamp. A huge DPI -> gigapixel raster ->
+    # OOM; a non-finite DPI serializes as non-standard JSON and breaks job.json parsing. Clamp it
+    # at the job boundary: drop non-finite, clamp finite values into [1, 600].
+    for key in ("TITANARUM_SKIP_QR",):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TITANARUM_DPI", "100000")
+    assert eng._env_param_overrides()["dpi"] == 600.0
+    monkeypatch.setenv("TITANARUM_DPI", "0")
+    assert eng._env_param_overrides()["dpi"] == 1.0
+    monkeypatch.setenv("TITANARUM_DPI", "150")
+    assert eng._env_param_overrides()["dpi"] == 150.0
+    monkeypatch.setenv("TITANARUM_DPI", "Infinity")
+    assert "dpi" not in eng._env_param_overrides()  # non-finite dropped -> _DEFAULT_JOB dpi used
+    monkeypatch.setenv("TITANARUM_DPI", "NaN")
+    assert "dpi" not in eng._env_param_overrides()
+
+
 def test_env_param_overrides_allowlist(monkeypatch):
     monkeypatch.setenv("TITANARUM_SKIP_QR", "1")
     monkeypatch.setenv("TITANARUM_DPI", "200")

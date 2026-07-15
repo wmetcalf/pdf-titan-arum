@@ -2554,6 +2554,11 @@ for (int pageNum : pagesToProcess) {
                 if (start == null || end == null) {
                     continue;
                 }
+                // Clamp the range to the document: an absurd bound (e.g. "1-2147483647") would
+                // otherwise materialize billions of entries here BEFORE the per-page validity
+                // filter below, exhausting memory. Out-of-range refs collapse to the doc edge.
+                start = Math.max(1, Math.min(start, pageCount));
+                end = Math.max(1, Math.min(end, pageCount));
                 int step = start <= end ? 1 : -1;
                 for (int i = start; ; i += step) {
                     resolved.add(i);

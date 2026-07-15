@@ -141,6 +141,11 @@ final class ZXingReaderScanner {
             }
             joinQuietly(drainThread, 2_000L);
             return new String(drain.result(), StandardCharsets.UTF_8).contains("-json");
+        } catch (InterruptedException e) {
+            // Restore the interrupt so a watchdog-driven abort during the one-time probe is not
+            // swallowed (mirrors scan()); the caller re-probes later.
+            Thread.currentThread().interrupt();
+            return null;
         } catch (Exception | LinkageError e) {
             return null;   // undeterminable -> caller assumes modern for this call, re-probes later
         } finally {

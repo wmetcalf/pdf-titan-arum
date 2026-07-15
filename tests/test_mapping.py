@@ -280,6 +280,17 @@ def test_reconstruct_survives_abs_path_with_leading_dotdot(tmp_path):
     assert any(a.path.endswith("titan/screenshots/page-0001.png") for a in arts)
 
 
+def test_rel_for_survives_symlink_loop(tmp_path):
+    # _rel_for guarded resolve() only against ValueError; a report path pointing at an on-disk
+    # symlink LOOP makes resolve() raise OSError (ELOOP), which propagated and crashed detonate.
+    # (Matches the (ValueError, OSError) guard in _reconstruct_artifacts_from_report.)
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    report_dir.mkdir(parents=True)
+    (report_dir / "loop").symlink_to(report_dir / "loop")  # self-referential -> ELOOP on resolve()
+    assert eng._rel_for("loop", outdir, report_dir) == ""  # OSError must not propagate
+
+
 def test_summary_fields_drops_non_finite_dpi():
     # _summary_fields fed report dpi straight into the Record metadata, bypassing the _as_float
     # non-finite guard the mapper applies everywhere else; a hostile dpi=Infinity would otherwise

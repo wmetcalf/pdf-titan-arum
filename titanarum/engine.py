@@ -137,8 +137,11 @@ def _env_param_overrides() -> dict[str, Any]:
         out["ocr_lang"] = lang
     if (pages := _str("TITANARUM_PAGES")):
         out["pages"] = pages
-    if (dpi := _float("TITANARUM_DPI")) is not None:
-        out["dpi"] = dpi
+    if (dpi := _float("TITANARUM_DPI")) is not None and math.isfinite(dpi):
+        # Clamp at the job boundary: worker mode (callWith) does NOT re-apply the CLI's 1..MAX_DPI
+        # bound, so a dispatcher-forwarded huge DPI would render a gigapixel raster (OOM). Drop
+        # non-finite (NaN/Inf serialize as non-standard JSON and break job.json parsing).
+        out["dpi"] = max(1.0, min(600.0, dpi))
     if (pw := _str("TITANARUM_PASSWORD")):
         out["password"] = pw
     return out
@@ -371,7 +374,8 @@ def _reconstruct_artifacts_from_report(outdir: Path, report_dir: Path,
             # ValueError 'embedded null byte'); _rel_for guards its resolve() the same way.
             try:
                 resolved = fp.resolve()
-            except (ValueError, OSError):
+            except (ValueError, OSError, RuntimeError):
+                # embedded NUL -> ValueError; symlink loop -> RuntimeError (3.12) / OSError ELOOP.
                 continue
             if not resolved.is_relative_to(report_dir.resolve()):
                 continue
@@ -539,8 +543,11 @@ def _rel_for(path_value: str | None, outdir: Path, report_dir: Path) -> str:
     base = p if p.is_absolute() else (report_dir / p)
     try:
         return base.resolve().relative_to(outdir.resolve()).as_posix()
-    except ValueError:
-        return ""  # outside the output tree -> won't match any declared artifact
+    except (ValueError, OSError, RuntimeError):
+        # ValueError: outside the output tree. OSError/RuntimeError: resolve() hit e.g. a symlink
+        # loop on an attacker-controlled path (Python raises RuntimeError 'Symlink loop' on 3.12,
+        # OSError ELOOP elsewhere) -- must not propagate (matches _reconstruct's guard).
+        return ""
 
 
 def _build_detection(report: dict) -> Detection:
@@ -748,18 +755,22 @@ class TitanArumEngine:
             # Always consume: a warm handle is tried at most once, whether it
             # turns out to be alive or already dead on arrival (Fix 4).
             self._warm = None
-            if warm.proc.poll() is None:
-                try:
-                    _run_warm_job(warm, input, report_dir,
-                                  timeout=effective_timeout, sha256=sha256)
-                    return
-                except Exception:  # noqa: BLE001 - fail-closed: fall through to cold
-                    pass
-            # Warm job failed, or the proc was dead on arrival: we are falling through to cold.
-            # self._warm is already None, so close() can never reclaim this handle -- reap its
-            # scratch here (the staged input PDF under in/, control files, boot log) so it does
-            # not orphan in /tmp (tmpfs) across successive warm dispatches.
-            shutil.rmtree(warm.scratch, ignore_errors=True)
+            try:
+                if warm.proc.poll() is None:
+                    try:
+                        _run_warm_job(warm, input, report_dir,
+                                      timeout=effective_timeout, sha256=sha256)
+                        return
+                    except Exception:  # noqa: BLE001 - fail-closed: fall through to cold
+                        pass
+                # else: proc was dead on arrival -> fall through to cold.
+            finally:
+                # Reap the fixed warm scratch (staged input PDF under in/, control files, boot log)
+                # on EVERY warm outcome -- SUCCESS returns early, so without this the staged input
+                # lingers in the shared /tmp/titanarum-warm across jobs (data-hygiene / cross-job
+                # exposure), and on failure it must not orphan in /tmp (tmpfs) either. self._warm is
+                # already None, so close() can never reclaim this handle.
+                shutil.rmtree(warm.scratch, ignore_errors=True)
 
         # Cold fallback (first attempt, or after a failed/dead warm attempt).
         # A warm attempt that died mid-processing may have left partial

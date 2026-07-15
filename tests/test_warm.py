@@ -74,9 +74,9 @@ def test_warmup_then_detonate_feeds_the_preboot_worker(tmp_path, monkeypatch):
     assert engine._warm is None
     report_path = outdir / "titan" / "report.json"
     assert report_path.is_file()
-    # The staged input landed inside the pre-booted worker's fixed scratch,
-    # not a throwaway cold tempdir.
-    assert (scratch / "in" / "in.pdf").is_file()
+    # The fixed warm scratch (which staged the input PDF under in/) is reaped on SUCCESS -- the
+    # staged input must not linger in the shared /tmp/titanarum-warm across jobs.
+    assert not scratch.exists()
     assert result.status in ("ok", "rejected")
     assert result.detected.source == "titanarum"
     # The pre-booted process ran the job to completion (communicate() reaped it).

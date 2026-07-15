@@ -205,18 +205,16 @@ def test_cold_vs_warm_parity(pdf_name: str, jar: Path, aot_cache: Path,
     # A warm handle is consumed unconditionally (success or fail-closed), so
     # `_warm is None` alone does NOT prove a warm run happened -- it's also
     # true after a silent cold fallback. The real proof: the SAME pre-booted
-    # process is the one that ran the job to completion (exit 0), and the
-    # input was staged into the fixed warm scratch (not a throwaway cold
-    # tempdir).
+    # process is the one that ran the job to completion (exit 0).
     assert warm_engine._warm is None, "warm handle should be consumed by detonate()"
     assert booted_proc.poll() == 0, (
         "the pre-booted warm JVM did not exit 0 -- detonate() likely fell back "
         f"to a fresh cold boot instead of running the warm branch. warm-boot.log:\n{boot_log_text}"
     )
-    staged_input = warm_scratch / "in" / pdf.name
-    assert staged_input.is_file(), (
-        "input was not staged into the fixed warm scratch -- proves the warm "
-        "branch did not run"
+    # The fixed warm scratch (which staged the input under in/) is reaped on a successful warm
+    # run, so the staged input must NOT linger in the shared scratch afterward.
+    assert not (warm_scratch / "in" / pdf.name).is_file(), (
+        "staged warm input must be reaped after a successful warm run, not left in the shared scratch"
     )
 
     # ---- parity gate 1: report.json byte-identical after normalization -----

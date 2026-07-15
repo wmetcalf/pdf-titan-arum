@@ -5,6 +5,7 @@ control.ready, blocks on control.go, reads job.json, writes report.json, and
 exits -- exactly the one-job warm flow (boot once via warmup(), dispatch once
 via detonate()).
 """
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -15,12 +16,40 @@ from titanarum import engine as eng
 from titanarum.engine import TitanArumEngine, _WarmWorker
 
 FAKE = Path(__file__).parent / "fixtures" / "fake_java_worker.py"
+FAKE_HARDHALT = Path(__file__).parent / "fixtures" / "fake_java_worker_hardhalt.py"
 
 
 def _route_to_fake(monkeypatch) -> None:
     monkeypatch.setenv("TITANARUM_JAVA_BIN", sys.executable)
     monkeypatch.setenv("TITANARUM_JAVA_OPTS", str(FAKE))
     monkeypatch.setenv("TITANARUM_WORKER_JAR", "dummy.jar")
+
+
+def test_warm_hardhalt_partial_report_is_consumed_not_discarded(tmp_path, monkeypatch):
+    # The warm worker's hard-halt flushes a partial report.json then exit(3). _run_warm_job must
+    # accept that partial (return without raising) so the caller keeps it -- previously the
+    # nonzero exit raised, _produce_report rmtree'd the partial and re-ran the SAME hung PDF
+    # cold, burning ~2x the budget and discarding the report the hard-halt deliberately saved.
+    monkeypatch.setenv("TITANARUM_JAVA_BIN", sys.executable)
+    monkeypatch.setenv("TITANARUM_JAVA_OPTS", str(FAKE_HARDHALT))
+    monkeypatch.setenv("TITANARUM_WORKER_JAR", "dummy.jar")
+    scratch = tmp_path / "warm-scratch"
+    monkeypatch.setattr(eng, "_DEFAULT_WARM_SCRATCH", str(scratch))
+
+    engine = TitanArumEngine()
+    engine.warmup()
+    assert engine._warm is not None
+    warm = engine._warm
+
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    report_dir = tmp_path / "out" / "titan"
+
+    # Must NOT raise despite the exit-3 hard-halt, and the flushed partial must be on disk.
+    eng._run_warm_job(warm, pdf, report_dir, timeout=30.0, sha256="d" * 64)
+    report = json.loads((report_dir / "report.json").read_text())
+    assert report["timedOut"] is True
+    assert report["documentSha256"] == "d" * 64
 
 
 def test_warmup_then_detonate_feeds_the_preboot_worker(tmp_path, monkeypatch):

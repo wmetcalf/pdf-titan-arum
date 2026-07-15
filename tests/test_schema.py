@@ -41,3 +41,34 @@ def test_unexpected_top_level_key_rejected():
     report["unexpectedKey"] = 1
     with pytest.raises(SchemaValidationError):
         validate_report(report)
+
+
+def test_timed_out_partial_without_pagesspec_is_accepted():
+    # A hard-halt TIMEOUT can flush a partial report before pagesSpec is assigned (the JVM writes
+    # pagesSpec only after a successful parse). Such a timedOut=true partial must still validate so
+    # the host can return it, not fail closed -- the same exemption parse-error reports get.
+    report = _load()
+    report.pop("pagesSpec", None)
+    report.pop("parseError", None)
+    report["timedOut"] = True
+    validate_report(report)  # must not raise
+
+
+def test_normal_report_without_pagesspec_still_rejected():
+    # The timeout exemption must NOT weaken the gate for an ordinary successful report.
+    report = _load()
+    report.pop("pagesSpec", None)
+    report.pop("parseError", None)
+    report.pop("timedOut", None)
+    with pytest.raises(SchemaValidationError):
+        validate_report(report)
+
+
+def test_timed_out_false_without_pagesspec_still_rejected():
+    # timedOut present-but-false is an ordinary report: pagesSpec is still required.
+    report = _load()
+    report.pop("pagesSpec", None)
+    report.pop("parseError", None)
+    report["timedOut"] = False
+    with pytest.raises(SchemaValidationError):
+        validate_report(report)

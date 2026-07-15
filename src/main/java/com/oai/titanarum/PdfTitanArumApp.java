@@ -26,6 +26,7 @@ import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecification;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile;
 import org.apache.pdfbox.pdmodel.graphics.PDXObject;
@@ -2398,12 +2399,18 @@ for (int pageNum : pagesToProcess) {
         if (!(cosBase instanceof COSStream cosStream)) return null;
         try {
             Path file = uniquePath(outputDir, baseName + "." + suffix);
-            // createRawInputStream (NOT createInputStream): we want the ORIGINAL encoded codestream
-            // (the real ffd8 JPEG / JP2 codestream / JBIG2), not PDFBox's decoded raster. That is what
-            // the hasher feeds to the rosetta decode port so JPEG hashes via turbojpeg (PIL-exact,
-            // fleet-uniform) and JP2/JBIG2 cleanly throw -> PDFBox fallback. createInputStream() here
-            // would decode the image filter to raster, which rosetta can't identify -> silent fallback.
-            try (InputStream is = cosStream.createRawInputStream();
+            // We want the ORIGINAL encoded codestream (the real ffd8 JPEG / JP2 codestream / JBIG2),
+            // not PDFBox's decoded raster: the hasher feeds it to the rosetta decode port so JPEG
+            // hashes via turbojpeg (PIL-exact, fleet-uniform) and JP2/JBIG2 cleanly throw -> PDFBox
+            // fallback. But an image codec may be legally wrapped in transport filters (e.g.
+            // /Filter [/ASCII85Decode /DCTDecode]); createRawInputStream() would save the wrapper
+            // bytes (ASCII85 text), which rosetta can't decode -> the perceptual hash silently
+            // drifts off fleet parity. So decode the wrapper filters but STOP at the image codec,
+            // yielding the true codestream regardless of how it was wrapped.
+            List<String> imageCodecFilters = List.of(
+                    COSName.DCT_DECODE.getName(), COSName.DCT_DECODE_ABBREVIATION.getName(),
+                    COSName.JPX_DECODE.getName(), COSName.JBIG2_DECODE.getName());
+            try (InputStream is = new PDStream(cosStream).createInputStream(imageCodecFilters);
                  OutputStream os = Files.newOutputStream(file)) {
                 // C2: use bounded copy — a decompression bomb in an XObject stream
                 // could otherwise expand to gigabytes before hitting the filesystem.

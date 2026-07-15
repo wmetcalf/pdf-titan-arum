@@ -170,3 +170,105 @@ def test_build_detection_label_is_type_not_threat():
     assert "SOAP" not in det.label
     assert det.label  # non-empty type label
     assert any(w.code.startswith("js_indicator.") for w in eng._build_warnings(report))
+
+
+def test_mapper_survives_hostile_nested_field_types(tmp_path):
+    # The trust gate (schema.py) deliberately leaves array-item FIELDS unconstrained
+    # ({"type":"object"}); a compromised worker (the gate's whole threat model) can emit
+    # wrong-typed nested fields. The host-side mapper must NOT crash on any of them.
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    report_dir.mkdir(parents=True)
+    hostile = _report(
+        embeddedFiles=[{"originalName": 5, "detectedMimeType": 7, "mimeType": ["x"],
+                        "size": {}, "sha256": 9, "file": 123}],
+        screenshots=[{"path": {"nope": 1}, "page": {"a": 1}, "width": "NaNlike",
+                      "height": None, "hashes": [1, 2], "ocrText": 42}],
+        renderedImages=[{"path": [1, 2]}],
+        resourceImages=[{"path": 999}],
+    )
+    # None of these may raise on a schema-valid-but-hostile report:
+    arts = eng._reconstruct_artifacts_from_report(outdir, report_dir, hostile, set())
+    payload = eng._build_payload(hostile, arts, outdir, report_dir)
+    warnings = eng._build_warnings(hostile)
+    assert isinstance(payload, EmbeddedResource)
+    assert isinstance(warnings, list)
+
+
+def test_mapper_survives_overflow_and_nullbyte_fields(tmp_path):
+    # marla round-2 follow-on: the coercion helpers added in round 1 caught only
+    # (TypeError, ValueError). Two hostile numerics slip past that:
+    #   * json.loads() accepts `Infinity`/`NaN` and UNBOUNDED integer literals by
+    #     default -> int(float('inf')) and float(10**400) raise OverflowError, which
+    #     is NOT a subclass of ValueError, so it propagated and crashed detonate().
+    #   * a path field carrying an embedded NUL survives isinstance(str) but makes
+    #     Path.resolve() raise ValueError('embedded null byte') at the one resolve()
+    #     call that _rel_for guards but _reconstruct_artifacts_from_report did not.
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    ss_dir = report_dir / "screenshots"
+    ss_dir.mkdir(parents=True)
+    (ss_dir / "page-0001.png").write_bytes(b"\x89PNG\r\n")  # a genuinely-declared artifact
+    arts = eng._enumerate_artifacts(outdir, report_dir, {})
+
+    # (a) non-finite page + oversized/non-finite dimensions on a screenshot that
+    #     references a DECLARED artifact (so _build_payload reaches the coercions).
+    over = _report(screenshots=[{
+        "path": "screenshots/page-0001.png",
+        "page": float("inf"),   # int(inf) -> OverflowError
+        "width": 10 ** 400,     # float(huge int) -> OverflowError
+        "height": float("nan"),  # non-finite dimension must be dropped, not emitted
+    }])
+    payload = eng._build_payload(over, arts, outdir, report_dir)
+    assert isinstance(payload, EmbeddedResource)
+
+    # (b) embedded-NUL path strings must not crash artifact reconstruction.
+    nul = _report(
+        embeddedFiles=[{"file": "a\x00b"}],
+        renderedImages=[{"path": "x\x00y"}],
+        resourceImages=[{"path": "z\x00w"}],
+    )
+    arts2 = eng._reconstruct_artifacts_from_report(outdir, report_dir, nul, set())
+    assert isinstance(arts2, list)
+
+
+def test_build_payload_survives_hostile_embedded_metadata_types(tmp_path):
+    # marla round-3: _build_payload hardened content_type/embedded_path via _as_str but passed
+    # the embedded-file metadata field VALUES raw into Record(fields=...). Record.fields is a
+    # pydantic dict[str, Scalar|list[Scalar]|Record]; a nested-object / mixed-array value matches
+    # no union member and raises ValidationError -> uncaught host crash. Every metadata value
+    # must be coerced to a Record-safe (scalar / list-of-scalars) shape.
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    report_dir.mkdir(parents=True)
+    hostile = _report(embeddedFiles=[{
+        "originalName": {"x": 1},          # nested object
+        "size": [[1, 2], {"a": 3}],        # nested/mixed array
+        "sha256": {"nested": "obj"},
+        "mimeType": [{"a": 1}],
+        "detectedMimeType": {"deep": {"er": 1}},
+        "mimeTypeMismatch": {"not": "a bool"},
+        "fileMagic": [1, {"b": 2}],
+    }])
+    payload = eng._build_payload(hostile, [], outdir, report_dir)  # must NOT raise
+    assert isinstance(payload, EmbeddedResource)
+    assert payload.children and payload.children[0].metadata is not None
+
+
+def test_build_warnings_clips_huge_timed_out_message():
+    # timedOutAfterMs is root-typed but UNBOUNDED; the timed_out warning interpolated it into an
+    # unclipped f-string while contract Warning.message caps at 2000 chars -> a hostile huge value
+    # raised pydantic ValidationError out of detonate(). The message must be clipped like the rest.
+    report = _report(timedOut=True, timedOutAfterMs=10 ** 2000)
+    warnings = eng._build_warnings(report)  # must NOT raise
+    timed = [w for w in warnings if w.code == "timed_out"]
+    assert timed and len(timed[0].message) <= 2000
+
+
+def test_summary_fields_drops_non_finite_dpi():
+    # _summary_fields fed report dpi straight into the Record metadata, bypassing the _as_float
+    # non-finite guard the mapper applies everywhere else; a hostile dpi=Infinity would otherwise
+    # reach the contract field (serializing to null), violating the mapper's finite invariant.
+    import math
+    fields = eng._summary_fields(_report(dpi=float("inf")))
+    assert math.isfinite(fields["dpi"])

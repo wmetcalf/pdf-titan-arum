@@ -100,11 +100,16 @@ _SCHEMA: dict[str, Any] = {
     },
     # Reject unexpected TOP-LEVEL keys (defense-in-depth against a tampered report).
     "additionalProperties": False,
-    # pagesSpec is only written on a SUCCESSFUL parse; parse-error reports (not-a-PDF /
-    # encrypted / wrong-password / unrecoverable) return early WITHOUT it. Require it only when
-    # parseError is absent, so those cleanly-rejected inputs still validate (else the engine would
-    # fail-closed on exactly the malformed/encrypted inputs it should classify as "rejected").
-    "if": {"not": {"required": ["parseError"]}},
+    # pagesSpec is only written on a SUCCESSFUL, non-timed-out parse. Parse-error reports
+    # (not-a-PDF / encrypted / wrong-password / unrecoverable) return early WITHOUT it, and a
+    # hard-halt TIMEOUT can flush a partial report before pagesSpec is assigned (the JVM sets it
+    # only after the parse completes). Require it only when the report is NEITHER a parse-error NOR
+    # a timeout, so those cleanly-degraded inputs still validate instead of failing closed on
+    # exactly the malformed/encrypted/hung inputs the engine should classify as rejected/partial.
+    "if": {"allOf": [
+        {"not": {"required": ["parseError"]}},
+        {"not": {"required": ["timedOut"], "properties": {"timedOut": {"const": True}}}},
+    ]},
     "then": {"required": ["pagesSpec"]},
 }
 

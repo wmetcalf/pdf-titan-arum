@@ -14,9 +14,14 @@ REPO="$(cd "$HERE/../.." && pwd)"
 IMG="${1:-$HERE/rootfs.ext4}"
 SIZE_MIB="${ROOTFS_MIB:-1024}"
 DOCKER="${DOCKER:-docker}"
-ENGINE="${ENGINE:-probe}"   # probe | pdf | pdfrasterize — baked into the rootfs
-DOCKERFILE="${DOCKERFILE:-deploy/firecracker/Dockerfile.worker}"
-TAG="blastbox-fc-worker:${ENGINE}"
+# ENGINE is a blastbox engine spec baked into the rootfs (module:Class). The default builds
+# the titanarum PDF engine; override for the generic FC test engines (probe / pdfrasterize).
+ENGINE="${ENGINE:-titanarum.engine:TitanArumEngine}"
+DOCKERFILE="${DOCKERFILE:-deploy/firecracker/Dockerfile.titanarum}"
+# Sanitize ENGINE into a valid Docker tag: the module:Class spec contains ':' / '.' / uppercase,
+# none of which are legal in the tag component (only [A-Za-z0-9_.-], and ':' would split it).
+ENGINE_TAG="$(printf '%s' "$ENGINE" | tr ':/.' '___' | tr '[:upper:]' '[:lower:]')"
+TAG="blastbox-fc-worker:${ENGINE_TAG}"
 
 command -v mkfs.ext4 >/dev/null || { echo "need mkfs.ext4 (e2fsprogs)"; exit 1; }
 command -v truncate  >/dev/null || { echo "need truncate (coreutils)"; exit 1; }

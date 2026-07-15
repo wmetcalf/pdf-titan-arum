@@ -1,10 +1,12 @@
 package com.oai.titanarum;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.cos.COSStream;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDResources;
+import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.graphics.PDXObject;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
@@ -13,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
@@ -99,6 +102,50 @@ class JpegParityTest {
             assertTrue(rel.endsWith(".jpg"), "saved as .jpg, got " + rel);
             assertArrayEquals(raw, Files.readAllBytes(tempDir.resolve(rel)),
                 "saved file must be the raw JFIF stream byte-for-byte");
+        }
+    }
+
+    @Test
+    void multiFilterDctSavesTrueCodestreamNotWrapperBytes(@TempDir Path tempDir) throws Exception {
+        // A DCT codestream may be legally wrapped in a transport filter -- /Filter
+        // [/ASCII85Decode /DCTDecode]. createRawInputStream() would save the ASCII85 wrapper
+        // bytes, which rosetta can't decode -> silent PDFBox fallback and hash drift off fleet
+        // parity. saveOriginalXObjectBytes must decode the wrapper but stop at the codec, saving
+        // the true ffd8 JFIF stream.
+        Assumptions.assumeTrue(JPEG_PDF.exists(), "jpeg fixture missing, skipping");
+        try (PDDocument doc = Loader.loadPDF(JPEG_PDF)) {
+            byte[] jpeg = rawStreamBytes(firstImageXObject(doc));  // real FFD8 JFIF codestream
+            assertEquals("ffd8", String.format("%02x%02x", jpeg[0], jpeg[1]),
+                "fixture precondition: extracted stream is a JPEG");
+
+            // Store ascii85(jpeg) and declare /Filter [/ASCII85Decode /DCTDecode].
+            PDStream pdStream = new PDStream(doc, new ByteArrayInputStream(jpeg), COSName.ASCII85_DECODE);
+            COSStream cos = pdStream.getCOSObject();
+            COSArray filters = new COSArray();
+            filters.add(COSName.ASCII85_DECODE);
+            filters.add(COSName.DCT_DECODE);
+            cos.setItem(COSName.FILTER, filters);
+            cos.setItem(COSName.TYPE, COSName.XOBJECT);
+            cos.setItem(COSName.SUBTYPE, COSName.IMAGE);
+            cos.setInt(COSName.WIDTH, 8);
+            cos.setInt(COSName.HEIGHT, 8);
+            cos.setItem(COSName.COLORSPACE, COSName.DEVICERGB);
+            cos.setInt(COSName.BITS_PER_COMPONENT, 8);
+            PDImageXObject wrapped = new PDImageXObject(pdStream, null);
+            assertEquals("jpg", wrapped.getSuffix(), "a DCT-terminated multi-filter stream is still a jpg");
+
+            // Precondition == the OLD bug: the RAW stored bytes are the ASCII85 wrapper, not FFD8.
+            byte[] rawStored = rawStreamBytes(wrapped);
+            assertNotEquals("ffd8", String.format("%02x%02x", rawStored[0], rawStored[1]),
+                "raw stored bytes are the ASCII85 wrapper (what createRawInputStream would have saved)");
+
+            // The fix: save the TRUE codestream (wrapper decoded, DCT left intact).
+            String rel = callSaveOriginalXObjectBytes(wrapped, tempDir, "wrapped-jpeg");
+            assertNotNull(rel);
+            byte[] saved = Files.readAllBytes(tempDir.resolve(rel));
+            assertEquals("ffd8", String.format("%02x%02x", saved[0], saved[1]),
+                "multi-filter DCT must be saved as the real FFD8 codestream, not the ASCII85 wrapper");
+            assertArrayEquals(jpeg, saved, "saved codestream must equal the original JFIF byte-for-byte");
         }
     }
 

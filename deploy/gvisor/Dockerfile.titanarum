@@ -1,0 +1,162 @@
+# gVisor C/R warm-tier rootfs for titanarum — the gVisor analog of
+# deploy/firecracker/Dockerfile.titanarum (Tier 2, not yet authored). Built ON TOP OF
+# titanarum-cold-worker:${TAG} (deploy/docker/Dockerfile.titanarum-cold-worker) so
+# titanarum's JVM/PDFBox worker runs inside a runsc sandbox that is CHECKPOINTED at
+# READY (after warmup()'s go-wait blocks -- see titanarum/engine.py) and RESTORED
+# per job (warm JVM, no Firecracker / no KVM). Clone of blastbox's
+# deploy/gvisor/Dockerfile.redtusk (see that file for the general gVisor-warm-JVM
+# pattern) with the titanarum-specific AOT bake this base image does NOT already
+# carry (Dockerfile.titanarum-cold-worker is explicitly AOT-cache-free: "No AOT
+# cache in the MVP image; _java_worker_argv skips -XX:AOTCache when the file is
+# absent").
+#
+# Why a warm gVisor tier: Firecracker needs /dev/kvm; many cloud hosts (nested-virt-
+# disabled VMs, some AWS instance types, CI runners) don't expose it. runsc C/R is
+# the KVM-less warm path -- `runsc checkpoint` the booted-and-warmed container, then
+# `runsc restore` a disposable copy per untrusted document.
+#
+# NO ACCEPT-RETRY SHIM: unlike clippyshot's gVisor rootfs (deploy/gvisor/Dockerfile.shim),
+# this image does NOT compile/LD_PRELOAD accept_retry.c. That shim exists because
+# LibreOffice's `osl_acceptPipe` (sal/osl/unx/pipe.cxx) does a single non-retrying
+# accept() on its UNO pipe, which gVisor's restore-time EINTR (forced on every
+# blocked syscall regardless of SA_RESTART) makes hang forever. titanarum has no
+# listening socket at all -- the JVM worker talks to blastbox purely over FILE-IPC
+# (poll for control/control.go, same protocol as --run cold mode; see
+# titanarum/engine.py's warmup()/_WarmWorker), so there is no accept() to retry
+# across a restore. The Tika/JVM tier in blastbox's own template notes agree: "The
+# JVM retries `accept` automatically on EINTR. Only the soffice warm container needs
+# the shim." Titanarum doesn't even open a socket, so the point is moot twice over.
+#
+# Build context = repo root (needs deploy/docker/build-aot.sh + the AOT warmup
+# corpus alongside the jar/venv this base image already carries):
+#   docker build --build-arg BASE_IMAGE=titanarum-cold-worker:${TAG} \
+#     -f deploy/gvisor/Dockerfile.titanarum -t titanarum-warm:gvisor .
+ARG BASE_IMAGE=titanarum-cold-worker:dev
+FROM ${BASE_IMAGE}
+ARG ENGINE=titanarum.engine:TitanArumEngine
+USER root
+
+# --- Bake the AOT cache (/app/titanarum.aot) --------------------------------
+# The cold-worker base has the jar (/app/pdf-titan-arum.jar) but NO AOT cache.
+# Real warm benefit needs one (Finding C / W-2/W-3 in the warm-mode plan): a
+# pre-booted-then-snapshotted JVM that hasn't loaded PDFBox/JBIG2/JPEG2000/ZXing
+# classes only saves JVM-bootstrap time, not the seconds of class-load + JIT the
+# first restored job would otherwise still pay. deploy/docker/build-aot.sh already
+# implements the full two-phase record->create->verify-load sequence, reading the
+# exact JVM flag bundle LIVE from titanarum.engine._DEFAULT_JVM_FLAGS so the AOT
+# cache can never silently drift out of byte-match with the flags warmup()/
+# _java_worker_argv() actually boot the warm JVM with (JDK 25 rejects a mismatched
+# cache SILENTLY -- see that script's header for why we read the flags live rather
+# than hand-copy them here). We invoke it rather than reimplement it, so there is
+# exactly one source of truth for "how the AOT cache gets built".
+COPY deploy/docker/build-aot.sh /tmp/build-aot.sh
+COPY deploy/docker/appcds-warmup-corpus /tmp/appcds-warmup-corpus
+RUN chmod +x /tmp/build-aot.sh \
+    # PYTHON_BIN must be the venv interpreter: it imports titanarum.engine to read
+    # _DEFAULT_JVM_FLAGS, and only /opt/titanarum's venv has titanarum installed.
+    && PYTHON_BIN=/opt/titanarum/bin/python3 \
+       TITANARUM_JAVA_BIN=java \
+       TITANARUM_AOT_LOG_DIR=/tmp/aot-build-logs \
+       /tmp/build-aot.sh /app/pdf-titan-arum.jar /tmp/appcds-warmup-corpus /app \
+    # build-aot.sh's own Phase 3 already boots the JVM with -XX:AOTCache + -Xlog:aot
+    # and fails the build (exit != 0) unless it sees "Opened AOT cache" AND "Using
+    # AOT-linked classes: true" with no "[error][aot]" line -- that IS the
+    # verify-load gate the task requires; a bare `test -s` here would only prove the
+    # file is non-empty, not that the JVM will actually accept it at warm-boot time.
+    && test -s /app/titanarum.aot \
+    && rm -rf /tmp/build-aot.sh /tmp/appcds-warmup-corpus /tmp/aot-build-logs
+
+# `docker export` (used to materialise the OCI rootfs dir in Task 10's build-rootfs
+# step) DROPS Docker ENV, incl. the temurin PATH entry for the JDK. The warm
+# worker's engine Popens "java" (TITANARUM_JAVA_BIN default "java") resolved via the
+# OCI spec's from-scratch PATH (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+# /sbin:/bin -- see blastbox's gvisor_snapshot._oci_config), which does NOT include
+# the JDK's bin dir -- so symlink java onto a path that IS on that PATH. `command -v`
+# (not a hardcoded /opt/java/openjdk/bin) so this doesn't silently break if the
+# temurin base image's install layout ever changes.
+RUN ln -sf "$(command -v java)" /usr/local/bin/java
+
+# gVisor C/R mountpoints (/in ro, /out rw, /ctrl rw) -- the bind-mount destinations
+# for blastbox's FileWarmControl (deploy/gvisor/run_warm.py). They MUST exist at
+# build time: the restored rootfs is mounted read-only, so runsc's gofer cannot
+# create them on the fly. Mode 1777 (sticky, world-writable) so the OCI spec's
+# fixed uid 65532 (blastbox's GvisorConfig.uid/gid default -- NOT this image's
+# baked USER, which the gVisor runtime overrides unconditionally) can traverse/
+# write under the bind mounts regardless of the exact host-side ownership blastbox
+# staged them with.
+RUN mkdir -p /in /out /ctrl && chmod 1777 /in /out /ctrl
+
+# python3 WRAPPER, NOT a symlink: `docker export` drops ENV (including the base
+# image's `ENV PATH=/opt/titanarum/bin:$PATH`), so a bare symlink to the venv
+# interpreter would exec fine but inherit only the OCI spec's bare PATH -- any
+# subprocess.Popen(["java", ...]) titanarum.engine issues from inside that process
+# would then fail to resolve "java" (ModuleNotFoundError-adjacent: silent
+# FileNotFoundError deep in subprocess, well after the warm worker has already
+# announced ready). The wrapper sets PATH itself, THEN execs the real venv
+# interpreter by its literal path (still inside /opt/titanarum/bin, so pyvenv.cfg
+# is found the same way a plain symlink would find it -- venv activation is
+# unaffected by this rename).
+RUN mv /opt/titanarum/bin/python3 /opt/titanarum/bin/python3.venv-real \
+    && printf '%s\n' \
+        '#!/bin/sh' \
+        '# Wrapper (not a symlink) standing in for the venv python3 -- see' \
+        '# deploy/gvisor/Dockerfile.titanarum for why. docker export drops image ENV,' \
+        '# so the gVisor OCI spec never carries this PATH; set it before exec so both' \
+        '# venv imports (titanarum, blastbox) AND `java` subprocess resolution work.' \
+        'export PATH="/opt/titanarum/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+        'exec /opt/titanarum/bin/python3.venv-real "$@"' \
+        > /opt/titanarum/bin/python3 \
+    && chmod 755 /opt/titanarum/bin/python3
+
+# blastbox gVisor warm agent looks up its engine from a FILE (Docker ENV is dropped
+# by `docker export`) -- run_warm.py reads /opt/blastbox/engine, falling back to
+# BLASTBOX_GVISOR_ENGINE only when the file is absent/empty.
+RUN mkdir -p /opt/blastbox \
+    && printf '%s' "${ENGINE}" > /opt/blastbox/engine
+
+# The blastbox gVisor warm AGENT itself: run_warm.py (the BLASTBOX_GVISOR_WARM_ARGV
+# entrypoint) + its engines.py registry (a generic module:Class loader). These live
+# in the blastbox REPO's deploy/ dir, NOT the pip package, so they are vendored into
+# titanarum's deploy/gvisor/ and COPY'd here — otherwise /opt/blastbox/run_warm.py
+# would be absent from the exported rootfs and the warm worker cannot start.
+COPY deploy/gvisor/run_warm.py /opt/blastbox/run_warm.py
+COPY deploy/gvisor/engines.py /opt/blastbox/engines.py
+
+# Belt-and-suspenders read/execute permissions for the fixed uid 65532 the gVisor
+# runtime always runs as (see the /in /out /ctrl comment above) -- COPY/RUN default
+# umask already leaves these world-readable, but AOT-cache/jar files are large and
+# worth being explicit about rather than relying on default umask across build
+# environments.
+RUN chmod -R a+rX /app /opt/blastbox
+
+# Strip ALL setuid/setgid bits. This MUST run last (after every other RUN step
+# that could introduce one) and must audit to ZERO: Task 10's build-rootfs.sh
+# (`docker run --rm --entrypoint find "$TAG" / -xdev -type f -perm /6000`) hard-fails
+# the rootfs bake otherwise. The warm worker runs java/python directly as a
+# non-root, no-new-privs uid -- no setuid binary is ever legitimately needed.
+RUN find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+
+# --- Runtime defaults (self-documenting; see caveat below) ------------------
+# `docker export` drops ALL image ENV, so these do NOT reach the warm worker
+# process when run under gVisor C/R -- they only apply if this image is run
+# directly via `docker run` (e.g. local smoke-testing outside runsc). The values
+# that must actually reach the restored container are carried by
+# deploy/docker/docker-compose.gvisor.yml's BLASTBOX_GVISOR_WARM_ARGV (host-side;
+# builds the OCI process.args) and BLASTBOX_GVISOR_EXTRA_ENV (host-side; the ONLY
+# channel that injects env into the OCI process.env blastbox constructs from
+# scratch -- see gvisor_snapshot._oci_config). engine.py's own defaults
+# (_DEFAULT_AOT_CACHE="/app/titanarum.aot") and run_warm.py's own default
+# (BLASTBOX_WARM_IDLE_TIMEOUT_S -> 86400.0 if unset) already match these values,
+# so the compose overlay setting them explicitly is redundant-but-deliberate
+# (operator-visible, tunable via .env without a rebuild) rather than load-bearing.
+ENV BLASTBOX_GVISOR_WARM_ARGV='["/opt/titanarum/bin/python3","/opt/blastbox/run_warm.py"]' \
+    BLASTBOX_WARM_IDLE_TIMEOUT_S=86400 \
+    TITANARUM_AOT_CACHE=/app/titanarum.aot \
+    TITANARUM_WARM=1
+
+# The warm entrypoint is supplied by the host via BLASTBOX_GVISOR_WARM_ARGV
+# (see docker-compose.gvisor.yml); no ENTRYPOINT/CMD is baked because
+# `docker export` drops it and the OCI spec sets process.args explicitly.
+LABEL org.opencontainers.image.title="titanarum-warm-gvisor" \
+      org.opencontainers.image.description="titanarum warm-JVM gVisor C/R rootfs (runsc checkpoint/restore; KVM-less warm tier)" \
+      org.opencontainers.image.version="0.1.0"

@@ -1,0 +1,41 @@
+# Base: JDK 25 + the pdf-titan-arum fat jar + fonts + a -json-capable ZXingReader.
+# Built once, reused by all tiers.
+FROM eclipse-temurin:25-jdk AS jarbuild
+WORKDIR /build
+COPY pom.xml .
+COPY src ./src
+RUN apt-get update && apt-get install -y --no-install-recommends maven \
+ && mvn -q -DskipTests package \
+ && cp target/pdf-titan-arum-*.jar /pdf-titan-arum.jar
+
+# zxing-cpp ZXingReader with `-json` output. The `-json` flag landed in the 3.x
+# series (v2.3.0 and distro 2.2.x lack it), so build from source pinned to v3.1.0.
+# Static link (BUILD_SHARED_LIBS=OFF) so the binary is self-contained in the JRE stage.
+FROM debian:12-slim AS zxingbuild
+ARG ZXING_TAG=v3.1.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git cmake g++ make ca-certificates \
+ && git clone --depth 1 --branch ${ZXING_TAG} https://github.com/zxing-cpp/zxing-cpp /zxing \
+ && cmake -S /zxing -B /zxing/build -DBUILD_SHARED_LIBS=OFF -DZXING_READERS=ON -DZXING_WRITERS=OFF \
+          -DZXING_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build /zxing/build --target ZXingReader -j"$(nproc)" \
+ && cp "$(find /zxing/build -name ZXingReader -type f | head -1)" /ZXingReader \
+ && /ZXingReader -version
+
+FROM eclipse-temurin:25-jre
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fontconfig fonts-dejavu-core python3-venv \
+      libturbojpeg-java libheif1 \
+ && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /app
+COPY --from=jarbuild /pdf-titan-arum.jar /app/pdf-titan-arum.jar
+# rosetta-squint's JPEG/HEIC decode loads the turbojpeg JNI binding (libturbojpeg-java's
+# /usr/share/java/turbojpeg.jar). Place it next to the app jar so the uber-jar's RELATIVE manifest
+# Class-Path (turbojpeg.jar) resolves it under `java -jar`. test -f fails the build if the packaged
+# path ever moves (rather than silently degrading JPEG hashes to the PDFBox fallback).
+RUN test -f /usr/share/java/turbojpeg.jar && cp /usr/share/java/turbojpeg.jar /app/turbojpeg.jar
+COPY --from=zxingbuild /ZXingReader /usr/local/bin/ZXingReader
+RUN /usr/local/bin/ZXingReader -version   # sanity: fails the build if the binary is broken
+RUN python3 -m venv /opt/titanarum
+ENV PATH=/opt/titanarum/bin:$PATH \
+    TITANARUM_ZXING_BIN=/usr/local/bin/ZXingReader

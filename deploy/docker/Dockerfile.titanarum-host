@@ -1,0 +1,75 @@
+# api / dispatcher image for titanarum on blastbox.host (`titanarum:<tag>`).
+#
+# Runs `blastbox serve` (HTTP ingress) or `blastbox dispatch` (claims queued
+# jobs, launches one titanarum-cold-worker container per job). NO JVM/ZXing
+# here — the WORKER image (Dockerfile.titanarum-cold-worker) carries those;
+# this tier is the pure-Python host.
+#
+# Clone of RedTusk's deploy/docker/Dockerfile.host. titanarum has no ingress
+# extension yet (no titanarum/blastbox_ingress.py) — so, unlike RedTusk, this
+# image does NOT set BLASTBOX_INGRESS_EXTENSION and does NOT import a
+# titanarum ingress module. It imports `blastbox.host.ingress.app` (the
+# generic core: submit/status/list/artifacts/result/similar/auth/health/
+# metrics) and `titanarum.engine` only. Add the ingress extension + its ENV
+# here once titanarum/blastbox_ingress.py exists.
+#
+# Build context = repo root:
+#   docker build -f deploy/docker/Dockerfile.titanarum-host -t titanarum:<tag> .
+FROM python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Docker CLI — the dispatcher shells out to `docker run`/`docker kill`/`docker
+# info` (blastbox honours DOCKER_HOST), reaching the daemon only via
+# docker-socket-proxy over TCP. No raw socket bind, no group_add needed.
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -q '9DC858229FC7DD38854AE2D88D81803C0EBFCD88' \
+        || { echo 'FATAL: docker apt signing key fingerprint mismatch' >&2; exit 1; } \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update -qq \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 titanarum \
+    && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin titanarum
+
+# Pin blastbox[host] to the exact deployed wheel (0.1.17) so the whole
+# titanarum-bb stack — this host image AND the cold-worker image
+# (Dockerfile.titanarum-cold-worker) — runs one blastbox version. Then
+# install the local titanarum package WITH its declared deps (pip sees
+# blastbox already satisfied within its >=0.1.15,<0.2 range and reuses it
+# rather than re-resolving), so titanarum.engine imports cleanly.
+WORKDIR /tmp/build
+COPY pyproject.toml README.md /tmp/build/
+COPY titanarum /tmp/build/titanarum
+RUN python3 -m venv /opt/titanarum \
+    && /opt/titanarum/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]==0.1.17" \
+    && /opt/titanarum/bin/pip install --no-cache-dir /tmp/build \
+    && rm -rf /tmp/build \
+    && /opt/titanarum/bin/python -c "import blastbox.host.ingress.app, titanarum.engine; print('host ok')"
+
+ENV PATH=/opt/titanarum/bin:$PATH \
+    BLASTBOX_ALLOWED_ENGINES=titanarum
+
+USER 10001:10001
+WORKDIR /var/lib/titanarum
+
+# Image-default healthcheck = the engine self-test; the compose `api` service
+# overrides this with an HTTP probe of /v1/healthz.
+HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3 \
+    CMD ["titanarum", "selftest"]
+
+# Default to serve; compose overrides `command` per service (api -> blastbox
+# serve, dispatcher -> blastbox dispatch). The `titanarum` CLI (version/
+# selftest) stays on PATH for one-shot in-process use.
+ENTRYPOINT ["blastbox"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]
+
+LABEL org.opencontainers.image.title="titanarum" \
+      org.opencontainers.image.description="titanarum api/dispatcher on blastbox.host" \
+      org.opencontainers.image.version="0.1.0"

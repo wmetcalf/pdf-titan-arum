@@ -1,0 +1,272 @@
+# titanarum-bb compose stack — runs ON blastbox.host, COLD tier only.
+# Usage: ./deploy/docker/titanarum-compose up --build -d
+#
+# Isolated purely by COMPOSE_PROJECT_NAME=titanarum-bb — compose scopes
+# networks (titanarum-bb_backend/_frontend), named volumes
+# (titanarum-bb_postgres-data, titanarum-bb_proxy-haproxy-cfg) and container
+# names (titanarum-bb-*) by project, so this stack cannot collide with any
+# other blastbox.host project (e.g. redtusk-bb, clippyshot) sharing the host.
+#
+# The ingress is `blastbox serve`; titanarum has no ingress extension yet
+# (no titanarum/blastbox_ingress.py), so the api runs the generic blastbox
+# core routes only (submit/status/list/artifacts/result/similar/auth/health/
+# metrics) — no BLASTBOX_INGRESS_EXTENSION is set. The dispatcher is
+# `blastbox dispatch`: it claims queued jobs and launches one hardened,
+# disposable titanarum-cold-worker container per job (runsc by default).
+# Only the dispatcher touches the Docker socket; the api never does.
+#
+# Clone of RedTusk's deploy/docker/docker-compose.yml (see that file for the
+# security-hardening rationale — this stack is byte-for-byte equivalent
+# except for the deltas called out inline below).
+
+services:
+  postgres:
+    # postgres:16-alpine + evirma/pg_bktree, so blastbox's SqlJobStore can build
+    # SP-GiST Hamming-distance indexes on perceptual hashes (powers /v1/similar).
+    build:
+      context: ../postgres
+    image: titanarum-postgres:${TAG}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-titanarum}
+      POSTGRES_USER: ${POSTGRES_USER:-titanarum}
+      # SECURITY: no default — startup fails fast if unset. Use a strong random
+      # value (openssl rand -base64 32) in deploy/docker/.env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env — use a strong random value}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend
+
+  # Least-privilege Docker API proxy — the SOLE holder of the real socket. The
+  # dispatcher reaches it over the internal backend network (DOCKER_HOST=
+  # tcp://docker-socket-proxy:2375) instead of being handed the raw, root-equivalent
+  # /var/run/docker.sock. A dispatcher RCE can then reach only the Docker verbs
+  # enabled below — the minimum `blastbox dispatch` uses: `docker run`
+  # (create/start/attach/wait/rm = CONTAINERS, pull = IMAGES, POST), `docker kill`
+  # (CONTAINERS), `docker info` (INFO). Everything else stays at the image DENY default.
+  # Verbatim from RedTusk — engine-agnostic. Each project runs its own
+  # independent proxy; the shared host socket is fine.
+  docker-socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - INFO=1
+      - POST=1
+      - VERSION=1           # docker CLI/SDK negotiates the API version on connect
+      # Everything else explicitly denied (defence in depth; 0 is already default).
+      - NETWORKS=0
+      - VOLUMES=0
+      - EXEC=0
+      - SWARM=0
+      - SERVICES=0
+      - TASKS=0
+      - NODES=0
+      - SECRETS=0
+      - CONFIGS=0
+      - PLUGINS=0
+      - SYSTEM=0
+      - AUTH=0
+      - BUILD=0
+      - COMMIT=0
+      - DISTRIBUTION=0
+      - SESSION=0
+    volumes:
+      # The ONLY container that touches the real socket (read-only bind).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # tecnativa renders haproxy.cfg into this dir at boot, which fails under
+      # read_only; a named volume is writable and seeded from the image.
+      - proxy-haproxy-cfg:/usr/local/etc/haproxy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /run
+    networks:
+      # Internal only — never exposed to frontend, no ports mapping.
+      - backend
+
+  api:
+    image: ${TITANARUM_IMAGE}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.titanarum-host
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - BLASTBOX_DATABASE_URL=postgresql://${POSTGRES_USER:-titanarum}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:-titanarum}
+      - BLASTBOX_JOB_ROOT=${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}/jobs
+      - BLASTBOX_JOB_RETENTION_SECONDS=${BLASTBOX_JOB_RETENTION_SECONDS:-0}
+      # Titanarum inlines per-page OCR ExtractedText, so the envelope can run
+      # much larger than the blastbox 4 MiB default. 100 MiB covers it with
+      # wide headroom, still DoS-bounded. MUST match the dispatcher (the trust
+      # gate there enforces equality).
+      - BLASTBOX_MAX_METADATA=${BLASTBOX_MAX_METADATA:-104857600}
+      - BLASTBOX_ALLOWED_ENGINES=titanarum
+      # NOTE: no BLASTBOX_INGRESS_EXTENSION here — titanarum/blastbox_ingress.py
+      # does not exist yet. Add
+      # `BLASTBOX_INGRESS_EXTENSION=titanarum.blastbox_ingress:make_extension`
+      # once it lands (and rebuild Dockerfile.titanarum-host to import it).
+      # Per-job tier routing (target_tier pins which dispatcher tier claims a job) is an
+      # OPERATOR/TEST knob — needed for the 3-tier (cold/FC/gVisor) parity gate.
+      # Default ON here (unlike RedTusk's default-off) per the titanarum deploy plan.
+      - BLASTBOX_ALLOW_TIER_ROUTING=${BLASTBOX_ALLOW_TIER_ROUTING:-1}
+      # Engine registry + boundary — kept BYTE-IDENTICAL to the dispatcher's copy
+      # below (and to any warm sidecar added in Phase 2), even though the
+      # blastbox 0.1.17 `serve` command does not itself read these today. Kept
+      # here as a deliberate consistency/defense-in-depth floor per the
+      # titanarum deploy plan (§1c): if BLASTBOX_ALLOW_TIER_ROUTING ever lets the
+      # api validate a per-job param/tier selection before it reaches dispatch,
+      # the allowlist is already present and cannot drift out of sync.
+      - BLASTBOX_ENGINES=titanarum=${TITANARUM_WORKER_IMAGE}
+      - BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS=${BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS:-TITANARUM_SKIP_SCREENSHOTS,TITANARUM_SKIP_IMAGES,TITANARUM_DPI,TITANARUM_PAGES}
+      - BLASTBOX_ENGINE_TITANARUM_DEFAULT_PARAMS=${BLASTBOX_ENGINE_TITANARUM_DEFAULT_PARAMS:-TITANARUM_SKIP_QR=0}
+      - BLASTBOX_ENGINE_TITANARUM_RESERVED_KEYS=${BLASTBOX_ENGINE_TITANARUM_RESERVED_KEYS:-TITANARUM_AI_URL,TITANARUM_AI_KEY,TITANARUM_AI_MODEL,TITANARUM_JAVA_BIN,TITANARUM_JAVA_OPTS,TITANARUM_WORKER_JAR,TITANARUM_AOT_CACHE,TITANARUM_JAVA_LIBRARY_PATH,TITANARUM_ZXING_BIN,TITANARUM_ZXING_FORMATS,TITANARUM_CRAC_CHECKPOINT,TITANARUM_CRAC_SCRATCH}
+      - BLASTBOX_ENGINE_TITANARUM_NETPOLICY=${BLASTBOX_ENGINE_TITANARUM_NETPOLICY:-none}
+    ports:
+      # The app does not authenticate — front with a reverse proxy for any exposed
+      # deploy. TITANARUM_BIND_ADDR=127.0.0.1 restricts to localhost. This is the
+      # ONLY published port in the whole stack.
+      - "${TITANARUM_BIND_ADDR:-0.0.0.0}:${TITANARUM_PORT:-8004}:8000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,size=2g
+    volumes:
+      # Host-CONSISTENT path, NOT a named volume: the dispatcher launches workers
+      # whose job-dir bind-mounts are resolved by the host docker daemon, so
+      # job_root must exist at the SAME path on host + container. Unique path —
+      # do not reuse redtusk-bb's/clippyshot's job root.
+      - ${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}:${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test:
+        - "CMD"
+        - "/opt/titanarum/bin/python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/v1/healthz', timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 15s
+      start_period: 20s
+      retries: 3
+    networks:
+      - backend
+      - frontend
+
+  # Claims queued jobs and launches one hardened disposable worker per job via
+  # `docker run --runtime=runsc …` (runc is REFUSED unless BLASTBOX_ALLOW_RUNC=1).
+  # The worker image is titanarum-cold-worker:<tag> (Dockerfile.titanarum-cold-worker
+  # → `python -m blastbox.worker.cold` with BLASTBOX_ENGINE=titanarum.engine:TitanArumEngine
+  # + the JVM/ZXing baked in). Reaches Docker ONLY through the least-privilege
+  # docker-socket-proxy (DOCKER_HOST below) — never the raw socket.
+  dispatcher:
+    image: ${TITANARUM_IMAGE}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.titanarum-host
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+    environment:
+      - BLASTBOX_DATABASE_URL=postgresql://${POSTGRES_USER:-titanarum}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:-titanarum}
+      - BLASTBOX_JOB_ROOT=${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}/jobs
+      - BLASTBOX_JOB_RETENTION_SECONDS=${BLASTBOX_JOB_RETENTION_SECONDS:-0}
+      # MUST match the api exactly (the trust gate there enforces equality).
+      - BLASTBOX_MAX_METADATA=${BLASTBOX_MAX_METADATA:-104857600}
+      # Reach the Docker daemon ONLY via the least-privilege proxy over TCP — the
+      # docker CLI (which blastbox shells out to) honours DOCKER_HOST. No raw socket.
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+      # EngineSpec registry: NAME=image:tag. Worker image built from
+      # Dockerfile.titanarum-cold-worker (FROM pdf-titan-arum-base:<tag>).
+      - BLASTBOX_ENGINES=titanarum=${TITANARUM_WORKER_IMAGE}
+      # Per-engine forwardable-param allowlist (default-deny). Narrow Task-13 set —
+      # these three boundary keys + the registry MUST be byte-identical on this cold
+      # dispatcher AND both warm sidecars (dispatcher-fc/dispatcher-gvisor) once those
+      # land — see docs/RUNTIMES / the titanarum deploy plan.
+      - BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS=${BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS:-TITANARUM_SKIP_SCREENSHOTS,TITANARUM_SKIP_IMAGES,TITANARUM_DPI,TITANARUM_PAGES}
+      # Operator defaults (per-job value wins). QR on by default = forensic IOC.
+      - BLASTBOX_ENGINE_TITANARUM_DEFAULT_PARAMS=${BLASTBOX_ENGINE_TITANARUM_DEFAULT_PARAMS:-TITANARUM_SKIP_QR=0}
+      # Engine-OWNED reserved keys — CODE-EXEC vectors a client must NEVER set via
+      # job.params (JVM binary/worker jar/JVM opts/native lib path/AOT cache/ZXing
+      # binary+formats/CRaC checkpoint+scratch/AI endpoint+key+model). Dropped
+      # UNCONDITIONALLY — before the allowlist — so they're blocked even on a warm
+      # tier running without the (optional) allowlist. Cold AND warm.
+      - BLASTBOX_ENGINE_TITANARUM_RESERVED_KEYS=${BLASTBOX_ENGINE_TITANARUM_RESERVED_KEYS:-TITANARUM_AI_URL,TITANARUM_AI_KEY,TITANARUM_AI_MODEL,TITANARUM_JAVA_BIN,TITANARUM_JAVA_OPTS,TITANARUM_WORKER_JAR,TITANARUM_AOT_CACHE,TITANARUM_JAVA_LIBRARY_PATH,TITANARUM_ZXING_BIN,TITANARUM_ZXING_FORMATS,TITANARUM_CRAC_CHECKPOINT,TITANARUM_CRAC_SCRATCH}
+      # Network policy for the launched worker container (titanarum-plan addition;
+      # RedTusk has no NETPOLICY key). MUST mirror the cold dispatcher on any warm
+      # sidecar too.
+      - BLASTBOX_ENGINE_TITANARUM_NETPOLICY=${BLASTBOX_ENGINE_TITANARUM_NETPOLICY:-none}
+      - BLASTBOX_DISPATCH_CONCURRENCY=${BLASTBOX_DISPATCH_CONCURRENCY:-16}
+      - BLASTBOX_WORKER_TIMEOUT_S=${BLASTBOX_WORKER_TIMEOUT_S:-300}
+      # Opt-in ceiling on QUEUED age before a job is FAILed + its input deleted —
+      # bounds a target_tier pinned to a tier with no running dispatcher (routing-enabled mode).
+      - BLASTBOX_MAX_QUEUED_AGE_S=${BLASTBOX_MAX_QUEUED_AGE_S:-600}
+      # Worker runtime gate (hardened floor): runsc required, runc fail-closed REFUSED
+      # unless BLASTBOX_ALLOW_RUNC=1.
+      - BLASTBOX_WORKER_RUNTIME=${BLASTBOX_WORKER_RUNTIME:-runsc}
+      - BLASTBOX_ALLOW_RUNC=${BLASTBOX_ALLOW_RUNC:-0}
+      - BLASTBOX_REQUIRE_SECURE_RUNTIME=${BLASTBOX_REQUIRE_SECURE_RUNTIME:-1}
+      # The titanarum JVM worker is -Xmx4g; at 2-3g (RedTusk's default) the worker is
+      # OOM-killed at boot with no report.json. 5g gives headroom above -Xmx4g + the
+      # ~50m AOT/ZXing/python overhead.
+      - BLASTBOX_WORKER_MEMORY=${BLASTBOX_WORKER_MEMORY:-5g}
+      # NOTE: these MUST be non-empty. blastbox reads them with
+      # os.environ.get(key, default), which returns "" when the key is set-but-empty
+      # (NOT the default), so an empty value emits a bare `--pids-limit`/`--cpus`
+      # flag → docker eats the next token as the value → arg-parse failure → the
+      # worker exits in ~30ms with no metadata.json.
+      - BLASTBOX_WORKER_PIDS_LIMIT=${BLASTBOX_WORKER_PIDS_LIMIT:-256}
+      - BLASTBOX_WORKER_CPUS=${BLASTBOX_WORKER_CPUS:-2}
+      - BLASTBOX_WORKER_NOFILE=${BLASTBOX_WORKER_NOFILE:-4096}
+      - BLASTBOX_SECCOMP_JSON_HOST=${BLASTBOX_SECCOMP_JSON_HOST:-}
+      - BLASTBOX_APPARMOR_PROFILES=${BLASTBOX_APPARMOR_PROFILES:-}
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # No group_add: the dispatcher reaches Docker over TCP via the proxy, not a
+    # bind-mounted socket, so it doesn't need the host docker group.
+    tmpfs:
+      - /tmp:rw,nosuid,size=64m
+    volumes:
+      - ${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}:${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}
+      # SECURITY: the raw docker.sock bind mount is intentionally ABSENT — the
+      # dispatcher talks to docker-socket-proxy (DOCKER_HOST). Do not re-add it.
+    command: ["dispatch"]
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 30s
+      timeout: 15s
+      start_period: 20s
+      retries: 3
+    networks:
+      - backend
+
+networks:
+  backend:
+    internal: true
+  frontend:
+
+volumes:
+  postgres-data:
+  proxy-haproxy-cfg:
+  # No titanarum-data volume: job_root is a host bind-mount (see api/dispatcher),
+  # required so dispatcher-launched workers can bind-mount job dirs by host path.

@@ -1,0 +1,154 @@
+# Firecracker warm-rootfs Dockerfile for titanarum — the FC analog of
+# deploy/gvisor/Dockerfile.titanarum (Tier 2 in the warm-mode plan; see that
+# file + docs/superpowers/plans/2026-07-11-titanarum-warm-mode.md "Tier 2 — FC
+# warm"). Built ON TOP OF titanarum-cold-worker:${TAG} so titanarum's JVM/
+# PDFBox worker runs inside a hardened, disposable Firecracker microVM that is
+# snapshotted at warm-idle and restored per job
+# (BLASTBOX_POOL_RUNTIME=firecracker + BLASTBOX_POOL_WARM_SNAPSHOT=1 — a full
+# guest-RAM snapshot, blastbox's FcSnapshotBackend/SnapshotManager — NOT CRaC/
+# in-JVM checkpoint-restore). Modeled line-by-line on blastbox's
+# deploy/firecracker/Dockerfile.redtusk (the JVM/Tika FC guest — THE analog):
+# s/redtusk/titanarum/, redtusk-worker.jar -> pdf-titan-arum.jar,
+# /opt/redtusk -> /opt/titanarum, REDTUSK_* -> TITANARUM_*, plus the AOT bake
+# this base image does not already carry (Dockerfile.titanarum-cold-worker is
+# explicitly AOT-cache-free — see deploy/gvisor/Dockerfile.titanarum for the
+# same bake, byte-for-byte reused here via deploy/docker/build-aot.sh).
+#
+# Per Finding A (warm-mode plan): the FC guest speaks vsock entirely through
+# blastbox's Python guest agent (run_guest.py's VsockWarmControl) — titanarum's
+# JVM never touches AF_VSOCK, no junixsocket, no CapDropper/KsmHelper native
+# libs, and NO -XX:CPUFeatures pinning (the snapshot is built AND restored on
+# the SAME dispatcher host/machine-config, unlike CRaC/warp's cross-host
+# checkpoint — that pinning is a Tier-3 CRaC concern, not this one). The engine
+# loads via the module:Class seam (titanarum.engine:TitanArumEngine — the SAME
+# class the cold dispatcher and the gVisor warm tier already use) — no adapter
+# staging needed; blastbox's generic engines.py (vendored below, get_engine())
+# does the importlib.import_module + getattr.
+#
+# GVISOR-LESSON CHECKLIST (Task 9 initially forgot to bake blastbox's warm
+# AGENT scripts, since they live in the blastbox REPO's deploy/, NOT the pip
+# package — docker export silently dropped them and the warm worker couldn't
+# start). For FC, every file the guest boot needs is vendored into THIS repo's
+# deploy/firecracker/ (copied verbatim from blastbox's deploy/firecracker/) and
+# COPY'd at the SAME in-image paths Dockerfile.redtusk uses:
+#   deploy/firecracker/init          -> /init                 (PID 1)
+#   deploy/firecracker/run_guest.py  -> /opt/blastbox/run_guest.py  (vsock guest agent)
+#   deploy/firecracker/engines.py    -> /opt/blastbox/engines.py    (module:Class loader)
+#   deploy/firecracker/guest.titanarum.env -> /opt/blastbox/guest.env (DROP_USER + TITANARUM_* + BLASTBOX_WARM_IDLE_TIMEOUT_S)
+#   (deploy/firecracker/build-rootfs.sh is vendored too, for Task 12's rootfs
+#    bake — it is not COPY'd into the image; it runs on the HOST.)
+#
+# Build context = titanarum repo root (deploy/firecracker/build-rootfs.sh, once
+# vendored + invoked here, `cd`s to the repo root before `docker build -f
+# deploy/firecracker/Dockerfile.titanarum .` — Task 12):
+#   ENGINE=titanarum.engine:TitanArumEngine BASE_IMAGE=titanarum-cold-worker:pha2 \
+#     DOCKERFILE=deploy/firecracker/Dockerfile.titanarum ROOTFS_MIB=3072 \
+#     deploy/firecracker/build-rootfs.sh titanarum-rootfs.ext4
+ARG BASE_IMAGE=titanarum-cold-worker:dev
+FROM ${BASE_IMAGE}
+ARG ENGINE=titanarum.engine:TitanArumEngine
+USER root
+
+# util-linux: `mount` for /init + `setpriv` to drop privileges (the temurin JRE
+# base does not ship setpriv) — same rationale as Dockerfile.redtusk.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Bake the AOT cache (/app/titanarum.aot) --------------------------------
+# Real warm benefit needs one (Finding C / W-2/W-3 in the warm-mode plan): a
+# pre-booted-then-snapshotted JVM that hasn't loaded PDFBox/JBIG2/JPEG2000/
+# ZXing classes only saves JVM-bootstrap time, not the seconds of class-load +
+# JIT the first restored job would otherwise still pay. Same two-phase
+# record->create->verify-load bake as deploy/gvisor/Dockerfile.titanarum (see
+# that file's header for why the flags are read LIVE from
+# titanarum.engine._DEFAULT_JVM_FLAGS rather than hand-copied — JDK 25 silently
+# rejects a mismatched cache). NOTE: still NO -XX:CPUFeatures — the FC
+# snapshot is built and restored on the SAME dispatcher host, so the
+# JIT-compiled native code in the guest-RAM snapshot always matches the
+# restore CPU (CPUFeatures pinning is a CRaC/warp cross-host concern, Tier 3).
+COPY deploy/docker/build-aot.sh /tmp/build-aot.sh
+COPY deploy/docker/appcds-warmup-corpus /tmp/appcds-warmup-corpus
+RUN chmod +x /tmp/build-aot.sh \
+    # PYTHON_BIN must be the venv interpreter: it imports titanarum.engine to
+    # read _DEFAULT_JVM_FLAGS, and only /opt/titanarum's venv has titanarum
+    # installed.
+    && PYTHON_BIN=/opt/titanarum/bin/python3 \
+       TITANARUM_JAVA_BIN=java \
+       TITANARUM_AOT_LOG_DIR=/tmp/aot-build-logs \
+       /tmp/build-aot.sh /app/pdf-titan-arum.jar /tmp/appcds-warmup-corpus /app \
+    # build-aot.sh's own Phase 3 already boots the JVM with -XX:AOTCache +
+    # -Xlog:aot and fails the build unless it sees "Opened AOT cache" AND
+    # "Using AOT-linked classes: true" with no "[error][aot]" line — that IS
+    # the verify-load gate; a bare `test -s` alone would only prove the file
+    # is non-empty, not that the JVM will actually accept it at warm-boot time.
+    && test -s /app/titanarum.aot \
+    && rm -rf /tmp/build-aot.sh /tmp/appcds-warmup-corpus /tmp/aot-build-logs
+
+# FC guest mountpoint for the per-slot output disk (/dev/vdb). MUST exist at
+# build time: the exported rootfs boots read-only, so /init cannot create it
+# on the fly.
+RUN mkdir -p /mnt/outdisk
+
+# `docker export` (used by build-rootfs.sh to materialise the ext4 rootfs) DROPS
+# Docker ENV (incl. the temurin PATH + the base's TITANARUM_* ENV), and the
+# shared /init execs `python3 /opt/blastbox/run_guest.py` + the engine Popens
+# `java`, both resolved via /init's fixed PATH (…:/usr/local/bin:/usr/bin:…).
+# Point those at the titanarum venv python (has titanarum + blastbox) and the
+# temurin java.
+#
+# python3 MUST be a WRAPPER, not a symlink: a symlink
+# (/usr/local/bin/python3 -> /opt/titanarum/bin/python3) gets realpath-resolved
+# down the venv->system python3 chain, so venv detection lands on /usr/bin (no
+# blastbox/titanarum -> ModuleNotFound, the guest agent dies -> hung/panicked
+# VM). A wrapper execs the venv python by its literal in-venv path, so
+# pyvenv.cfg is found and the venv is active. java is not a venv, so a plain
+# symlink is fine — `command -v java` (not a hardcoded temurin path) so this
+# doesn't silently break if the base image's JDK install layout ever changes.
+# rm -f first: if a base ever ships /usr/local/bin/python3 as a symlink,
+# `printf >` would follow it and overwrite the *target* — removing it first
+# guarantees a fresh regular file (not the case for the current base, cheap
+# insurance against base drift).
+RUN rm -f /usr/local/bin/python3 \
+    && printf '#!/bin/sh\nexec /opt/titanarum/bin/python3 "$@"\n' > /usr/local/bin/python3 \
+    && chmod +x /usr/local/bin/python3 \
+    && ln -sf "$(command -v java)" /usr/local/bin/java
+
+# blastbox FC guest agent + init + per-rootfs config (vendored VERBATIM from
+# blastbox's deploy/firecracker/ into THIS repo's deploy/firecracker/ — see the
+# gVisor-lesson checklist in this file's header). The engine is chosen by
+# writing the module:Class name to a FILE (Docker ENV is dropped by
+# `docker export`) that run_guest.py's _engine_name() reads at guest boot.
+COPY deploy/firecracker/run_guest.py /opt/blastbox/run_guest.py
+COPY deploy/firecracker/engines.py /opt/blastbox/engines.py
+COPY deploy/firecracker/init /init
+COPY deploy/firecracker/guest.titanarum.env /opt/blastbox/guest.env
+RUN chmod +x /init \
+    && printf '%s' "${ENGINE}" > /opt/blastbox/engine \
+    && chmod -R a+rX /app /opt/blastbox
+
+# Strip ALL setuid/setgid bits. This MUST run last (after every other RUN step
+# that could introduce one) and must audit to ZERO: Task 12's build-rootfs.sh
+# (`docker run --rm --entrypoint find "$TAG" / -xdev -type f -perm /6000`)
+# hard-fails the rootfs bake otherwise. The in-VM worker runs java/python
+# directly as a dropped-privilege uid (setpriv --reuid, see /init) — no setuid
+# binary is ever legitimately needed.
+RUN find / -xdev -type f -perm /6000 -exec chmod a-s {} + 2>/dev/null || true
+
+# --- Runtime defaults (documentary; see caveat below) -----------------------
+# `docker export` drops ALL image ENV, so these do NOT reach the guest when
+# booted as a Firecracker microVM — the guest instead sources
+# /opt/blastbox/guest.env (baked as a FILE above), which is authoritative. These
+# ENV lines only apply if this image is run directly via `docker run` (e.g.
+# local smoke-testing outside firecracker) and are kept for documentation/
+# `docker inspect` visibility parity with deploy/gvisor/Dockerfile.titanarum.
+ENV TITANARUM_AOT_CACHE=/app/titanarum.aot \
+    TITANARUM_WARM=1 \
+    BLASTBOX_WARM_IDLE_TIMEOUT_S=86400
+
+# No ENTRYPOINT/CMD is baked: `docker export` drops it and Firecracker boots
+# the guest kernel directly (kernel cmdline `init=/init`), not this image's
+# entrypoint/cmd.
+LABEL org.opencontainers.image.title="titanarum-warm-firecracker" \
+      org.opencontainers.image.description="titanarum warm-JVM Firecracker rootfs (guest-RAM snapshot restore; hardware-KVM warm tier)" \
+      org.opencontainers.image.version="0.1.0"

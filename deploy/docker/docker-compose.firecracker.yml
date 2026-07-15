@@ -1,0 +1,144 @@
+# Firecracker warm-pool SIDECAR for titanarum on blastbox.host — a dedicated,
+# socket-less warm dispatcher that runs titanarum's JVM/PDFBox worker inside
+# hardened, disposable Firecracker microVMs restored from a warm-idle
+# guest-RAM snapshot (BLASTBOX_POOL_RUNTIME=firecracker +
+# BLASTBOX_POOL_WARM_SNAPSHOT=1 — blastbox's FcSnapshotBackend/SnapshotManager;
+# see docs/superpowers/plans/2026-07-11-titanarum-warm-mode.md "Tier 2 — FC
+# warm"). This is the FC analog of docker-compose.gvisor.yml (Task 9) — read
+# that file's header for the shared sidecar rationale (warm-only claim-gating
+# via BLASTBOX_DISPATCH_WARM_ONLY, byte-identical engine boundary).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.firecracker.yml \
+#     --project-name titanarum-bb up -d --force-recreate dispatcher-fc
+#
+# FC's isolation is HARDWARE (host KVM via /dev/kvm), unlike gVisor's
+# root-in-container + broad cap_add: this sidecar needs ONLY /dev/kvm + the kvm
+# group, so — unlike dispatcher-gvisor — it keeps the FULL hardened floor the
+# cold dispatcher uses: cap_drop:[ALL] + read_only + no-new-privileges, no
+# docker socket, no ports.
+#
+# No entrypoint override is needed here (unlike dispatcher-gvisor): titanarum's
+# host image sets `ENTRYPOINT ["blastbox"]`, so `command: ["dispatch"]` alone
+# already runs `blastbox dispatch`. This tier also needs NO pre-boot
+# state-clear step: blastbox's SnapshotManager.build() does
+# `base_dir.mkdir(parents=True, exist_ok=True)` and the FC scratch_root
+# (default /tmp/blastbox-fc-slots) lives entirely on THIS container's own
+# tmpfs `/tmp` mount below, which is already wiped clean on every container
+# (re)start. (Contrast gVisor: `runsc checkpoint` refuses to overwrite an
+# on-disk checkpoint dir left over from a prior container life, so that
+# sidecar needs a state-clear shell script + entrypoint override — FC has no
+# such leftover-state hazard.)
+#
+# Prerequisite — the FC assets staged on the host at ${TITANARUM_FC_DIR}
+# (default /home/coz/titanarum-bb-fc): the `firecracker` binary (>= 1.15.1), a
+# `vmlinux` guest kernel >= 5.18 (VMGenID — required so the JVM's
+# SecureRandom/CRNG reseeds on every restore instead of cloning the base VM's
+# random state) built with `random.trust_cpu=on` (or virtio-rng) to avoid a
+# ~120s CRNG-stall on boot, and the titanarum FC rootfs
+# `titanarum-rootfs.ext4` (built from THIS repo's
+# deploy/firecracker/Dockerfile.titanarum FROM titanarum-cold-worker:${TAG} via
+# the vendored deploy/firecracker/build-rootfs.sh — Task 12's rootfs build +
+# deploy, NOT done by this file). The firecracker binary + kernel are
+# engine-agnostic and may be reused from a redtusk-bb/clippyshot FC install
+# already on the host.
+services:
+  dispatcher-fc:
+    image: ${TITANARUM_IMAGE:-titanarum:pha2}
+    command: ["dispatch"]
+    restart: unless-stopped
+    # Liveness is covered by restart: unless-stopped; the image-default
+    # healthcheck (HTTP /v1/healthz) doesn't apply to a warm-only, no-port
+    # dispatcher.
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/kvm
+    group_add:
+      - "${KVM_GID:-994}"
+    environment:
+      - BLASTBOX_DATABASE_URL=postgresql://${POSTGRES_USER:-titanarum}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:-titanarum}
+      - BLASTBOX_JOB_ROOT=${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}/jobs
+      - BLASTBOX_JOB_RETENTION_SECONDS=${BLASTBOX_JOB_RETENTION_SECONDS:-0}
+      # Trust-gate cap — MUST match the cold dispatcher + api + dispatcher-gvisor exactly.
+      - BLASTBOX_MAX_METADATA=${BLASTBOX_MAX_METADATA:-104857600}
+      # Engine registry + the three boundary keys + NETPOLICY — MUST be
+      # byte-identical to the cold dispatcher (docker-compose.yml) AND
+      # dispatcher-gvisor (docker-compose.gvisor.yml). Without this mirroring,
+      # this warm tier would fall back to its own defaults (default-deny param
+      # allowlist, no reserved-key denylist, no netpolicy), which could let a
+      # client's job.params reach titanarum's code-exec-vector TITANARUM_*
+      # knobs on this tier even though the cold tier blocks them.
+      - BLASTBOX_ENGINES=titanarum=${TITANARUM_WORKER_IMAGE}
+      - BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS=${BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS:-TITANARUM_SKIP_SCREENSHOTS,TITANARUM_SKIP_IMAGES,TITANARUM_DPI,TITANARUM_PAGES}
+      - BLASTBOX_ENGINE_TITANARUM_DEFAULT_PARAMS=${BLASTBOX_ENGINE_TITANARUM_DEFAULT_PARAMS:-TITANARUM_SKIP_QR=0}
+      - BLASTBOX_ENGINE_TITANARUM_RESERVED_KEYS=${BLASTBOX_ENGINE_TITANARUM_RESERVED_KEYS:-TITANARUM_AI_URL,TITANARUM_AI_KEY,TITANARUM_AI_MODEL,TITANARUM_JAVA_BIN,TITANARUM_JAVA_OPTS,TITANARUM_WORKER_JAR,TITANARUM_AOT_CACHE,TITANARUM_JAVA_LIBRARY_PATH,TITANARUM_ZXING_BIN,TITANARUM_ZXING_FORMATS,TITANARUM_CRAC_CHECKPOINT,TITANARUM_CRAC_SCRATCH}
+      - BLASTBOX_ENGINE_TITANARUM_NETPOLICY=${BLASTBOX_ENGINE_TITANARUM_NETPOLICY:-none}
+      # --- sidecar primitive ---
+      # On a warm-pool MISS, requeue the job for the cold dispatcher instead of
+      # cold-falling-back (this socket-less box can't launch a cold docker
+      # worker — no docker socket / no docker-socket-proxy wiring here).
+      - BLASTBOX_DISPATCH_WARM_ONLY=1
+      # Concurrency MUST match warm_size — the warm dispatch path blocks until
+      # the job finishes, so N dispatch threads keep N slots busy (default 1
+      # starves the pool).
+      - BLASTBOX_DISPATCH_CONCURRENCY=${BLASTBOX_FC_WARM_SIZE:-2}
+      - BLASTBOX_MAX_QUEUED_AGE_S=${BLASTBOX_MAX_QUEUED_AGE_S:-0}  # bound stuck target_tier jobs
+      - BLASTBOX_POOL_RUNTIME=firecracker
+      # Snapshot tier (vs cold FC boot-per-job): the warm-idle base VM is
+      # snapshotted ONCE, then every slot restores from that guest-RAM
+      # snapshot — this is the whole point of the tier (Finding A: no CRaC, no
+      # vsock/native libs/CPUFeatures on titanarum's side; warmth = frozen
+      # guest RAM). Omitting this flag would silently degrade to cold-FC-boot-
+      # per-job (blastbox.host.runtime.firecracker instead of
+      # fc_snapshot_runtime) with no error.
+      - BLASTBOX_POOL_WARM_SNAPSHOT=1
+      - BLASTBOX_POOL_WARM_SIZE=${BLASTBOX_FC_WARM_SIZE:-2}
+      # Default = warm_size: with BURST_SIZE=0 the pool never grows past
+      # warm_size, so a higher ceiling is unreachable. Raise only alongside burst.
+      - BLASTBOX_POOL_CEILING=${BLASTBOX_FC_CEILING:-2}
+      # Burst MUST be 0 on this socket-less warm-only sidecar — burst overflow
+      # launches EXTRA *cold* docker workers, which this box cannot do (no
+      # docker socket) — so a warm-pool miss simply doesn't claim, leaving
+      # overflow queued for the cold dispatcher.
+      - BLASTBOX_POOL_BURST_SIZE=0
+      # --- FC config (assets mounted read-only at /var/lib/blastbox-fc below) ---
+      - BLASTBOX_FC_BIN=/var/lib/blastbox-fc/firecracker
+      - BLASTBOX_FC_KERNEL=/var/lib/blastbox-fc/vmlinux
+      - BLASTBOX_FC_ROOTFS=/var/lib/blastbox-fc/titanarum-rootfs.ext4
+      # vcpu_count=1 is blastbox's own hard-won vsock-corruption mitigation
+      # (blastbox.host.runtime.firecracker.FCConfig: "NEVER increase without
+      # ..."). Do not raise this.
+      - BLASTBOX_FC_VCPU=${BLASTBOX_FC_VCPU:-1}
+      # The in-VM JVM is -Xmx4g pre-touched + AOT (~40MB) + python/blastbox
+      # overhead — 4608 MiB gives headroom above -Xmx4g without wasting a full
+      # extra GiB per slot.
+      - BLASTBOX_FC_MEM_MIB=${BLASTBOX_FC_MEM_MIB:-4608}
+      # Per-slot ext4 output disk. Titanarum's report.json can inline per-page
+      # OCR text (up to BLASTBOX_MAX_METADATA); 1 GiB gives headroom for that
+      # plus screenshots/page_pdfs/url_crops artifacts.
+      - BLASTBOX_FC_OUTDISK_MIB=${BLASTBOX_FC_OUTDISK_MIB:-1024}
+    volumes:
+      # job_root (host-consistent, same path as the cold dispatcher) — read the
+      # staged input.
+      - "${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}/jobs:${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}/jobs"
+      # FC assets (firecracker binary + vmlinux kernel + titanarum-rootfs.ext4),
+      # read-only.
+      - "${TITANARUM_FC_DIR:-/home/coz/titanarum-bb-fc}:/var/lib/blastbox-fc:ro"
+    tmpfs:
+      # FC warm-base guest-RAM snapshot (mem file size ~= BLASTBOX_FC_MEM_MIB,
+      # i.e. ~4.5g) + per-slot outdisks (~1g x warm_size) + the vsock UDS
+      # scratch, all under scratch_root (default /tmp/blastbox-fc-slots, i.e.
+      # THIS mount) — tmpfs makes every restore's COW-shared base read come
+      # from RAM (zero disk I/O). Sized for warm_size=2: ~4.5g base snapshot +
+      # 2x1g outdisks + headroom.
+      - /tmp:rw,exec,nosuid,size=16g
+    networks:
+      - backend

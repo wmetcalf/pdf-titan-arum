@@ -34,3 +34,6 @@ output/
 # AI assistant config
 CLAUDE.md
 AGENTS.md
+
+.venv/
+.superpowers/

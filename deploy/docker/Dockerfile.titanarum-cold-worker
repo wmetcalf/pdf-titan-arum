@@ -1,0 +1,22 @@
+ARG BASE_IMAGE=pdf-titan-arum-base:dev
+FROM ${BASE_IMAGE}
+USER root
+# Install blastbox (lean core) from the index first, pinned to 0.1.17 (the
+# deployed toolz2 wheel) so the whole titanarum-bb stack — this worker AND the
+# host image (Dockerfile.titanarum-host) — runs one blastbox version. Then the
+# titanarum engine WITH its declared deps (jsonschema/click/structlog) — pip
+# reuses the already-satisfied blastbox (0.1.17 falls within its
+# >=0.1.15,<0.2 dependency range) rather than re-resolving it.
+COPY pyproject.toml README.md /src/titanarum/
+COPY titanarum /src/titanarum/titanarum
+RUN /opt/titanarum/bin/pip install --no-cache-dir "blastbox==0.1.17" \
+ && /opt/titanarum/bin/pip install --no-cache-dir /src/titanarum \
+ && rm -rf /src \
+ && /opt/titanarum/bin/python -c "import blastbox.worker.cold, titanarum.engine; print('cold ok')"
+ENV BLASTBOX_ENGINE=titanarum.engine:TitanArumEngine \
+    TITANARUM_WORKER_JAR=/app/pdf-titan-arum.jar \
+    TITANARUM_JAVA_LIBRARY_PATH=/app \
+    TITANARUM_SANDBOX=container
+# No AOT cache in the MVP image; _java_worker_argv skips -XX:AOTCache when the file is absent.
+USER 10001:10001
+ENTRYPOINT ["/opt/titanarum/bin/python", "-m", "blastbox.worker.cold"]

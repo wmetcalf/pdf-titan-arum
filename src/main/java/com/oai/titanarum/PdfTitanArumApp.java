@@ -1,7 +1,9 @@
 package com.oai.titanarum;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import org.apache.pdfbox.Loader;
@@ -24,6 +26,7 @@ import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.PDResources;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.common.PDStream;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecification;
 import org.apache.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile;
 import org.apache.pdfbox.pdmodel.graphics.PDXObject;
@@ -58,15 +61,6 @@ import com.google.i18n.phonenumbers.geocoding.PhoneNumberOfflineGeocoder;
 import org.nibor.autolink.LinkExtractor;
 import org.nibor.autolink.LinkSpan;
 import org.nibor.autolink.LinkType;
-import com.google.zxing.BarcodeFormat;
-import com.google.zxing.BinaryBitmap;
-import com.google.zxing.DecodeHintType;
-import com.google.zxing.NotFoundException;
-import com.google.zxing.Result;
-import com.google.zxing.ResultPoint;
-import com.google.zxing.common.HybridBinarizer;
-import com.google.zxing.multi.qrcode.QRCodeMultiReader;
-import com.google.zxing.client.j2se.BufferedImageLuminanceSource;
 
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -82,6 +76,7 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -145,16 +140,77 @@ public class PdfTitanArumApp implements Callable<Integer> {
     private static final long MAX_EMBEDDED_FILE_BYTES = 100L * 1024 * 1024; // 100 MB
     private static final int MAX_SCRIPT_BYTES         = 10 * 1024 * 1024;   // 10 MB
     private static final int MAX_XFA_BYTES            = 10 * 1024 * 1024;   // 10 MB
+    // A FlateDecode cross-reference stream is a decompression-bomb vector (zlib amplifies ~1000:1);
+    // cap its inflate like the XObject/embedded-file paths. Real xref streams are small (KB-few MB
+    // even for huge PDFs), so 64 MB is generous while stopping a GB expansion.
+    private static final long MAX_XREF_STREAM_BYTES   = 64L * 1024 * 1024;  // 64 MB
     private static final int MAX_PAGES_ALL            = 1000;
     private static final int MAX_UNIQUE_PATH_ATTEMPTS = 10_000;
     private static final int MAX_NAME_TREE_DEPTH      = 50;
     private static final int MAX_DEREF_HOPS           = 50;
+
+    // I1 (warm-plan.md): per-document QR-scan / image-extraction budgets. scanQrCodes()
+    // forks a ZXingReader subprocess per call and is invoked once per screenshot, per
+    // resource image, and per drawn image with no document-level cap; a QR-flood PDF
+    // (thousands of >=40x40 images) is a fork-pressure / wall-clock DoS, more so once a
+    // warm JVM reuses the process across jobs. Configurable via env for ops tuning;
+    // overridable via setters (below) so tests can exercise the gate without needing
+    // hundreds of images or a slow subprocess fork loop.
+    private int maxQrScans = envInt("TITANARUM_MAX_QR_SCANS", 256);
+    private long qrTotalBudgetMs = envLong("TITANARUM_QR_TOTAL_BUDGET_MS", 30_000L);
+    private int maxImagesExtracted = envInt("TITANARUM_MAX_IMAGES_EXTRACTED", 2000);
+
+    public void setMaxQrScans(int v) { this.maxQrScans = v; }
+    public void setQrTotalBudgetMs(long v) { this.qrTotalBudgetMs = v; }
+    public void setMaxImagesExtracted(int v) { this.maxImagesExtracted = v; }
+
+    /** Number of QR scans actually performed for the current/last document (test visibility). */
+    public int getQrScanCount() { return qrScanCount; }
+
+    // Per-document budget state; reset at the top of callWith() so a warm/reused JVM never
+    // carries counters over from a previous job (see PdfTitanArumApp#callWith).
+    private int qrScanCount;
+    private long qrScanBudgetStartNanos;
+    private boolean qrScanBudgetExceeded;
+    private int imagesExtractedCount;
+    private boolean imagesExtractedCapExceeded;
+
+    private static int envInt(String name, int def) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) return def;
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
+
+    private static long envLong(String name, long def) {
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) return def;
+        try {
+            return Long.parseLong(v.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
+    }
 
     @Option(names = {"-i", "--input"}, required = false, description = "Input PDF")
     private Path inputPdf;
 
     @Option(names = {"-o", "--output"}, required = false, description = "Output directory")
     private Path outputDir;
+
+    @Option(names = {"--run"},
+            description = "Worker mode: run a single job from the file-IPC control loop under <scratch>")
+    private Path runScratch;
+
+    @Option(names = {"--appcds-warmup"},
+            description = "AOT-cache warmup mode: run every PDF in <dir> through the analysis "
+                    + "pipeline once each (QR on, OCR off) to force class-load+link of the "
+                    + "PDFBox/JBIG2/JPEG2000/ZXing/phone/autolink parser path for AOT-cache "
+                    + "recording, then exit 0. Used only by the AOT-cache record build step, never at runtime.")
+    private Path appcdsWarmupDir;
 
     @Option(names = {"--dpi"}, defaultValue = "150", description = "Render DPI for screenshots")
     private float dpi;
@@ -233,6 +289,8 @@ private boolean skipQrScan;
             .setSerializationInclusion(JsonInclude.Include.NON_NULL)
             .enable(SerializationFeature.INDENT_OUTPUT);
 
+    private final ZXingReaderScanner qrScanner = new ZXingReaderScanner();
+
     public static void main(String[] args) {
         CommandLine cmd = new CommandLine(new PdfTitanArumApp());
         try {
@@ -249,6 +307,12 @@ private boolean skipQrScan;
 
     @Override
     public Integer call() throws Exception {
+        if (runScratch != null) {
+            return runWorker(runScratch);
+        }
+        if (appcdsWarmupDir != null) {
+            return runAppcdsWarmup(appcdsWarmupDir);
+        }
         if (inputPdf == null) {
             System.err.println("ERROR: -i / --input is required");
             return 1;
@@ -310,6 +374,14 @@ private boolean skipQrScan;
         this.addLinkAnnotations = addLinkAnnotations;
         this.modifiedPdfOutput = modifiedPdfOutput;
         this.password = password;
+        // I1: reset per-document QR-scan / image-extraction budget counters. Required even
+        // though today's --run mode is one-job-per-process, because a warm/reused JVM must
+        // never let one document's budget bleed into the next.
+        this.qrScanCount = 0;
+        this.qrScanBudgetStartNanos = System.nanoTime();
+        this.qrScanBudgetExceeded = false;
+        this.imagesExtractedCount = 0;
+        this.imagesExtractedCapExceeded = false;
         outputDir = this.outputDir;
         Files.createDirectories(outputDir);
         Thread.interrupted(); // clear any stale interrupt from a previous timed-out job on this thread
@@ -320,6 +392,76 @@ private boolean skipQrScan;
             : null;
         if (_watchdog != null)
             _watchdog.schedule(() -> _processingThread.interrupt(), timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS);
+
+        // I2 (warm-plan.md): JVM hard-halt watchdog. Cooperative interruption above does not
+        // cover a hang inside a single native JBIG2/JPEG2000 decode, a ZXingReader waitFor that
+        // ignores interrupt, or catastrophic regex backtracking. Cold mode has the Python
+        // subprocess.run(timeout=) SIGKILL backstop; a persistent/warm JVM has no equivalent
+        // in-JVM hard bound without this. Scheduled strictly after the cooperative deadline
+        // (timeoutSeconds + TITANARUM_HARD_TIMEOUT_MS); if it fires the job is unrecoverably
+        // hung, so best-effort flush whatever report state exists, then halt(3) -- NOT
+        // System.exit, which runs shutdown hooks that may themselves hang. A warm JVM is
+        // one-job-disposable, so a hard self-halt is safe: the pool just reaps and boots a
+        // fresh slot. Only armed when a cooperative deadline is configured (mirrors _watchdog
+        // above) -- timeoutSeconds<=0 means "no limit" was requested for both.
+        final java.util.concurrent.atomic.AtomicReference<AnalysisReport> _reportRef =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        // Set once the job has finished (any exit path, in finally before shutdownNow). The
+        // hard-halt task checks this first: shutdownNow() cannot stop a task that has ALREADY
+        // started, so without this guard a job completing right at the hard deadline would be
+        // flushed as timedOut=true and halt(3)'d despite having written a complete report. The
+        // flag is only ever set on completion, so a genuine hang (which never reaches finally)
+        // still halts -- the guard can prevent a false halt but never miss a real one.
+        final java.util.concurrent.atomic.AtomicBoolean _analysisComplete =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+        // Clamp: a misconfigured/non-positive TITANARUM_HARD_TIMEOUT_MS must never collapse
+        // the hard deadline onto (or before) the cooperative one -- the hard halt must always
+        // fire strictly after the cooperative timeout has had a chance to complete gracefully.
+        final long _hardTimeoutMs = Math.max(1L, envLong("TITANARUM_HARD_TIMEOUT_MS", 15_000L));
+        final java.util.concurrent.ScheduledExecutorService _hardWatchdog = timeoutSeconds > 0
+            ? java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> { Thread t = new Thread(r, "hard-halt-watchdog"); t.setDaemon(true); return t; })
+            : null;
+        if (_hardWatchdog != null) {
+            long hardDelayMs = timeoutSeconds * 1000L + _hardTimeoutMs;
+            _hardWatchdog.schedule(() -> {
+                // If the job already finished (report written, finally about to/just ran), do
+                // NOT flush-over-and-halt a completed job -- shutdownNow() may not have stopped
+                // this already-started task in time.
+                if (_analysisComplete.get()) {
+                    return;
+                }
+                // I2 fix: the halt(3) below is this watchdog's one guarantee, so it must never
+                // be gated on the partial-report flush completing. If mapper.writeValue blocks
+                // (e.g. a hung filesystem) a try/finally around it alone would never reach the
+                // finally clause and halt() would never fire. Instead, run the flush on its own
+                // daemon thread, join it with a short bound, then halt unconditionally --
+                // a hung write can delay the flush but can never prevent the halt.
+                Thread flush = new Thread(() -> {
+                    try {
+                        AnalysisReport partial = _reportRef.get();
+                        if (partial != null) {
+                            partial.timedOut = true;
+                            if (partial.timedOutAfterMs == null) {
+                                partial.timedOutAfterMs = (System.nanoTime() - _startNanos) / 1_000_000;
+                            }
+                            mapper.writeValue(this.outputDir.resolve("report.json").toFile(), partial);
+                        }
+                    } catch (Throwable ignored) {
+                        // Best-effort only -- must still halt below even if the flush itself fails
+                        // (e.g. disk full, or the report was mid-mutation on the hung thread).
+                    }
+                }, "titanarum-hard-flush");
+                flush.setDaemon(true);
+                flush.start();
+                try {
+                    flush.join(1500L);
+                } catch (InterruptedException ignored) {
+                }
+                Runtime.getRuntime().halt(3);
+            }, hardDelayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+
+        try {
         Path screenshotsDir = outputDir.resolve("screenshots");
         Path renderedImagesDir = outputDir.resolve("images_rendered");
         Path resourceImagesDir = outputDir.resolve("images_resources");
@@ -340,6 +482,7 @@ private boolean skipQrScan;
         Files.createDirectories(urlCropsDir);
 
         AnalysisReport report = new AnalysisReport();
+        _reportRef.set(report); // I2: hard watchdog flushes whatever this holds if it ever fires
         report.inputPdf = originalName;
         report.outputDirectory = outputDir.toAbsolutePath().toString();
         report.generatedAt = Instant.now().toString();
@@ -347,6 +490,22 @@ private boolean skipQrScan;
         report.addLinkAnnotations = addLinkAnnotations;
         report.documentSha256 = sha256(pdfBytes);
         report.fileMagic = detectFileMagic(pdfBytes);
+
+        // I2 TDD-only seam: simulates a hang that ignores cooperative Thread.interrupt()
+        // entirely (e.g. a wedged native codec decode, or a ZXingReader waitFor swallowing
+        // InterruptedException) so HardWatchdogTest can exercise the halt(3) path end-to-end
+        // without real native-decoder plumbing. Off by default; gated on an env var no
+        // operator sets intentionally, so this is inert in production.
+        String _hangSpin = System.getenv("TITANARUM_TEST_HANG_SPIN");
+        if (_hangSpin != null && !_hangSpin.isBlank()) {
+            while (true) {
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException ignored) {
+                    // Deliberately swallowed: simulates an interrupt-proof hang.
+                }
+            }
+        }
 
         // Acrobat-style header search: find %PDF within first 1024 bytes.
         // If found at offset > 0, slice the array so PDFBox parses from the real header.
@@ -750,7 +909,6 @@ private boolean skipQrScan;
             report.timedOut = true;
             report.timedOutAfterMs = (System.nanoTime() - _startNanos) / 1_000_000;
         }
-        if (_watchdog != null) _watchdog.shutdownNow();
 
         List<Path> hashTargets = new ArrayList<>();
         addPaths(hashTargets, report.screenshots);
@@ -796,6 +954,22 @@ private boolean skipQrScan;
 
         // Structural anomaly detection
         List<StructuralAnomalyHit> sah = checkStructuralAnomalies(originalPdfBytes, pdfHeaderOffset, pdfBytes);
+        // I1: surface budget/cap trips as structural anomalies so downstream consumers can
+        // tell a report is incomplete because of a QR-flood / image-flood PDF.
+        if (qrScanBudgetExceeded) {
+            StructuralAnomalyHit h = new StructuralAnomalyHit();
+            h.type = "qr_scan_budget_exceeded";
+            h.detail = "QR scan budget exceeded (" + qrScanCount + "/" + maxQrScans
+                + " scans, " + qrTotalBudgetMs + "ms budget); further QR scans were skipped";
+            sah.add(h);
+        }
+        if (imagesExtractedCapExceeded) {
+            StructuralAnomalyHit h = new StructuralAnomalyHit();
+            h.type = "images_extracted_cap_exceeded";
+            h.detail = "Image extraction cap exceeded (" + imagesExtractedCount + "/" + maxImagesExtracted
+                + "); further images were skipped";
+            sah.add(h);
+        }
         if (!sah.isEmpty()) report.structuralAnomalies = sah;
 
         // Metadata spoofing indicators
@@ -809,6 +983,18 @@ private boolean skipQrScan;
         profTick(_pt, "report.json write");
         System.out.println("Wrote report: " + reportPath.toAbsolutePath());
         return report;
+        } finally {
+            // I2: cancel both watchdogs on every exit path -- the normal return above, any of
+            // the early returns for a non-PDF/encrypted/wrong-password/parse-error input, or an
+            // exception propagating out of this method. An uncancelled hard-halt watchdog left
+            // ticking after this job finishes would otherwise halt() the JVM out from under a
+            // *later* job on a warm/reused process.
+            // Mark complete BEFORE shutdownNow so a hard-halt task that is starting concurrently
+            // sees the flag and skips its flush+halt (shutdownNow can't stop an already-running one).
+            _analysisComplete.set(true);
+            if (_watchdog != null) _watchdog.shutdownNow();
+            if (_hardWatchdog != null) _hardWatchdog.shutdownNow();
+        }
     }
 
     /**
@@ -2174,6 +2360,11 @@ for (int pageNum : pagesToProcess) {
         continue; // exact duplicate page, skip screenshot
     }
 
+    // I1: per-document image-extraction cap (drawn + resource + rendered/screenshot images)
+    if (!reserveImageExtractionSlot()) {
+        continue; // extraction cap reached; skip remaining screenshots
+    }
+
     // QR scan on the full-resolution render before downscaling (better detection)
     List<QrCodeHit> qrCodes = null;
     if (!skipQrScan) {
@@ -2219,12 +2410,28 @@ for (int pageNum : pagesToProcess) {
     private String saveOriginalXObjectBytes(PDImage pdImage, Path outputDir, String baseName) {
         if (!(pdImage instanceof PDImageXObject xobj)) return null;
         String suffix = xobj.getSuffix();
-        if (!"jpg".equals(suffix) && !"jp2".equals(suffix)) return null;
+        // PDFBox 3.0.6 PDImageXObject.getSuffix() yields "jpg" (DCT/JPEG), "jpx" (JPX/JPEG2000),
+        // and "jb2" (JBIG2). Save the original encoded bytes for these so the hasher sees the true
+        // stream: rosetta decodes JPEG (fleet-exact), and throws UNSUPPORTED_FORMAT on JPX/JB2 --
+        // which routes decodeForHash to the PDFBox-decoded fallback image (the JP2/JBIG2 contract).
+        // ("jp2" never matches getSuffix() in PDFBox 3.x; the value is "jpx".)
+        if (!"jpg".equals(suffix) && !"jpx".equals(suffix) && !"jb2".equals(suffix)) return null;
         COSBase cosBase = xobj.getCOSObject();
         if (!(cosBase instanceof COSStream cosStream)) return null;
         try {
             Path file = uniquePath(outputDir, baseName + "." + suffix);
-            try (InputStream is = cosStream.createInputStream();
+            // We want the ORIGINAL encoded codestream (the real ffd8 JPEG / JP2 codestream / JBIG2),
+            // not PDFBox's decoded raster: the hasher feeds it to the rosetta decode port so JPEG
+            // hashes via turbojpeg (PIL-exact, fleet-uniform) and JP2/JBIG2 cleanly throw -> PDFBox
+            // fallback. But an image codec may be legally wrapped in transport filters (e.g.
+            // /Filter [/ASCII85Decode /DCTDecode]); createRawInputStream() would save the wrapper
+            // bytes (ASCII85 text), which rosetta can't decode -> the perceptual hash silently
+            // drifts off fleet parity. So decode the wrapper filters but STOP at the image codec,
+            // yielding the true codestream regardless of how it was wrapped.
+            List<String> imageCodecFilters = List.of(
+                    COSName.DCT_DECODE.getName(), COSName.DCT_DECODE_ABBREVIATION.getName(),
+                    COSName.JPX_DECODE.getName(), COSName.JBIG2_DECODE.getName());
+            try (InputStream is = new PDStream(cosStream).createInputStream(imageCodecFilters);
                  OutputStream os = Files.newOutputStream(file)) {
                 // C2: use bounded copy — a decompression bomb in an XObject stream
                 // could otherwise expand to gigabytes before hitting the filesystem.
@@ -2283,6 +2490,10 @@ for (int pageNum : pagesToProcess) {
             }
             if (xObject instanceof PDImageXObject imageXObject) {
                 seen.add(cos);
+                // I1: per-document image-extraction cap; skip decode entirely once exhausted.
+                if (!reserveImageExtractionSlot()) {
+                    continue;
+                }
                 BufferedImage image = imageXObject.getImage();
                 Path file = uniquePath(outputDir, String.format(Locale.ROOT, "resource-page-%04d-%s.png", pageNumber, name.getName()));
                 ImageIO.write(image, "PNG", file.toFile());
@@ -2360,6 +2571,11 @@ for (int pageNum : pagesToProcess) {
                 if (start == null || end == null) {
                     continue;
                 }
+                // Clamp the range to the document: an absurd bound (e.g. "1-2147483647") would
+                // otherwise materialize billions of entries here BEFORE the per-page validity
+                // filter below, exhausting memory. Out-of-range refs collapse to the doc edge.
+                start = Math.max(1, Math.min(start, pageCount));
+                end = Math.max(1, Math.min(end, pageCount));
                 int step = start <= end ? 1 : -1;
                 for (int i = start; ; i += step) {
                     resolved.add(i);
@@ -2878,193 +3094,92 @@ for (int pageNum : pagesToProcess) {
         return String.valueOf(base);
     }
 
+    /**
+     * I1: reserves one slot in the per-document QR-scan budget. Returns false once either
+     * {@code maxQrScans} scans have been performed or {@code qrTotalBudgetMs} wall-clock
+     * milliseconds have elapsed since the document started processing; the first time either
+     * limit trips, {@code qrScanBudgetExceeded} is latched so callWith() can record a single
+     * {@code qr_scan_budget_exceeded} structuralAnomalies entry.
+     */
+    private boolean reserveQrScanSlot() {
+        if (qrScanBudgetExceeded) {
+            return false;
+        }
+        if (qrScanCount >= maxQrScans) {
+            qrScanBudgetExceeded = true;
+            return false;
+        }
+        long elapsedMs = (System.nanoTime() - qrScanBudgetStartNanos) / 1_000_000L;
+        if (elapsedMs >= qrTotalBudgetMs) {
+            qrScanBudgetExceeded = true;
+            return false;
+        }
+        qrScanCount++;
+        return true;
+    }
+
+    /**
+     * I1: reserves one slot in the per-document image-extraction budget (drawn + resource +
+     * rendered/screenshot images combined). Extraction itself was previously unbounded;
+     * once {@code maxImagesExtracted} is reached, further images are skipped and
+     * {@code imagesExtractedCapExceeded} is latched for a single anomaly entry.
+     */
+    private boolean reserveImageExtractionSlot() {
+        if (imagesExtractedCount >= maxImagesExtracted) {
+            imagesExtractedCapExceeded = true;
+            return false;
+        }
+        imagesExtractedCount++;
+        return true;
+    }
+
     private List<QrCodeHit> scanQrCodes(BufferedImage input) {
         List<QrCodeHit> results = new ArrayList<>();
         if (input == null || input.getWidth() < 40 || input.getHeight() < 40) {
             return results;
         }
-        BufferedImage image = input;
-        int maxDim = Math.max(image.getWidth(), image.getHeight());
-        if (maxDim > 1200) {
-            double scale = 1200.0 / maxDim;
-            int w = Math.max(1, (int) Math.round(image.getWidth() * scale));
-            int h = Math.max(1, (int) Math.round(image.getHeight() * scale));
-            BufferedImage scaled = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
-            Graphics2D g = scaled.createGraphics();
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.drawImage(image, 0, 0, w, h, null);
-            g.dispose();
-            image = scaled;
+        if (!reserveQrScanSlot()) {
+            return results; // per-document QR-scan budget exhausted; anomaly recorded in callWith
         }
+        File tmp = null;
         try {
-            BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(new BufferedImageLuminanceSource(image)));
-            Map<DecodeHintType, Object> hints = new HashMap<>();
-            hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
-            Result[] decoded = new QRCodeMultiReader().decodeMultiple(bitmap, hints);
-            if (decoded != null) {
-                for (Result result : decoded) {
-                    QrCodeHit hit = new QrCodeHit();
-                    hit.text = result.getText();
-                    hit.format = result.getBarcodeFormat() == null ? null : result.getBarcodeFormat().toString();
-                    if (result.getResultPoints() != null && result.getResultPoints().length > 0) {
-                        hit.points = new ArrayList<>();
-                        for (ResultPoint point : result.getResultPoints()) {
-                            if (point == null) continue;
-                            QrPoint qp = new QrPoint();
-                            qp.x = point.getX();
-                            qp.y = point.getY();
-                            hit.points.add(qp);
-                        }
-                    }
-                    results.add(hit);
-                }
+            tmp = File.createTempFile("titanarum-qr", ".png");
+            ImageIO.write(input, "png", tmp);
+            for (ZXingReaderScanner.QrResult r : qrScanner.scan(tmp.toPath())) {
+                QrCodeHit hit = new QrCodeHit();
+                hit.text = r.text();
+                hit.format = r.format();
+                hit.error = r.error();
+                hit.points = parseQrPosition(r.position());
+                results.add(hit);
             }
-        } catch (NotFoundException ignored) {
-            // no QR codes found
         } catch (Exception e) {
             QrCodeHit hit = new QrCodeHit();
             hit.error = e.getMessage();
             results.add(hit);
+        } finally {
+            if (tmp != null) tmp.delete();
         }
         return results;
     }
 
-    private static double sinc(double x) {
-        if (x == 0.0) return 1.0;
-        double px = Math.PI * x;
-        return Math.sin(px) / px;
+    private static List<QrPoint> parseQrPosition(String position) {
+        if (position == null || position.isBlank()) return null;
+        List<QrPoint> pts = new ArrayList<>();
+        for (String tok : position.trim().split("\\s+")) {
+            int xi = tok.indexOf('x');
+            if (xi <= 0) continue;
+            try {
+                QrPoint qp = new QrPoint();
+                qp.x = (float) Double.parseDouble(tok.substring(0, xi));
+                qp.y = (float) Double.parseDouble(tok.substring(xi + 1));
+                pts.add(qp);
+            } catch (NumberFormatException ignore) {
+                // skip a malformed coordinate token
+            }
+        }
+        return pts.isEmpty() ? null : pts;
     }
-
-    private static double lanczosKernel(double x) {
-        double ax = Math.abs(x);
-        if (ax < 3.0) return sinc(ax) * sinc(ax / 3.0);
-        return 0.0;
-    }
-
-    private static double[][] lanczosResize(double[][] src, int srcW, int srcH, int dstW, int dstH) {
-        // Precompute horizontal kernel weights once (independent of source row).
-        // Weights are normalized so no per-row wSum division is needed in the inner loop.
-        double scaleX = (double) srcW / dstW;
-        double filterScaleX = Math.max(1.0, scaleX);
-        double supportX = 3.0 * filterScaleX;
-        int[]    hOff = new int[dstW];
-        double[][] hW = new double[dstW][];
-        for (int xd = 0; xd < dstW; xd++) {
-            double center = (xd + 0.5) * scaleX;
-            int start = Math.max(0,        (int) Math.ceil(center - supportX));
-            int end   = Math.min(srcW - 1, (int) Math.floor(center + supportX));
-            int len = end - start + 1;
-            hOff[xd] = start;
-            hW[xd] = new double[len];
-            double wSum = 0;
-            for (int i = 0; i < len; i++) {
-                double w = lanczosKernel((start + i + 0.5 - center) / filterScaleX);
-                hW[xd][i] = w;
-                wSum += w;
-            }
-            if (wSum != 0) for (int i = 0; i < len; i++) hW[xd][i] /= wSum;
-        }
-        // Horizontal pass: pure MAC loop, no trig, no per-sample clamping
-        double[][] hpass = new double[srcH][dstW];
-        for (int y = 0; y < srcH; y++) {
-            double[] row = src[y];
-            double[] out = hpass[y];
-            for (int xd = 0; xd < dstW; xd++) {
-                double[] w = hW[xd];
-                int off = hOff[xd];
-                double v = 0;
-                for (int i = 0; i < w.length; i++) v += w[i] * row[off + i];
-                out[xd] = Math.max(0.0, Math.min(255.0, v));
-            }
-        }
-        // Precompute vertical kernel weights
-        double scaleY = (double) srcH / dstH;
-        double filterScaleY = Math.max(1.0, scaleY);
-        double supportY = 3.0 * filterScaleY;
-        int[]    vOff = new int[dstH];
-        double[][] vW = new double[dstH][];
-        for (int yd = 0; yd < dstH; yd++) {
-            double center = (yd + 0.5) * scaleY;
-            int start = Math.max(0,        (int) Math.ceil(center - supportY));
-            int end   = Math.min(srcH - 1, (int) Math.floor(center + supportY));
-            int len = end - start + 1;
-            vOff[yd] = start;
-            vW[yd] = new double[len];
-            double wSum = 0;
-            for (int i = 0; i < len; i++) {
-                double w = lanczosKernel((start + i + 0.5 - center) / filterScaleY);
-                vW[yd][i] = w;
-                wSum += w;
-            }
-            if (wSum != 0) for (int i = 0; i < len; i++) vW[yd][i] /= wSum;
-        }
-        // Vertical pass: pure MAC loop
-        double[][] result = new double[dstH][dstW];
-        for (int yd = 0; yd < dstH; yd++) {
-            double[] w = vW[yd];
-            int off = vOff[yd];
-            double[] out = result[yd];
-            for (int xd = 0; xd < dstW; xd++) {
-                double v = 0;
-                for (int i = 0; i < w.length; i++) v += w[i] * hpass[off + i][xd];
-                out[xd] = Math.max(0.0, Math.min(255.0, v));
-            }
-        }
-        return result;
-    }
-
-    private static void fft(double[] re, double[] im) {
-        int N = re.length;
-        int j = 0;
-        for (int i = 1; i < N; i++) {
-            int bit = N >> 1;
-            for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-            j ^= bit;
-            if (i < j) {
-                double t = re[i]; re[i] = re[j]; re[j] = t;
-                t = im[i]; im[i] = im[j]; im[j] = t;
-            }
-        }
-        for (int len = 2; len <= N; len <<= 1) {
-            double ang = -2 * Math.PI / len;
-            double wRe = Math.cos(ang), wIm = Math.sin(ang);
-            for (int i = 0; i < N; i += len) {
-                double curRe = 1, curIm = 0;
-                for (int k = 0; k < len / 2; k++) {
-                    double uRe = re[i + k], uIm = im[i + k];
-                    double vRe = re[i + k + len/2] * curRe - im[i + k + len/2] * curIm;
-                    double vIm = re[i + k + len/2] * curIm + im[i + k + len/2] * curRe;
-                    re[i + k] = uRe + vRe; im[i + k] = uIm + vIm;
-                    re[i + k + len/2] = uRe - vRe; im[i + k + len/2] = uIm - vIm;
-                    double newCurRe = curRe * wRe - curIm * wIm;
-                    curIm = curRe * wIm + curIm * wRe;
-                    curRe = newCurRe;
-                }
-            }
-        }
-    }
-
-    private static double[] dct1d(double[] x) {
-        int N = x.length;
-        double[] re = new double[N];
-        double[] im = new double[N];
-        for (int n = 0; n < N / 2; n++) {
-            re[n]       = x[2 * n];
-            re[N - 1 - n] = x[2 * n + 1];
-        }
-        if ((N & 1) == 1) re[N / 2] = x[N - 1];
-        fft(re, im);
-        double[] y = new double[N];
-        for (int k = 0; k < N; k++) {
-            double angle = -Math.PI * k / (2.0 * N);
-            y[k] = 2.0 * (re[k] * Math.cos(angle) - im[k] * Math.sin(angle));
-        }
-        return y;
-    }
-
-    // Pre-scale cap: images larger than this are fast-downscaled by Java2D before
-    // our pure-Java Lanczos kernel runs, avoiding O(srcW*srcH*kernelSupport) blowup.
-    private static final int PHASH_PRESIZE = 256;
 
     // Screenshot pages are scaled to this width (pixels) to simulate a typical laptop
     // viewport in Adobe Reader (e.g. 1200px ≈ a 1920×1080 laptop at "Fit Width").
@@ -3072,144 +3187,19 @@ for (int pageNum : pagesToProcess) {
     private static final int SCREENSHOT_TARGET_WIDTH = 1200;
 
     private static String computePhash(BufferedImage img) {
-        // Fast pre-downscale for large images using Java2D (C-optimized area averaging)
-        if (img.getWidth() > PHASH_PRESIZE || img.getHeight() > PHASH_PRESIZE) {
-            double scale = Math.min((double) PHASH_PRESIZE / img.getWidth(),
-                                    (double) PHASH_PRESIZE / img.getHeight());
-            int pw = Math.max(32, (int) (img.getWidth()  * scale));
-            int ph = Math.max(32, (int) (img.getHeight() * scale));
-            BufferedImage pre = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_RGB);
-            java.awt.Graphics2D g = pre.createGraphics();
-            g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
-                               java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            g.drawImage(img, 0, 0, pw, ph, null);
-            g.dispose();
-            img = pre;
-        }
-        int srcW = img.getWidth();
-        int srcH = img.getHeight();
-        double[][] gray = new double[srcH][srcW];
-        for (int y = 0; y < srcH; y++) {
-            for (int x = 0; x < srcW; x++) {
-                int rgb = img.getRGB(x, y);
-                int r = (rgb >> 16) & 0xFF;
-                int g = (rgb >> 8)  & 0xFF;
-                int b =  rgb        & 0xFF;
-                gray[y][x] = (r * 19595 + g * 38470 + b * 7471 + 32768) >> 16;
-            }
-        }
-        double[][] resized = lanczosResize(gray, srcW, srcH, 32, 32);
-        // Round to integer pixel values, matching PIL's integer-pixel storage
-        for (int y = 0; y < 32; y++)
-            for (int x = 0; x < 32; x++)
-                resized[y][x] = Math.round(resized[y][x]);
-        double[][] tmp = new double[32][32];
-        for (int col = 0; col < 32; col++) {
-            double[] column = new double[32];
-            for (int row = 0; row < 32; row++) column[row] = resized[row][col];
-            double[] dctCol = dct1d(column);
-            for (int row = 0; row < 32; row++) tmp[row][col] = dctCol[row];
-        }
-        double[][] dct = new double[32][32];
-        for (int row = 0; row < 32; row++) dct[row] = dct1d(tmp[row]);
-        double[] lowfreq = new double[64];
-        for (int r = 0; r < 8; r++)
-            for (int c = 0; c < 8; c++)
-                lowfreq[r * 8 + c] = dct[r][c];
-        double[] sorted = lowfreq.clone();
-        Arrays.sort(sorted);
-        double median = (sorted[31] + sorted[32]) / 2.0;
-        StringBuilder sb = new StringBuilder(16);
-        for (int byteIdx = 0; byteIdx < 8; byteIdx++) {
-            int bite = 0;
-            for (int bit = 0; bit < 8; bit++) {
-                if (lowfreq[byteIdx * 8 + bit] > median) bite |= (0x80 >> bit);
-            }
-            sb.append(String.format("%02x", bite));
-        }
-        return sb.toString();
+        // pHash via the shared rosetta-squint-hash port (byte-exact with Python imagehash 4.3.2 /
+        // ClippyShot). hash_size=8 (=> 16 hex); highfreqFactor defaults to 4 in the 2-arg overload.
+        return io.github.wmetcalf.rosettasquint.hash.PHash.compute(img, 8).toString();
     }
 
-    private static final int COLOR_HASH_BINBITS = 4;  // 14 bins × 4 bits = 56 bits = 14 hex chars
-
     /**
-     * Color hash with bit-level compatibility with Python imagehash.colorhash(img, binbits=4).
-     *
-     * 14 bins: 1 black fraction + 1 gray fraction + 6 faint-color hue bins + 6 bright-color hue bins.
-     * Each bin value (0 to 2^binbits-1) encoded with the exact same quirky bit formula as imagehash.
-     * PIL 'L' grayscale and PIL HSV conversion replicated to match Pillow's C implementation.
+     * Color hash delegating to the shared rosetta-squint-hash port (byte-exact with Python
+     * imagehash.colorhash), binbits=4 (=> 14 hex chars).
      */
-    private static String computeColorHash(BufferedImage src) {
-        // Normalize to TYPE_INT_RGB to handle alpha/unusual color models
-        BufferedImage img = src;
-        if (src.getType() != BufferedImage.TYPE_INT_RGB) {
-            img = new BufferedImage(src.getWidth(), src.getHeight(), BufferedImage.TYPE_INT_RGB);
-            java.awt.Graphics2D g2 = img.createGraphics();
-            g2.drawImage(src, 0, 0, null);
-            g2.dispose();
-        }
-        int width = img.getWidth(), height = img.getHeight(), n = width * height;
-        int blackCount = 0, grayNotBlackCount = 0, colorfulCount = 0;
-        int[] faintBins  = new int[6];
-        int[] brightBins = new int[6];
-        float[] hsbBuf = new float[3];
-
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int rgb = img.getRGB(x, y);
-                int r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
-
-                // PIL 'L' grayscale — matches Pillow's fixed-point C formula exactly
-                int intensity = (r * 19595 + g * 38470 + b * 7471 + 32768) >> 16;
-
-                // PIL HSV — Color.RGBtoHSB uses the same algorithm as Pillow's rgb2hsv_row
-                java.awt.Color.RGBtoHSB(r, g, b, hsbBuf);
-                int hVal = Math.round(hsbBuf[0] * 255.0f);  // roundf, not truncation
-                int sVal = Math.round(hsbBuf[1] * 255.0f);
-
-                // Thresholds: 256//8=32, 256//3=85, 256*2//3=170 (Python integer division)
-                if (intensity < 32) {
-                    blackCount++;
-                } else if (sVal < 85) {
-                    grayNotBlackCount++;
-                } else {
-                    colorfulCount++;
-                    int hueBin = Math.min(5, (int)(hVal * 6.0 / 255.0));
-                    if      (sVal < 170) faintBins[hueBin]++;
-                    else if (sVal > 170) brightBins[hueBin]++;
-                    // sVal == 170: colorful but in neither histogram (matches Python's strict >)
-                }
-            }
-        }
-
-        int binbits = COLOR_HASH_BINBITS, maxVal = 1 << binbits;
-        int c = Math.max(1, colorfulCount);
-        int[] values = new int[14];
-        values[0] = Math.min(maxVal - 1, (int)((double) blackCount       / n * maxVal));
-        values[1] = Math.min(maxVal - 1, (int)((double) grayNotBlackCount / n * maxVal));
-        for (int i = 0; i < 6; i++) {
-            values[2 + i] = Math.min(maxVal - 1, (int)((double) faintBins[i]  * maxVal / c));
-            values[8 + i] = Math.min(maxVal - 1, (int)((double) brightBins[i] * maxVal / c));
-        }
-
-        // Bit encoding — replicates Python exactly:
-        // [v // (2**(binbits-i-1)) % 2**(binbits-i) > 0 for i in range(binbits)]
-        // Note: this is NOT standard binary (e.g. value 4 with binbits=4 encodes as 0x6, not 0x4)
-        int hexChars = (14 * binbits + 3) / 4;
-        StringBuilder sb = new StringBuilder(hexChars);
-        int bitBuf = 0, bitsInBuf = 0;
-        for (int val : values) {
-            for (int i = 0; i < binbits; i++) {
-                int bit = (val / (1 << (binbits - i - 1))) % (1 << (binbits - i)) > 0 ? 1 : 0;
-                bitBuf = (bitBuf << 1) | bit;
-                if (++bitsInBuf == 4) {
-                    sb.append(Integer.toHexString(bitBuf));
-                    bitBuf = 0; bitsInBuf = 0;
-                }
-            }
-        }
-        if (bitsInBuf > 0) sb.append(Integer.toHexString(bitBuf << (4 - bitsInBuf)));
-        return sb.toString();
+    private static String computeColorHash(BufferedImage img) {
+        // colorhash via rosetta-squint-hash, binbits=4 (=> 14 hex) to match ClippyShot / titan's
+        // prior binbits and the engine.py _HASH_HEXLEN contract.
+        return io.github.wmetcalf.rosettasquint.hash.ColorHash.compute(img, 4).toString();
     }
 
     /** SHA-256 of raw pixel data for a TYPE_INT_RGB BufferedImage (no I/O, no PNG encoding). */
@@ -3238,16 +3228,19 @@ for (int pageNum : pagesToProcess) {
      */
     private HashResult computeImageHashInMemory(BufferedImage img, Path hashFile) {
         HashResult hr = new HashResult();
-        hr.width     = img.getWidth();
-        hr.height    = img.getHeight();
-        hr.mode      = colorModelMode(img);
-        hr.phash     = computePhash(img);
-        hr.colorhash = computeColorHash(img);
+        BufferedImage hashImg = img;   // PDFBox-decoded fallback (JP2/JBIG2 or read error)
         try {
-            hr.sha256 = sha256(Files.readAllBytes(hashFile));
+            byte[] raw = Files.readAllBytes(hashFile);
+            hr.sha256 = sha256(raw);
+            hashImg = decodeForHash(raw, img);   // rosetta-decode the original encoded bytes
         } catch (IOException e) {
             hr.error = e.getMessage();
         }
+        hr.width     = hashImg.getWidth();
+        hr.height    = hashImg.getHeight();
+        hr.mode      = colorModelMode(hashImg);
+        hr.phash     = computePhash(hashImg);
+        hr.colorhash = computeColorHash(hashImg);
         return hr;
     }
 
@@ -3265,9 +3258,10 @@ for (int pageNum : pagesToProcess) {
                 continue;
             }
             try {
-                hr.sha256 = sha256(Files.readAllBytes(path));
-                BufferedImage img = ImageIO.read(path.toFile());
-                if (img == null) throw new IOException("ImageIO could not decode " + path.getFileName());
+                byte[] raw = Files.readAllBytes(path);
+                hr.sha256 = sha256(raw);
+                BufferedImage img = decodeForHash(raw, ImageIO.read(path.toFile()));
+                if (img == null) throw new IOException("could not decode " + path.getFileName());
                 hr.width     = img.getWidth();
                 hr.height    = img.getHeight();
                 hr.mode      = colorModelMode(img);
@@ -3288,6 +3282,20 @@ for (int pageNum : pagesToProcess) {
             case BufferedImage.TYPE_BYTE_GRAY                                  -> "L";
             default                                                             -> "RGB";
         };
+    }
+
+    // Decode via the rosetta-squint decode port (PIL-exact for PNG/JPEG/WebP/TIFF/HEIC/GIF/BMP).
+    // Falls back to the caller's already-decoded image for formats rosetta can't handle -- notably
+    // titan's PDF-specific JPEG2000 / JBIG2 embedded streams (decoded by PDFBox), or any decode error.
+    private static BufferedImage decodeForHash(byte[] bytes, BufferedImage fallback) {
+        try {
+            return io.github.wmetcalf.rosettasquint.Squint.decodeBytes(bytes);
+        } catch (Exception | LinkageError e) {
+            // Exception: formats rosetta can't decode (JP2/JBIG2/corrupt) -> PDFBox fallback.
+            // LinkageError: the turbojpeg JNI binding (NoClassDefFoundError/UnsatisfiedLinkError) is
+            // absent in this deployment -> degrade to the PDFBox-decoded image rather than crashing.
+            return fallback;
+        }
     }
 
     private static List<PhoneHit> extractPhonesFromText(
@@ -4773,8 +4781,11 @@ for (int pageNum : pagesToProcess) {
                 java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
                 try (java.util.zip.InflaterInputStream iis = new java.util.zip.InflaterInputStream(
                         new java.io.ByteArrayInputStream(pdf, streamStart, streamEnd - streamStart))) {
-                    byte[] buf = new byte[4096]; int n;
-                    while ((n = iis.read(buf)) >= 0) baos.write(buf, 0, n);
+                    // Bound the inflate: an attacker xref stream can be a decompression bomb, and
+                    // an unbounded copy into baos would OOM (the enclosing catch only handles
+                    // Exception, not OutOfMemoryError). copyBounded throws IOException past the cap,
+                    // which the catch below turns into a clean skip of this xref stream.
+                    copyBounded(iis, baos, MAX_XREF_STREAM_BYTES, "xref stream");
                 }
                 decompressed = baos.toByteArray();
             } catch (Exception ignored) { return; }
@@ -5135,6 +5146,10 @@ for (int pageNum : pagesToProcess) {
 
         @Override
         public void drawImage(PDImage pdImage) throws IOException {
+            // I1: per-document image-extraction cap; skip decode entirely once exhausted.
+            if (!reserveImageExtractionSlot()) {
+                return;
+            }
             BufferedImage image = pdImage.getImage();
             if (image == null) {
                 return;
@@ -5216,6 +5231,184 @@ for (int pageNum : pagesToProcess) {
         public Long daysSinceModified;
         /** Days between creationDate and modificationDate (positive = modified after creation). Null if either date is absent. */
         public Long daysBetweenCreatedAndModified;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record JobDescriptor(
+            @JsonProperty("input_path") String inputPath,
+            @JsonProperty("output_dir") String outputDir,
+            @JsonProperty("filename_hint") String filenameHint,
+            @JsonProperty("sha256") String sha256,
+            @JsonProperty("dpi") float dpi,
+            @JsonProperty("pages") String pages,
+            @JsonProperty("skip_qr") boolean skipQr,
+            @JsonProperty("skip_screenshots") boolean skipScreenshots,
+            @JsonProperty("skip_images") boolean skipImages,
+            @JsonProperty("skip_phones") boolean skipPhones,
+            @JsonProperty("skip_page_export") boolean skipPageExport,
+            @JsonProperty("skip_text_urls") boolean skipTextUrls,
+            @JsonProperty("no_skip_blanks") boolean noSkipBlanks,
+            @JsonProperty("ocr_screenshots") boolean ocrScreenshots,
+            @JsonProperty("ocr_url_crops") boolean ocrUrlCrops,
+            @JsonProperty("ocr_lang") String ocrLang,
+            @JsonProperty("add_link_annotations") boolean addLinkAnnotations,
+            @JsonProperty("password") String password,
+            @JsonProperty("timeout_seconds") int timeoutSeconds) {}
+
+    /**
+     * True when this worker is running in a warm tier (env {@code TITANARUM_WARM=1}, or
+     * {@code TITANARUM_CRAC_CHECKPOINT} set). See W-1 / {@link #awaitGoSignal}.
+     */
+    private static boolean isWarmMode() {
+        String cracCheckpoint = System.getenv("TITANARUM_CRAC_CHECKPOINT");
+        return "1".equals(System.getenv("TITANARUM_WARM"))
+                || (cracCheckpoint != null && !cracCheckpoint.isBlank());
+    }
+
+    /**
+     * W-1 (warm-plan.md FINDING B): blocks the file-IPC worker loop until {@code goFile}
+     * (control.go) appears, using a monotonic clock (nanoClock -- normally
+     * {@code System::nanoTime}, i.e. CLOCK_MONOTONIC) rather than wall-clock time. A
+     * warm-tier JVM can be snapshotted WHILE blocked in this loop; on restore minutes or
+     * hours later, wall-clock time has jumped forward. With the old
+     * {@code System.currentTimeMillis()}-based deadline that jump landed past the
+     * deadline baked into the snapshot, so the loop exited immediately, {@code go.exists()}
+     * was false, and the worker returned 2 -- the job was silently never delivered on
+     * every warm restore. CLOCK_MONOTONIC is frozen across an FC/gVisor restore, so a
+     * nanoTime-based deadline cannot be defeated the same way.
+     *
+     * <p>When {@code warm} is true there is NO deadline at all: blastbox owns reaping
+     * idle warm slots via {@code BLASTBOX_WARM_IDLE_TIMEOUT_S}, so this loop must keep
+     * waiting no matter what the clock reads. When {@code warm} is false (legacy cold
+     * {@code --run}) the historical 600s bound is preserved, just computed from the
+     * monotonic clock instead of the wall clock.
+     *
+     * <p>{@code nanoClock} is an injectable seam (defaults to {@code System::nanoTime} in
+     * production) so tests can simulate an arbitrary monotonic-clock jump without a real
+     * 600s sleep. Package-private for {@code RunWorkerModeTest}.
+     *
+     * @return true once goFile exists; false if the cold bound elapsed first without it appearing.
+     */
+    static boolean awaitGoSignal(File goFile, boolean warm, java.util.function.LongSupplier nanoClock) throws InterruptedException {
+        long deadlineNanos = warm ? Long.MAX_VALUE : nanoClock.getAsLong() + 600_000_000_000L;
+        while (warm || nanoClock.getAsLong() < deadlineNanos) {
+            if (goFile.exists()) return true;
+            Thread.sleep(100L);
+        }
+        return goFile.exists();
+    }
+
+    /** File-IPC worker mode. Announces readiness, waits for control.go, runs one job, exits. */
+    private Integer runWorker(Path scratch) throws Exception {
+        File controlDir = scratch.resolve("control").toFile();
+        controlDir.mkdirs();
+        new File(controlDir, "control.ready").createNewFile();       // (a) announce ready
+
+        File go = new File(controlDir, "control.go");                // (b) block for go
+        boolean delivered = awaitGoSignal(go, isWarmMode(), System::nanoTime);
+        if (!delivered) {
+            System.err.println("ERROR: --run timed out waiting for control.go");
+            return 2;
+        }
+
+        File jobFile = new File(controlDir, "job.json");             // (c) read job
+        JobDescriptor job = mapper.readValue(jobFile, JobDescriptor.class);
+
+        // (d) populate the field-only options via existing setters (mirrors WorkerPool.processJob)
+        setSkipScreenshots(job.skipScreenshots());
+        setSkipImages(job.skipImages());
+        setSkipPhones(job.skipPhones());
+        setSkipPageExport(job.skipPageExport());
+        setSkipTextUrls(job.skipTextUrls());
+        setNoSkipBlanks(job.noSkipBlanks());
+        setTimeout(job.timeoutSeconds());
+        setOcrScreenshots(job.ocrScreenshots());
+        setOcrUrlCrops(job.ocrUrlCrops());
+        if (job.ocrLang() != null) setOcrLang(job.ocrLang());
+
+        byte[] pdfBytes = Files.readAllBytes(Paths.get(job.inputPath()));
+        String name = job.filenameHint() != null ? job.filenameHint() : "input.pdf";
+        String pages = job.pages() != null ? job.pages() : "default";
+
+        // (e) SAME programmatic entry WorkerPool.processJob uses. callWith writes report.json
+        //     (including partial reports with parseError/timedOut) into outputDir itself.
+        callWith(pdfBytes, name, Paths.get(job.outputDir()),
+                 job.dpi(), pages, job.skipQr(), job.addLinkAnnotations(),
+                 /* modifiedPdfOutput */ null, job.password());
+
+        // (f) exit 0 whenever report.json was written (parseError/timedOut are surfaced by the adapter)
+        return 0;
+    }
+
+    /**
+     * AOT-cache warmup mode (warm-plan.md W-2 / FINDING C). Mirrors RedTusk's
+     * {@code Main.runWarmup}: run every PDF in {@code corpusDir} through the SAME
+     * {@link #callWith} entry point a real job uses, so the AOT-cache recording run (invoked
+     * once, at image-build time, under {@code -XX:AOTMode=record}) actually class-loads and
+     * links the PDFBox / JBIG2 / JPEG2000 / ZXing / phone / autolink parser path. Those classes
+     * are otherwise loaded lazily inside {@code callWith} on a document's first job, so a
+     * snapshot/AOT-cache taken before any job ran would only capture JVM bootstrap, not the
+     * expensive parser path (Finding C).
+     *
+     * <p>Each file is run with QR scanning ON ({@code skipQrScan=false}) so the ZXing
+     * subprocess path is touched too; OCR stays off (the {@code ocrScreenshots}/
+     * {@code ocrUrlCrops} instance fields default to false and are never set here). Each file
+     * gets its own throwaway output directory under the system temp dir -- the warmup run's
+     * reports are never consumed by anything.
+     *
+     * <p>A single bad/corrupt/garbage fixture must never abort the run: warmup wants to touch
+     * as many code paths as possible over the whole corpus, so per-file failures are caught and
+     * logged to stderr rather than propagated. This method always returns 0 -- including when
+     * {@code corpusDir} doesn't exist -- because a warmup failure must never fail the image
+     * build; it just means less AOT coverage.
+     */
+    private Integer runAppcdsWarmup(Path corpusDir) {
+        if (!Files.isDirectory(corpusDir)) {
+            System.err.println("ERROR: --appcds-warmup target is not a directory: " + corpusDir);
+            return 0;
+        }
+        File[] pdfFiles = corpusDir.toFile().listFiles(
+                f -> f.isFile() && f.getName().toLowerCase(Locale.ROOT).endsWith(".pdf"));
+        if (pdfFiles != null) {
+            Arrays.sort(pdfFiles);
+        } else {
+            pdfFiles = new File[0];
+        }
+        for (File pdfFile : pdfFiles) {
+            Path tmpOut = null;
+            try {
+                byte[] bytes = Files.readAllBytes(pdfFile.toPath());
+                tmpOut = Files.createTempDirectory("titanarum-appcds-warmup-");
+                callWith(bytes, pdfFile.getName(), tmpOut, dpi, "default",
+                        /* skipQrScan */ false, /* addLinkAnnotations */ false,
+                        /* modifiedPdfOutput */ null, /* password */ null);
+                System.err.println("APPCDS_WARMUP_OK " + tmpOut);
+            } catch (Exception e) {
+                System.err.println("APPCDS_WARMUP_SKIP " + pdfFile.getName() + " ("
+                        + e.getClass().getSimpleName() + ": " + e.getMessage() + ")"
+                        + (tmpOut != null ? " out=" + tmpOut : ""));
+            } finally {
+                // Recursively delete the warmup output dir. build-aot.sh runs --appcds-warmup
+                // INSIDE a single Docker RUN layer (deploy/{gvisor,firecracker}/Dockerfile.titanarum)
+                // whose cleanup removes only the corpus + logs -- any leftover
+                // /tmp/titanarum-appcds-warmup-* (screenshots, report.json, page rasters) would
+                // otherwise bake into the image. deleteOnExit cannot remove a populated directory.
+                if (tmpOut != null) {
+                    try (java.util.stream.Stream<Path> walk = Files.walk(tmpOut)) {
+                        walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                            try {
+                                Files.deleteIfExists(p);
+                            } catch (IOException ignore) {
+                                // best-effort per-entry cleanup
+                            }
+                        });
+                    } catch (IOException ignore) {
+                        // best-effort: could not walk the temp dir for deletion
+                    }
+                }
+            }
+        }
+        return 0;
     }
 
     @JsonInclude(JsonInclude.Include.NON_NULL)

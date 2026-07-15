@@ -12,7 +12,6 @@
         <jackson.version>2.19.0</jackson.version>
         <picocli.version>4.7.7</picocli.version>
         <pdfbox.version>3.0.6</pdfbox.version>
-        <zxing.version>3.5.4</zxing.version>
         <javalin.version>6.7.0</javalin.version>
         <hikari.version>5.1.0</hikari.version>
         <flyway.version>10.15.0</flyway.version>
@@ -41,16 +40,6 @@
             <artifactId>jackson-databind</artifactId>
             <version>${jackson.version}</version>
         </dependency>
-<dependency>
-    <groupId>com.google.zxing</groupId>
-    <artifactId>core</artifactId>
-    <version>${zxing.version}</version>
-</dependency>
-<dependency>
-    <groupId>com.google.zxing</groupId>
-    <artifactId>javase</artifactId>
-    <version>${zxing.version}</version>
-</dependency>
     <dependency>
         <groupId>org.junit.jupiter</groupId>
         <artifactId>junit-jupiter</artifactId>
@@ -87,6 +76,26 @@
         <groupId>com.googlecode.libphonenumber</groupId>
         <artifactId>geocoder</artifactId>
         <version>3.25</version>
+    </dependency>
+    <dependency>
+        <groupId>io.github.wmetcalf</groupId>
+        <artifactId>rosetta-squint</artifactId>
+        <version>1.1.1</version>
+    </dependency>
+    <!-- Squint's public API (phash/dhash/colorhash/etc.) returns and consumes
+         rosetta-squint-hash/-decode types directly, but the umbrella
+         rosetta-squint POM does not declare hash/decode as compile
+         dependencies, so they are pinned explicitly here. Pinned to the
+         newest versions published on Maven Central for each submodule. -->
+    <dependency>
+        <groupId>io.github.wmetcalf</groupId>
+        <artifactId>rosetta-squint-hash</artifactId>
+        <version>1.0.0</version>
+    </dependency>
+    <dependency>
+        <groupId>io.github.wmetcalf</groupId>
+        <artifactId>rosetta-squint-decode</artifactId>
+        <version>1.1.0</version>
     </dependency>
     </dependencies>
 
@@ -221,6 +230,15 @@
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.oai.titanarum.PdfTitanArumApp</mainClass>
+                                    <manifestEntries>
+                                        <!-- rosetta-squint's JPEG/HEIC decode needs the turbojpeg JNI
+                                             binding (system /usr/share/java/turbojpeg.jar; not on Maven
+                                             Central). A RELATIVE Class-Path entry is honored by `java -jar`
+                                             when turbojpeg.jar sits next to this jar (deploy images copy it
+                                             to /app/), and is silently ignored when absent (decodeForHash
+                                             then degrades to the PDFBox-decoded image). -->
+                                        <Class-Path>turbojpeg.jar</Class-Path>
+                                    </manifestEntries>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
@@ -261,6 +279,12 @@
                 <excludes>
                     <exclude>${server.test.exclude}</exclude>
                 </excludes>
+                <!-- turbojpeg JNI binding for the rosetta JPEG-decode parity tests (present on
+                     Ubuntu via libturbojpeg-java at /usr/share/java/turbojpeg.jar; the tests
+                     assumeTrue-skip when it is absent, so this stays green off-Ubuntu). -->
+                <additionalClasspathElements>
+                    <additionalClasspathElement>/usr/share/java/turbojpeg.jar</additionalClasspathElement>
+                </additionalClasspathElements>
             </configuration>
         </plugin>
         </plugins>

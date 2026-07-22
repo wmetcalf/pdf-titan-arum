@@ -882,6 +882,12 @@ final class TableExtractor {
         int n = 0;
         for (PDPage p : doc.getPages()) pageNumbers.put(p, ++n);
 
+        // Per-page count of ACCEPTED tagged tables, enforcing the same MAX_TABLES_PER_PAGE cap
+        // the lattice path applies -- a hostile structure tree with thousands of Table elements
+        // sharing one TR/TD set (or independently authored) must not emit unbounded duplicates
+        // into report.json.
+        Map<Integer, Integer> tablesPerPage = new HashMap<>();
+
         for (PDStructureElement tableEl : tables) {
             List<PDStructureElement> trs = new ArrayList<>();
             collectByType(tableEl, "TR", trs, 0, STOP_AT_TABLE);
@@ -895,8 +901,16 @@ final class TableExtractor {
             Integer pageNum = earlyPage == null ? null : pageNumbers.get(earlyPage);
             if (pageNum == null || !pagesToProcess.contains(pageNum)) continue;
 
-            TableHit t = buildTaggedTable(trs, earlyPage, pageNum, mcidCache, pageNumbers, pagesToProcess);
-            if (t == null) continue;                          // degenerate -> lattice may still run
+            if (tablesPerPage.getOrDefault(pageNum, 0) >= MAX_TABLES_PER_PAGE) {
+                result.truncated = true;
+                continue; // per-page cap already met -- drop further tables for this page
+            }
+
+            TableHit t = buildTaggedTable(trs, earlyPage, pageNum, mcidCache, pageNumbers, pagesToProcess, result);
+            if (t == null) continue;                          // degenerate, or cap-rejected (result.truncated
+                                                               // already set inside buildTaggedTable) -- lattice
+                                                               // may still run for a degenerate page
+            tablesPerPage.merge(pageNum, 1, Integer::sum);
             renderViews(t);
             result.tables.add(t);
             coveredOut.add(t.page);
@@ -935,14 +949,17 @@ final class TableExtractor {
         }
     }
 
-    /** Build one tagged table; returns null when degenerate (no rows / no textful cells) or when
-     * the span-bomb area guard trips. {@code trs} is pre-collected (stopping at nested Table
-     * boundaries) and {@code tablePage}/{@code pageNum} pre-resolved and pagesToProcess-gated by
-     * the caller -- this method never has to reject on page-scope itself. */
+    /** Build one tagged table; returns null when degenerate (no rows / no textful cells -- silent,
+     * lattice fallback covers these pages) or when the span-bomb cumulative-area guard trips (NOT
+     * silent: sets {@code result.truncated = true} before returning null, since this is the same
+     * hostile-input cap the lattice path signals via Result.truncated). {@code trs} is
+     * pre-collected (stopping at nested Table boundaries) and {@code tablePage}/{@code pageNum}
+     * pre-resolved and pagesToProcess-gated by the caller -- this method never has to reject on
+     * page-scope itself. */
     private static TableHit buildTaggedTable(List<PDStructureElement> trs, PDPage tablePage, int pageNum,
                                              Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache,
                                              Map<PDPage, Integer> pageNumbers,
-                                             Set<Integer> pagesToProcess) throws IOException {
+                                             Set<Integer> pagesToProcess, Result result) throws IOException {
         List<List<TaggedCell>> rows = new ArrayList<>();
         for (PDStructureElement tr : trs) {
             List<TaggedCell> row = new ArrayList<>();
@@ -978,7 +995,10 @@ final class TableExtractor {
                 while (occupied.containsKey(((long) r << 32) | c)) c++;
                 long area = (long) cell.rowSpan * (long) cell.colSpan;
                 cumulativeArea += area;
-                if (cumulativeArea > MAX_CELLS_PER_TABLE) return null; // reject BEFORE inserting slots
+                if (cumulativeArea > MAX_CELLS_PER_TABLE) {
+                    result.truncated = true; // hostile-input cap, distinct from a silent degenerate reject
+                    return null; // reject BEFORE inserting slots
+                }
                 CellHit hit = new CellHit();
                 hit.row = r;
                 hit.col = c;

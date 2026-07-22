@@ -353,6 +353,90 @@ final class TableTestPdfs {
     }
 
     /**
+     * A single tagged TR with 11 TD cells, each carrying a ColSpan=1000 attribute -- cumulative
+     * area 11 x 1,000 = 11,000 exceeds MAX_CELLS_PER_TABLE (10,000). Only the first cell carries
+     * real MCID text, so the table clears the "degenerate" (all-cells-empty) check and reaches
+     * the cumulative-area guard instead of being rejected as degenerate.
+     */
+    static void taggedAreaCapBomb(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                COSDictionary d = new COSDictionary();
+                d.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                text(cs, 60, 700, "X");
+                cs.endMarkedContent();
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            for (int c = 0; c < 11; c++) {
+                PDStructureElement cell = new PDStructureElement("TD", tr);
+                cell.setPage(page);
+                PDTableAttributeObject att = new PDTableAttributeObject();
+                att.setColSpan(1000);
+                cell.addAttribute(att);
+                if (c == 0) cell.getCOSObject().setInt(COSName.K, 0); // only this cell carries text
+                tr.appendKid(cell);
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * {@code tableCount} independent 1x1 Table elements (own TR/TD, own MCID text), all
+     * attributed to a single page. Used to prove the tagged path's per-page table cap
+     * (MAX_TABLES_PER_PAGE) is enforced and {@code Result.truncated} is set once exceeded.
+     *
+     * <p>Each cell's text is placed at a DISTINCT (x, y) offset (a wrapping grid): PDFBox's text
+     * extraction drops a glyph as a duplicate-render artifact (faux-bold detection) when the same
+     * character is drawn at the exact same position more than once, so drawing every "T" at an
+     * identical spot -- as this fixture initially did -- silently loses the shared "T" prefix from
+     * all but the first cell's text.
+     */
+    static void taggedManyTablesOnePage(Path file, int tableCount) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int i = 0; i < tableCount; i++) {
+                    COSDictionary d = new COSDictionary();
+                    d.setInt(COSName.MCID, i);
+                    cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                    text(cs, 60 + (i % 15) * 30, 700 - (i / 15) * 15, "T" + i);
+                    cs.endMarkedContent();
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            for (int i = 0; i < tableCount; i++) {
+                PDStructureElement table = new PDStructureElement("Table", root);
+                table.setPage(page);
+                root.appendKid(table);
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                PDStructureElement cell = new PDStructureElement("TD", tr);
+                cell.setPage(page);
+                cell.getCOSObject().setInt(COSName.K, i);
+                tr.appendKid(cell);
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * An outer 1x1 tagged table whose sole TD has NO marked content of its own and instead wraps
      * a nested, independently-tagged 2x2 table (own TR/TD + own MCID text). Used to prove the
      * nested table's rows never leak into the outer table's grid, and extract standalone.

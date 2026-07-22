@@ -63,24 +63,61 @@ class TableTaggedTest {
 
     @Test
     void rowSpanBombIsClampedNotHung() throws Exception {
-        // RowSpan=50_000_000 must be clamped (readSpans) and/or rejected (cumulative-area guard
-        // in buildTaggedTable) long before any HashMap-filling occupancy loop runs. No timing
-        // assertion here by design -- a hung/looping implementation would simply never return and
-        // the test would be killed by the surefire/JVM timeout, which is evidence enough.
+        // RowSpan=50_000_000 must be clamped (readSpans) long before any HashMap-filling
+        // occupancy loop runs. No timing assertion here by design -- a hung/looping
+        // implementation would simply never return and the test would be killed by the
+        // surefire/JVM timeout, which is evidence enough.
+        //
+        // Expected outcome for THIS fixture is not conditional: the clamped span yields a
+        // cumulative area of 1,003 (TH+TH+clamped-TD(1000)+TD), which is under
+        // MAX_CELLS_PER_TABLE (10,000), so the table survives (clamped, not rejected) and
+        // must NOT be flagged truncated.
         Path pdf = tmp.resolve("spanbomb.pdf");
         TableTestPdfs.taggedSpanBomb(pdf);
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
-            // Either outcome ("clamped" or "rejected") is acceptable per the fix; if a table
-            // came back, its bombed cell's rowSpan must be clamped to MAX_SPAN, never the
-            // attacker-supplied 50_000_000.
-            if (!r.tables.isEmpty()) {
-                TableExtractor.TableHit t = r.tables.get(0);
-                boolean anyBombed = t.cells.stream().anyMatch(c -> c.rowSpan > 1);
-                assertTrue(anyBombed, "expected the RowSpan-bearing cell to survive with a clamped (but >1) span");
-                assertTrue(t.cells.stream().allMatch(c -> c.rowSpan <= TableExtractor.MAX_SPAN),
-                        "rowSpan must never exceed MAX_SPAN");
-            }
+            assertEquals(1, r.tables.size(), "clamped-span area (1,003) is under the cap; table must survive");
+            TableExtractor.TableHit t = r.tables.get(0);
+            TableExtractor.CellHit bombed = t.cells.stream()
+                    .filter(c -> c.rowSpan > 1)
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("expected the RowSpan-bearing cell to survive clamped"));
+            assertEquals(TableExtractor.MAX_SPAN, bombed.rowSpan,
+                    "rowSpan must be clamped to exactly MAX_SPAN, never the attacker-supplied 50_000_000");
+            assertFalse(r.truncated, "area 1,003 < MAX_CELLS_PER_TABLE=10,000; must not be flagged truncated");
+        }
+    }
+
+    @Test
+    void taggedAreaCapSetsTruncated() throws Exception {
+        // A single TR with 11 TD cells, each ColSpan=1000: cumulative area 11 x 1,000 = 11,000
+        // exceeds MAX_CELLS_PER_TABLE (10,000). Unlike the clamped-but-under-cap case above, this
+        // must be dropped AND must set Result.truncated -- the tagged path's cap-rejection must
+        // not vanish silently the way a degenerate (no rows / no text) table does.
+        Path pdf = tmp.resolve("areabomb.pdf");
+        TableTestPdfs.taggedAreaCapBomb(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertTrue(r.tables.isEmpty(),
+                    "table whose clamped cumulative area (11,000) exceeds MAX_CELLS_PER_TABLE must be dropped");
+            assertTrue(r.truncated, "area-cap rejection on the tagged path must set Result.truncated");
+        }
+    }
+
+    @Test
+    void taggedTablesPerPageCapped() throws Exception {
+        // MAX_TABLES_PER_PAGE + 5 independent 1x1 tagged tables, all resolving to page 1: a
+        // hostile structure tree with many Table elements must not emit unbounded duplicates
+        // (collectByType's own 10_001 cap is 200x looser than the intended per-page limit).
+        Path pdf = tmp.resolve("manytables.pdf");
+        int total = TableExtractor.MAX_TABLES_PER_PAGE + 5;
+        TableTestPdfs.taggedManyTablesOnePage(pdf, total);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            long onPage1 = r.tables.stream().filter(t -> t.page == 1).count();
+            assertTrue(onPage1 <= TableExtractor.MAX_TABLES_PER_PAGE,
+                    "at most MAX_TABLES_PER_PAGE tagged tables may survive for page 1, got " + onPage1);
+            assertTrue(r.truncated, "exceeding the per-page tagged table cap must set Result.truncated");
         }
     }
 

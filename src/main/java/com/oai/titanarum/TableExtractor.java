@@ -9,9 +9,12 @@ import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDAttributeObject;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkedContentReference;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureElement;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureNode;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureTreeRoot;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.Revisions;
 import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedContent;
 import org.apache.pdfbox.pdmodel.documentinterchange.taggedpdf.PDTableAttributeObject;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
@@ -45,6 +48,11 @@ final class TableExtractor {
     static final int MAX_TABLES_PER_PAGE = 50;
     static final int MAX_CELLS_PER_TABLE = 10_000;
     static final int MAX_RULINGS_PER_PAGE = 10_000;
+    // Tagged-path RowSpan/ColSpan are attacker-controlled ints straight from the structure tree
+    // (no PDF-spec upper bound). Clamped in readSpans() to this ceiling BEFORE any grid-placement
+    // work happens; buildTaggedTable additionally bounds the cumulative (rowSpan*colSpan) area
+    // against MAX_CELLS_PER_TABLE, checked before the occupancy map is populated for that cell.
+    static final int MAX_SPAN = 1_000;
     // Total buffered path points (across all pending subpaths of one path) RulingCollector
     // will hold before giving up on that path as a ruling candidate. A content stream that
     // free-runs lineTo/curveTo without ever issuing a paint op would otherwise grow this
@@ -835,6 +843,19 @@ final class TableExtractor {
 
     // ---------------------------------------------------------------- tagged path
 
+    // Structure types collectByType must not descend past when walking for "TR" (or nested
+    // "Table") matches -- a Table nested inside a TD is discovered as its OWN independent
+    // top-level Table entry (see the "Table" collection call in extractTagged, which uses no
+    // stop set and so keeps recursing past a match), but must never have its rows/cells folded
+    // into the OUTER table that contains it.
+    private static final Set<String> STOP_AT_TABLE = Set.of("Table");
+
+    /** Test-only instrumentation: counts {@code PDFMarkedContentExtractor.processPage(...)} calls
+     * made by the tagged path's MCID resolution. Package-private so tests can assert a hostile,
+     * out-of-scope-page table never triggers a content-stream walk. Not reset automatically;
+     * callers should snapshot the value before/after the call under test. */
+    static int taggedProcessPageCalls = 0;
+
     /** Internal: one tagged cell before grid placement. */
     private static final class TaggedCell {
         String text = "";
@@ -849,7 +870,9 @@ final class TableExtractor {
         PDStructureTreeRoot root = doc.getDocumentCatalog().getStructureTreeRoot();
         if (root == null) return;
         List<PDStructureElement> tables = new ArrayList<>();
-        collectByType(root, "Table", tables, 0);
+        // No stop set here: nested Table elements must surface as their OWN entries in `tables`
+        // (fix for the flattening bug below), so recursion continues past a "Table" match too.
+        collectByType(root, "Table", tables, 0, Set.of());
         if (tables.isEmpty()) return;
 
         // page -> (mcid -> glyphs), computed lazily, one content pass per page
@@ -860,35 +883,66 @@ final class TableExtractor {
         for (PDPage p : doc.getPages()) pageNumbers.put(p, ++n);
 
         for (PDStructureElement tableEl : tables) {
-            TableHit t = buildTaggedTable(tableEl, mcidCache, pageNumbers);
-            if (t == null) continue;                      // degenerate -> lattice may still run
-            if (!pagesToProcess.contains(t.page)) continue;
+            List<PDStructureElement> trs = new ArrayList<>();
+            collectByType(tableEl, "TR", trs, 0, STOP_AT_TABLE);
+            if (trs.isEmpty()) continue;                     // degenerate -> lattice may still run
+
+            // Determine the table's page EARLY and cheaply -- PDStructureElement.getPage() only
+            // reads the /Pg dictionary reference, no MCID resolution / content-stream walk. A
+            // hostile structure tree referencing thousands of out-of-scope pages is rejected
+            // right here, before buildTaggedTable ever calls resolveCellText/glyphsFor.
+            PDPage earlyPage = firstCellPage(trs);
+            Integer pageNum = earlyPage == null ? null : pageNumbers.get(earlyPage);
+            if (pageNum == null || !pagesToProcess.contains(pageNum)) continue;
+
+            TableHit t = buildTaggedTable(trs, earlyPage, pageNum, mcidCache, pageNumbers, pagesToProcess);
+            if (t == null) continue;                          // degenerate -> lattice may still run
             renderViews(t);
             result.tables.add(t);
             coveredOut.add(t.page);
         }
     }
 
-    /** DFS for structure elements of a standard type; depth-capped against cyclic/hostile trees. */
-    private static void collectByType(PDStructureNode node, String type,
-                                      List<PDStructureElement> out, int depth) {
-        if (depth > 64 || out.size() > 10_000) return;
-        for (Object kid : node.getKids()) {
-            if (kid instanceof PDStructureElement el) {
-                if (type.equals(el.getStandardStructureType())) out.add(el);
-                else collectByType(el, type, out, depth + 1);
+    /** Cheap page lookup with NO content-stream access: first TD/TH (in row/cell order) carrying
+     * an explicit /Pg. Used both to gate a table against pagesToProcess before any MCID work, and
+     * (by construction, same row/cell order as buildTaggedTable) to pick the table's own page. */
+    private static PDPage firstCellPage(List<PDStructureElement> trs) {
+        for (PDStructureElement tr : trs) {
+            for (Object kid : tr.getKids()) {
+                if (kid instanceof PDStructureElement el) {
+                    String st = el.getStandardStructureType();
+                    if (("TD".equals(st) || "TH".equals(st)) && el.getPage() != null) return el.getPage();
+                }
             }
+        }
+        return null;
+    }
+
+    /** DFS for structure elements of a standard type; depth-capped against cyclic/hostile trees.
+     * Does not descend past any element whose standard type is in {@code stopTypes} (still adds
+     * it first if it matches {@code type} itself) -- used to keep a nested Table's TR/TD from
+     * being folded into an outer table's row list. */
+    private static void collectByType(PDStructureNode node, String type,
+                                      List<PDStructureElement> out, int depth, Set<String> stopTypes) {
+        if (depth > 64) return;
+        for (Object kid : node.getKids()) {
+            if (out.size() > 10_000) return; // bail mid-loop once the cap is hit, not just on entry
+            if (!(kid instanceof PDStructureElement el)) continue;
+            String st = el.getStandardStructureType();
+            if (type.equals(st)) out.add(el);
+            if (stopTypes.contains(st)) continue; // nested Table (or other stop boundary): don't descend
+            collectByType(el, type, out, depth + 1, stopTypes);
         }
     }
 
-    /** Build one tagged table; returns null when degenerate (no rows / no textful cells). */
-    private static TableHit buildTaggedTable(PDStructureElement tableEl,
+    /** Build one tagged table; returns null when degenerate (no rows / no textful cells) or when
+     * the span-bomb area guard trips. {@code trs} is pre-collected (stopping at nested Table
+     * boundaries) and {@code tablePage}/{@code pageNum} pre-resolved and pagesToProcess-gated by
+     * the caller -- this method never has to reject on page-scope itself. */
+    private static TableHit buildTaggedTable(List<PDStructureElement> trs, PDPage tablePage, int pageNum,
                                              Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache,
-                                             Map<PDPage, Integer> pageNumbers) throws IOException {
-        List<PDStructureElement> trs = new ArrayList<>();
-        collectByType(tableEl, "TR", trs, 0);
-        if (trs.isEmpty()) return null;
-
+                                             Map<PDPage, Integer> pageNumbers,
+                                             Set<Integer> pagesToProcess) throws IOException {
         List<List<TaggedCell>> rows = new ArrayList<>();
         for (PDStructureElement tr : trs) {
             List<TaggedCell> row = new ArrayList<>();
@@ -899,7 +953,7 @@ final class TableExtractor {
                 TaggedCell cell = new TaggedCell();
                 cell.th = "TH".equals(st);
                 readSpans(el, cell);
-                resolveCellText(el, cell, mcidCache);
+                resolveCellText(el, cell, mcidCache, pageNumbers, pagesToProcess);
                 row.add(cell);
             }
             if (!row.isEmpty()) rows.add(row);
@@ -907,24 +961,34 @@ final class TableExtractor {
         if (rows.isEmpty()) return null;
         if (rows.stream().allMatch(r -> r.stream().allMatch(c -> c.text.isEmpty()))) return null;
 
-        // Grid placement with an occupancy map (HTML table algorithm).
+        // Grid placement with an occupancy map (HTML table algorithm), bounded against a
+        // RowSpan/ColSpan bomb: readSpans() already clamps each span to MAX_SPAN, but a single
+        // cell can still claim up to MAX_SPAN*MAX_SPAN cells of area -- cumulativeArea is checked
+        // against MAX_CELLS_PER_TABLE BEFORE the occupancy map is populated for that cell, so a
+        // hostile span is rejected in O(1) rather than after an O(area) HashMap-filling loop.
         int colCount = 0;
         List<CellHit> placed = new ArrayList<>();
         Map<Long, Boolean> occupied = new HashMap<>();
-        PDPage tablePage = null;
         float bx0 = Float.MAX_VALUE, by0 = Float.MAX_VALUE, bx1 = -Float.MAX_VALUE, by1 = -Float.MAX_VALUE;
         boolean anyBbox = false;
+        long cumulativeArea = 0;
         for (int r = 0; r < rows.size(); r++) {
             int c = 0;
             for (TaggedCell cell : rows.get(r)) {
                 while (occupied.containsKey(((long) r << 32) | c)) c++;
+                long area = (long) cell.rowSpan * (long) cell.colSpan;
+                cumulativeArea += area;
+                if (cumulativeArea > MAX_CELLS_PER_TABLE) return null; // reject BEFORE inserting slots
                 CellHit hit = new CellHit();
                 hit.row = r;
                 hit.col = c;
                 hit.rowSpan = cell.rowSpan;
                 hit.colSpan = cell.colSpan;
                 hit.text = cell.text;
-                hit.bbox = cell.bbox;
+                // Cross-page guard: a cell resolved from a DIFFERENT page than the table's own
+                // page must not have its bbox unioned into this table's (single-page) frame.
+                boolean onTablePage = tablePage.equals(cell.page);
+                hit.bbox = onTablePage ? cell.bbox : null;
                 if (cell.th) hit.header = Boolean.TRUE;
                 placed.add(hit);
                 for (int rr = r; rr < r + cell.rowSpan; rr++) {
@@ -933,19 +997,15 @@ final class TableExtractor {
                     }
                 }
                 colCount = Math.max(colCount, c + cell.colSpan);
-                if (cell.page != null && tablePage == null) tablePage = cell.page;
-                if (cell.bbox != null) {
+                if (onTablePage && hit.bbox != null) {
                     anyBbox = true;
-                    bx0 = Math.min(bx0, cell.bbox[0]); by0 = Math.min(by0, cell.bbox[1]);
-                    bx1 = Math.max(bx1, cell.bbox[2]); by1 = Math.max(by1, cell.bbox[3]);
+                    bx0 = Math.min(bx0, hit.bbox[0]); by0 = Math.min(by0, hit.bbox[1]);
+                    bx1 = Math.max(bx1, hit.bbox[2]); by1 = Math.max(by1, hit.bbox[3]);
                 }
                 c += cell.colSpan;
-                if (placed.size() > MAX_CELLS_PER_TABLE) return null;
             }
         }
-        if (tablePage == null || colCount == 0) return null;
-        Integer pageNum = pageNumbers.get(tablePage);
-        if (pageNum == null) return null;
+        if (colCount == 0) return null;
 
         TableHit t = new TableHit();
         t.page = pageNum;
@@ -959,15 +1019,13 @@ final class TableExtractor {
 
     private static void readSpans(PDStructureElement el, TaggedCell cell) {
         try {
-            org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.Revisions<
-                    org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDAttributeObject> revisions =
-                    el.getAttributes();
+            Revisions<PDAttributeObject> revisions = el.getAttributes();
             // Revisions is not Iterable (no getAll()/iterator()) -- index by size()/getObject(i).
             for (int i = 0; i < revisions.size(); i++) {
                 Object att = revisions.getObject(i);
                 if (att instanceof PDTableAttributeObject tao) {
-                    cell.rowSpan = Math.max(1, tao.getRowSpan());
-                    cell.colSpan = Math.max(1, tao.getColSpan());
+                    cell.rowSpan = clampSpan(tao.getRowSpan());
+                    cell.colSpan = clampSpan(tao.getColSpan());
                 }
             }
         } catch (Exception ignored) {
@@ -975,11 +1033,19 @@ final class TableExtractor {
         }
     }
 
+    /** Clamp an attacker-controlled RowSpan/ColSpan attribute into [1, MAX_SPAN]. */
+    private static int clampSpan(int v) {
+        if (v < 1) return 1;
+        return Math.min(v, MAX_SPAN);
+    }
+
     /** Gather the cell's MCIDs (bare integer kids and MCR kids), resolve to glyphs, join text. */
     private static void resolveCellText(PDStructureElement el, TaggedCell cell,
-                                        Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache) throws IOException {
+                                        Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache,
+                                        Map<PDPage, Integer> pageNumbers,
+                                        Set<Integer> pagesToProcess) throws IOException {
         List<TextPosition> glyphs = new ArrayList<>();
-        collectGlyphs(el, el.getPage(), glyphs, mcidCache, 0);
+        collectGlyphs(el, el.getPage(), glyphs, mcidCache, 0, pageNumbers, pagesToProcess);
         cell.text = joinText(glyphs);
         if (!glyphs.isEmpty()) {
             float x0 = Float.MAX_VALUE, y0 = Float.MAX_VALUE, x1 = -Float.MAX_VALUE, y1 = -Float.MAX_VALUE;
@@ -995,29 +1061,43 @@ final class TableExtractor {
     }
 
     private static void collectGlyphs(PDStructureNode node, PDPage inheritedPage, List<TextPosition> out,
-                                      Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache, int depth) throws IOException {
+                                      Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache, int depth,
+                                      Map<PDPage, Integer> pageNumbers, Set<Integer> pagesToProcess) throws IOException {
         if (depth > 64) return;
         PDPage page = inheritedPage;
         if (node instanceof PDStructureElement el && el.getPage() != null) page = el.getPage();
         for (Object kid : node.getKids()) {
             if (kid instanceof PDStructureElement el) {
-                collectGlyphs(el, page, out, mcidCache, depth + 1);
+                // A nested Table is discovered/built as its own independent TableHit (see
+                // extractTagged); pulling its cell text into the OUTER cell here would both
+                // duplicate it and defeat the "nested rows don't leak into the outer table"
+                // fix -- so this cell's own text resolution stops at that boundary too.
+                if ("Table".equals(el.getStandardStructureType())) continue;
+                collectGlyphs(el, page, out, mcidCache, depth + 1, pageNumbers, pagesToProcess);
             } else if (kid instanceof Integer mcid && page != null) {
-                out.addAll(glyphsFor(page, mcid, mcidCache));
+                out.addAll(glyphsFor(page, mcid, mcidCache, pageNumbers, pagesToProcess));
             } else if (kid instanceof COSInteger ci && page != null) {
-                out.addAll(glyphsFor(page, (int) ci.longValue(), mcidCache));
-            } else if (kid instanceof org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkedContentReference mcr) {
+                out.addAll(glyphsFor(page, (int) ci.longValue(), mcidCache, pageNumbers, pagesToProcess));
+            } else if (kid instanceof PDMarkedContentReference mcr) {
                 PDPage mcrPage = mcr.getPage() != null ? mcr.getPage() : page;
-                if (mcrPage != null) out.addAll(glyphsFor(mcrPage, mcr.getMCID(), mcidCache));
+                if (mcrPage != null) out.addAll(glyphsFor(mcrPage, mcr.getMCID(), mcidCache, pageNumbers, pagesToProcess));
             }
         }
     }
 
     private static List<TextPosition> glyphsFor(PDPage page, int mcid,
-                                                Map<PDPage, Map<Integer, List<TextPosition>>> cache) throws IOException {
+                                                Map<PDPage, Map<Integer, List<TextPosition>>> cache,
+                                                Map<PDPage, Integer> pageNumbers,
+                                                Set<Integer> pagesToProcess) throws IOException {
+        // Defense-in-depth against a mixed-page hostile table: even if the table's OWN page
+        // passed extractTagged's early gate, an individual cell's /Pg could point at a
+        // different, out-of-scope page. Never walk that page's content stream.
+        Integer pn = pageNumbers.get(page);
+        if (pn == null || !pagesToProcess.contains(pn)) return List.of();
         Map<Integer, List<TextPosition>> byMcid = cache.get(page);
         if (byMcid == null) {
             byMcid = new HashMap<>();
+            taggedProcessPageCalls++;
             PDFMarkedContentExtractor ex = new PDFMarkedContentExtractor();
             ex.processPage(page);
             for (PDMarkedContent mc : ex.getMarkedContents()) flattenMarkedContent(mc, byMcid);

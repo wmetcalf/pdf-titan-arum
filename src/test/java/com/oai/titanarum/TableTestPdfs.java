@@ -185,4 +185,228 @@ final class TableTestPdfs {
             doc.save(file.toFile());
         }
     }
+
+    /**
+     * Same shape as {@link #tagged2x2}, except the second row's first TD carries a hostile
+     * {@code RowSpan=50_000_000} attribute instead of {@code ColSpan=1} -- a span-bomb PoC.
+     */
+    static void taggedSpanBomb(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            String[][] cells = {{"Name", "Qty"}, {"Ada", "3"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
+                                PDPropertyList.create(d));
+                        text(cs, 60 + c * 120, 700 - r * 30, cells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
+                    cell.setPage(page);
+                    if (r == 1 && c == 0) {
+                        PDTableAttributeObject att = new PDTableAttributeObject();
+                        att.setRowSpan(50_000_000);
+                        cell.addAttribute(att);
+                    }
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * Two-page doc; page 1 has ordinary (untagged) text; the ENTIRE tagged 2x2 table (structure
+     * + all TH/TD marked content) lives on page 2. Used to prove that a table whose page falls
+     * outside {@code pagesToProcess} is rejected before its page's content stream is ever walked.
+     */
+    static void taggedOnPageTwo(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page1 = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page1);
+            PDPage page2 = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page2);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page1)) {
+                text(cs, 60, 700, "page one, no table");
+            }
+
+            String[][] cells = {{"Name", "Qty"}, {"Ada", "3"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page2)) {
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
+                                PDPropertyList.create(d));
+                        text(cs, 60 + c * 120, 700 - r * 30, cells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page2);
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page2);
+                table.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
+                    cell.setPage(page2);
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * Two-page doc, ONE Table whose first TR's cells ("A","B") carry /Pg = page 1 and whose
+     * second TR's cells ("C","D") carry /Pg = page 2. The table must be attributed to page 1
+     * (the first cell's page); page-2 cells keep their text but must not contribute a bbox.
+     */
+    static void taggedCrossPage(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page1 = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page1);
+            PDPage page2 = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page2);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page1)) {
+                int mcid = 0;
+                for (String s : new String[]{"A", "B"}) {
+                    COSDictionary d = new COSDictionary();
+                    d.setInt(COSName.MCID, mcid);
+                    cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                    text(cs, 60 + mcid * 120, 700, s);
+                    cs.endMarkedContent();
+                    mcid++;
+                }
+            }
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page2)) {
+                int mcid = 0;
+                for (String s : new String[]{"C", "D"}) {
+                    COSDictionary d = new COSDictionary();
+                    d.setInt(COSName.MCID, mcid);
+                    cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                    text(cs, 60 + mcid * 120, 700, s);
+                    cs.endMarkedContent();
+                    mcid++;
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            root.appendKid(table);
+
+            PDStructureElement tr1 = new PDStructureElement("TR", table);
+            tr1.setPage(page1);
+            table.appendKid(tr1);
+            for (int c = 0; c < 2; c++) {
+                PDStructureElement cell = new PDStructureElement("TD", tr1);
+                cell.setPage(page1);
+                cell.getCOSObject().setInt(COSName.K, c);
+                tr1.appendKid(cell);
+            }
+
+            PDStructureElement tr2 = new PDStructureElement("TR", table);
+            tr2.setPage(page2);
+            table.appendKid(tr2);
+            for (int c = 0; c < 2; c++) {
+                PDStructureElement cell = new PDStructureElement("TD", tr2);
+                cell.setPage(page2);
+                cell.getCOSObject().setInt(COSName.K, c);
+                tr2.appendKid(cell);
+            }
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * An outer 1x1 tagged table whose sole TD has NO marked content of its own and instead wraps
+     * a nested, independently-tagged 2x2 table (own TR/TD + own MCID text). Used to prove the
+     * nested table's rows never leak into the outer table's grid, and extract standalone.
+     */
+    static void taggedNested(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            String[][] innerCells = {{"R1C1", "R1C2"}, {"R2C1", "R2C2"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                        text(cs, 60 + c * 120, 700 - r * 30, innerCells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+
+            PDStructureElement outerTable = new PDStructureElement("Table", root);
+            outerTable.setPage(page);
+            root.appendKid(outerTable);
+            PDStructureElement outerTr = new PDStructureElement("TR", outerTable);
+            outerTr.setPage(page);
+            outerTable.appendKid(outerTr);
+            PDStructureElement outerTd = new PDStructureElement("TD", outerTr);
+            outerTd.setPage(page);
+            outerTr.appendKid(outerTd);
+            // outerTd deliberately carries no MCID of its own -- only wraps the nested table.
+
+            PDStructureElement innerTable = new PDStructureElement("Table", outerTd);
+            innerTable.setPage(page);
+            outerTd.appendKid(innerTable);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", innerTable);
+                tr.setPage(page);
+                innerTable.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    PDStructureElement cell = new PDStructureElement("TD", tr);
+                    cell.setPage(page);
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+
+            doc.save(file.toFile());
+        }
+    }
 }

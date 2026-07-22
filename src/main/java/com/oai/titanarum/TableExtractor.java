@@ -4,14 +4,18 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 
 import org.apache.pdfbox.contentstream.PDFGraphicsStreamEngine;
 import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
+import org.apache.pdfbox.text.PDFTextStripperByArea;
+import org.apache.pdfbox.text.TextPosition;
 
 import java.awt.geom.Point2D;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Table extraction for report.json: a tagged-structure path (Table/TR/TH/TD from the
@@ -587,6 +591,127 @@ final class TableExtractor {
                 }
             }
             return new Point2D.Float(0, 0);
+        }
+    }
+
+    // ---------------------------------------------------------------- text fill
+
+    /**
+     * Join per-char TextPositions into cell text: group into lines by y (2pt tolerance),
+     * order lines top-to-bottom and chars left-to-right, insert a space on word-sized gaps,
+     * join lines with '\n'.
+     */
+    static String joinText(List<TextPosition> chars) {
+        if (chars.isEmpty()) return "";
+        List<TextPosition> sorted = new ArrayList<>(chars);
+        sorted.sort(java.util.Comparator.comparingDouble(TextPosition::getYDirAdj)
+                .thenComparingDouble(TextPosition::getXDirAdj));
+        StringBuilder out = new StringBuilder();
+        float lineY = sorted.get(0).getYDirAdj();
+        TextPosition prev = null;
+        for (TextPosition tp : sorted) {
+            if (tp.getYDirAdj() - lineY > 2f) {           // new line
+                out.append('\n');
+                lineY = tp.getYDirAdj();
+                prev = null;
+            }
+            if (prev != null) {
+                float gap = tp.getXDirAdj() - (prev.getXDirAdj() + prev.getWidthDirAdj());
+                if (gap > Math.max(1.5f, 0.25f * tp.getHeightDir()) && out.length() > 0
+                        && out.charAt(out.length() - 1) != ' ') {
+                    out.append(' ');
+                }
+            }
+            out.append(tp.getUnicode());
+            prev = tp;
+        }
+        return out.toString().strip();
+    }
+
+    /** Midpoint-containment bucket of positions into a cell rect (top-left space). */
+    private static void fillCellsFromPositions(List<CellRect> cells, List<TextPosition> positions) {
+        for (CellRect c : cells) {
+            List<TextPosition> in = new ArrayList<>();
+            for (TextPosition tp : positions) {
+                float mx = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
+                float my = tp.getYDirAdj() - tp.getHeightDir() / 2;
+                if (mx >= c.x0 && mx <= c.x1 && my >= c.y0 && my <= c.y1) in.add(tp);
+            }
+            c.text = joinText(in);
+        }
+    }
+
+    /** Fallback when no TextPositions were collected (--skip-text-urls): region-strip per cell. */
+    private static void fillCellsByRegion(List<CellRect> cells, PDPage page) throws IOException {
+        PDFTextStripperByArea area = new PDFTextStripperByArea();
+        for (int i = 0; i < cells.size(); i++) {
+            CellRect c = cells.get(i);
+            area.addRegion("c" + i,
+                    new java.awt.geom.Rectangle2D.Float(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0));
+        }
+        area.extractRegions(page);
+        for (int i = 0; i < cells.size(); i++) {
+            cells.get(i).text = area.getTextForRegion("c" + i).strip();
+        }
+    }
+
+    // ---------------------------------------------------------------- entry point
+
+    /**
+     * Extract tables for the given (1-indexed) pages. Never throws: per-page failures are
+     * logged and skipped. positionsByPage may be empty (--skip-text-urls) -> region fallback.
+     */
+    static Result extract(PDDocument doc, List<Integer> pagesToProcess,
+                          Map<Integer, List<TextPosition>> positionsByPage) {
+        Result result = new Result();
+        for (int pageNum : pagesToProcess) {
+            try {
+                extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result);
+            } catch (RulingOverflowException e) {
+                result.truncated = true;
+                System.err.println("WARNING: table extraction skipped on page " + pageNum + " (ruling cap)");
+            } catch (Exception e) {
+                System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
+            }
+        }
+        result.tables.sort(java.util.Comparator
+                .<TableHit>comparingInt(t -> t.page)
+                .thenComparingDouble(t -> t.bbox == null ? 0 : t.bbox[1]));
+        return result;
+    }
+
+    private static void extractLatticePage(PDDocument doc, int pageNum,
+                                           List<TextPosition> positions, Result result) throws IOException {
+        if (pageNum < 1 || pageNum > doc.getNumberOfPages()) return;
+        PDPage page = doc.getPage(pageNum - 1);
+        List<Ruling> rulings = normalize(collectRulings(page));
+        if (rulings.isEmpty()) return;
+        List<Ruling> horiz = new ArrayList<>();
+        List<Ruling> vert = new ArrayList<>();
+        for (Ruling r : rulings) (r.horizontal() ? horiz : vert).add(r);
+        List<CellRect> cells = findCells(horiz, vert);
+        if (cells.isEmpty()) return;
+
+        int tablesOnPage = 0;
+        for (List<CellRect> comp : groupIntoTables(cells)) {
+            if (comp.size() > MAX_CELLS_PER_TABLE) {
+                result.truncated = true;
+                continue;
+            }
+            // Tentatively fill text, then build (buildTable copies CellRect.text into cells).
+            if (positions != null && !positions.isEmpty()) {
+                fillCellsFromPositions(comp, positions);
+            } else {
+                fillCellsByRegion(comp, page);
+            }
+            TableHit t = buildTable(pageNum, comp, "lattice");
+            if (t == null) continue;
+            if (++tablesOnPage > MAX_TABLES_PER_PAGE) {
+                result.truncated = true;
+                break;
+            }
+            renderViews(t);
+            result.tables.add(t);
         }
     }
 }

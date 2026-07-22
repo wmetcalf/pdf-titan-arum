@@ -52,4 +52,43 @@ final class TableTestPdfs {
             doc.save(file.toFile());
         }
     }
+
+    /**
+     * 2x2 grid at x=50/150/250, y(bottom-left)=700/670/640 whose TOP internal vertical is
+     * missing: header cell spans both columns. Header text "HDR", bottom cells "L"/"R".
+     */
+    static void mergedHeader(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640}) line(cs, 50, y, 250, y);
+                line(cs, 50, 700, 50, 640);
+                line(cs, 250, 700, 250, 640);
+                line(cs, 150, 670, 150, 640); // internal vertical only on the bottom row
+                text(cs, 55, 680, "HDR");
+                text(cs, 55, 650, "L");
+                text(cs, 155, 650, "R");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /** No tables: a paragraph, an underlined word, and one boxed callout rectangle. */
+    static void noTables(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                text(cs, 50, 700, "This paragraph has no table structure at all.");
+                text(cs, 50, 660, "underlined");
+                line(cs, 50, 657, 105, 657);        // underline
+                cs.addRect(50, 500, 200, 80);        // boxed callout = single cell, not a table
+                cs.stroke();
+                text(cs, 60, 540, "callout box");
+            }
+            doc.save(file.toFile());
+        }
+    }
 }

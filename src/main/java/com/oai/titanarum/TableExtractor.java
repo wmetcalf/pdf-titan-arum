@@ -99,6 +99,15 @@ final class TableExtractor {
     static final float EPS = 1f;            // intersection tolerance (pt)
     static final float MIN_RULING_LEN = 8f; // shorter segments are decoration
     static final float THIN_FILL_MAX = 3f;  // filled rects thinner than this are lines
+    // A hair above the intersection-point count of a MAX_CELLS_PER_TABLE-sized grid
+    // (101x101 points ~ 10k cells); MAX_RULINGS_PER_PAGE alone (5k horiz x 5k vert) still
+    // allows a 25M-point cross product, so findCells enforces this cap independently.
+    static final int MAX_INTERSECTIONS = 40_000;
+
+    /** Thrown when a page exceeds a geometry cap (ruling/intersection bomb) — caller skips the page. */
+    static final class RulingOverflowException extends RuntimeException {
+        RulingOverflowException() { super("ruling cap exceeded", null, true, false); }
+    }
 
     /** An axis-aligned ruling segment, normalized so x1<=x2 and y1<=y2. */
     static final class Ruling {
@@ -126,18 +135,25 @@ final class TableExtractor {
 
     /**
      * Snap endpoints to the SNAP grid, merge collinear overlapping/adjacent fragments,
-     * then drop rulings that intersect no perpendicular ruling (isolated underlines).
+     * apply the minimum-length filter to the MERGED rulings, then drop rulings that
+     * intersect no perpendicular ruling (isolated underlines).
+     *
+     * <p>The length filter runs after merging (not per raw fragment) so a dashed border
+     * drawn as many short collinear strokes (each individually under MIN_RULING_LEN) still
+     * survives once the dashes are merged into one long logical ruling.
      */
     static List<Ruling> normalize(List<Ruling> raw) {
         List<Ruling> horiz = new ArrayList<>();
         List<Ruling> vert = new ArrayList<>();
         for (Ruling r : raw) {
             Ruling s = new Ruling(snap(r.x1), snap(r.y1), snap(r.x2), snap(r.y2));
-            if (s.horizontal() && !s.vertical() && s.length() >= MIN_RULING_LEN) horiz.add(s);
-            else if (s.vertical() && !s.horizontal() && s.length() >= MIN_RULING_LEN) vert.add(s);
+            if (s.horizontal() && !s.vertical()) horiz.add(s);
+            else if (s.vertical() && !s.horizontal()) vert.add(s);
         }
         horiz = mergeCollinear(horiz, true);
         vert = mergeCollinear(vert, false);
+        horiz.removeIf(h -> h.length() < MIN_RULING_LEN);
+        vert.removeIf(v -> v.length() < MIN_RULING_LEN);
 
         List<Ruling> keptH = new ArrayList<>();
         for (Ruling h : horiz) if (intersectsAny(h, vert)) keptH.add(h);
@@ -201,7 +217,10 @@ final class TableExtractor {
             for (Ruling v : vert) {
                 if (intersects(h, v)) {
                     long key = (((long) Float.floatToIntBits(v.x1)) << 32) | (Float.floatToIntBits(h.y1) & 0xffffffffL);
-                    if (pts.add(key)) points.add(new float[]{v.x1, h.y1});
+                    if (pts.add(key)) {
+                        points.add(new float[]{v.x1, h.y1});
+                        if (points.size() > MAX_INTERSECTIONS) throw new RulingOverflowException();
+                    }
                 }
             }
         }
@@ -264,9 +283,21 @@ final class TableExtractor {
         return new ArrayList<>(comps.values());
     }
 
+    /**
+     * True when two cell rectangles share an EDGE, not merely a corner point: they must
+     * abut (within SNAP) along one axis while their projections on the other axis overlap
+     * by a positive length (&gt; EPS). Pure bbox-overlap-with-slack would also call two
+     * rectangles that meet only at a shared corner "touching", which lets diagonal quadrants
+     * of an otherwise-empty 2x2 grid merge into a single (bogus) component.
+     */
     private static boolean touches(CellRect a, CellRect b) {
-        return a.x0 <= b.x1 + SNAP && b.x0 <= a.x1 + SNAP
-            && a.y0 <= b.y1 + SNAP && b.y0 <= a.y1 + SNAP;
+        float xOverlap = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+        float yOverlap = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+        boolean xAdjacent = Math.abs(a.x1 - b.x0) <= SNAP || Math.abs(b.x1 - a.x0) <= SNAP;
+        boolean yAdjacent = Math.abs(a.y1 - b.y0) <= SNAP || Math.abs(b.y1 - a.y0) <= SNAP;
+        if (xAdjacent && yOverlap > EPS) return true;   // side-by-side, sharing a vertical edge
+        if (yAdjacent && xOverlap > EPS) return true;   // stacked, sharing a horizontal edge
+        return xOverlap > EPS && yOverlap > EPS;        // genuine area overlap (shouldn't normally occur)
     }
 
     private static int find(int[] p, int i) { while (p[i] != i) { p[i] = p[p[i]]; i = p[i]; } return i; }

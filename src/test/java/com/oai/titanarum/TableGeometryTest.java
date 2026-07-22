@@ -115,6 +115,54 @@ class TableGeometryTest {
         assertEquals(2, t.cells.get(8).col);
     }
 
+    @Test
+    void groupRequiresEdgeAdjacencyNotCornerTouch() {
+        // Two cells meeting only at a shared corner point (diagonal quadrants of an
+        // otherwise-empty 2x2 grid) must NOT be merged into one component.
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        cells.add(cellRect(50, 100, 150, 130));
+        cells.add(cellRect(150, 130, 250, 160));
+        List<List<TableExtractor.CellRect>> comps = TableExtractor.groupIntoTables(cells);
+        assertEquals(2, comps.size(), "corner-touching cells must be separate components");
+        assertNull(TableExtractor.buildTable(1, comps.get(0), "lattice"));
+        assertNull(TableExtractor.buildTable(1, comps.get(1), "lattice"));
+    }
+
+    @Test
+    void findCellsThrowsOnIntersectionBomb() {
+        // 250 horizontals x 250 verticals, all crossing -> 62,500 intersection points,
+        // well past MAX_INTERSECTIONS (40,000); must fail fast during point collection.
+        List<TableExtractor.Ruling> horiz = new ArrayList<>();
+        List<TableExtractor.Ruling> vert = new ArrayList<>();
+        for (int i = 0; i < 250; i++) horiz.add(h(i * 4f, 0, 1000));
+        for (int i = 0; i < 250; i++) vert.add(v(i * 4f, 0, 1000));
+        assertThrows(TableExtractor.RulingOverflowException.class,
+                () -> TableExtractor.findCells(horiz, vert));
+    }
+
+    @Test
+    void normalizeMergesDashedRulingBeforeLengthFilter() {
+        // A horizontal drawn as 20 dashes of 4pt each with 1pt gaps (merged span ~100pt);
+        // individually each dash is well under MIN_RULING_LEN(8) and must not be dropped
+        // before merging. A frame (second long horizontal + two crossing verticals) keeps
+        // it alive per the isolated-ruling rule.
+        List<TableExtractor.Ruling> raw = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            float x0 = i * 5f;
+            raw.add(h(100, x0, x0 + 4));
+        }
+        raw.add(h(190, 0, 99));
+        raw.add(v(0, 100, 190));
+        raw.add(v(99, 100, 190));
+        List<TableExtractor.Ruling> out = TableExtractor.normalize(raw);
+        TableExtractor.Ruling dashed = out.stream()
+                .filter(r -> r.horizontal() && Math.abs(r.y1 - 100) < 3)
+                .findFirst()
+                .orElse(null);
+        assertNotNull(dashed, "dashed horizontal must survive merge + length filter");
+        assertTrue(dashed.length() > 80, "merged dashed ruling should be close to full span, not filtered piecewise");
+    }
+
     private static TableExtractor.CellRect cellRect(float x0, float y0, float x1, float y1) {
         TableExtractor.CellRect c = new TableExtractor.CellRect();
         c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;

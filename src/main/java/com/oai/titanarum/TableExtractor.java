@@ -2,6 +2,13 @@ package com.oai.titanarum;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 
+import org.apache.pdfbox.contentstream.PDFGraphicsStreamEngine;
+import org.apache.pdfbox.cos.COSName;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
+
+import java.awt.geom.Point2D;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -392,5 +399,117 @@ final class TableExtractor {
             if (d < bestD) { bestD = d; best = i; }
         }
         return best;
+    }
+
+    // ---------------------------------------------------------------- ruling collection
+
+    /**
+     * Collect candidate ruling segments from a page's content stream: stroked axis-aligned
+     * segments plus thin filled rectangles (many generators draw rules as fills).
+     * Output is in top-left-origin page space.
+     */
+    static List<Ruling> collectRulings(PDPage page) throws IOException {
+        RulingCollector rc = new RulingCollector(page);
+        rc.processPage(page);
+        return rc.rulings;
+    }
+
+    private static final class RulingCollector extends PDFGraphicsStreamEngine {
+        final List<Ruling> rulings = new ArrayList<>();
+        private final float pageHeight;
+        // current subpath, as device-space points
+        private final List<float[]> path = new ArrayList<>();
+
+        RulingCollector(PDPage page) {
+            super(page);
+            this.pageHeight = page.getCropBox().getHeight();
+        }
+
+        private float flipY(float y) { return pageHeight - y; }
+
+        private void addRuling(float x1, float y1, float x2, float y2) {
+            boolean axisAligned = Math.abs(x1 - x2) <= EPS || Math.abs(y1 - y2) <= EPS;
+            if (!axisAligned) return;
+            Ruling r = new Ruling(x1, flipY(y1), x2, flipY(y2));
+            if (r.length() < MIN_RULING_LEN) return;
+            if (rulings.size() >= MAX_RULINGS_PER_PAGE) throw new RulingOverflowException();
+            rulings.add(r);
+        }
+
+        // -- path construction (coordinates arrive already CTM-transformed / device space)
+
+        @Override public void moveTo(float x, float y) { path.clear(); path.add(new float[]{x, y}); }
+
+        @Override public void lineTo(float x, float y) { path.add(new float[]{x, y}); }
+
+        @Override public void curveTo(float x1, float y1, float x2, float y2, float x3, float y3) {
+            path.add(new float[]{x3, y3}); // curves are not rulings; keep the endpoint for continuity
+        }
+
+        @Override public void appendRectangle(Point2D p0, Point2D p1, Point2D p2, Point2D p3) {
+            path.clear();
+            path.add(new float[]{(float) p0.getX(), (float) p0.getY()});
+            path.add(new float[]{(float) p1.getX(), (float) p1.getY()});
+            path.add(new float[]{(float) p2.getX(), (float) p2.getY()});
+            path.add(new float[]{(float) p3.getX(), (float) p3.getY()});
+            path.add(new float[]{(float) p0.getX(), (float) p0.getY()});
+        }
+
+        @Override public void closePath() {
+            if (!path.isEmpty()) path.add(path.get(0).clone());
+        }
+
+        @Override public void strokePath() {
+            for (int i = 1; i < path.size(); i++) {
+                float[] a = path.get(i - 1), b = path.get(i);
+                addRuling(a[0], a[1], b[0], b[1]);
+            }
+            path.clear();
+        }
+
+        @Override public void fillPath(int windingRule) {
+            emitThinFillAsRuling();
+            path.clear();
+        }
+
+        @Override public void fillAndStrokePath(int windingRule) {
+            // Stroke edges AND consider the thin-fill case.
+            for (int i = 1; i < path.size(); i++) {
+                float[] a = path.get(i - 1), b = path.get(i);
+                addRuling(a[0], a[1], b[0], b[1]);
+            }
+            emitThinFillAsRuling();
+            path.clear();
+        }
+
+        /** A filled axis-aligned rect thinner than THIN_FILL_MAX in one dimension is a drawn line. */
+        private void emitThinFillAsRuling() {
+            if (path.isEmpty()) return;
+            float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+            for (float[] p : path) {
+                minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
+                minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
+            }
+            float w = maxX - minX, h = maxY - minY;
+            if (h <= THIN_FILL_MAX && w >= MIN_RULING_LEN) {
+                float midY = (minY + maxY) / 2;
+                addRuling(minX, midY, maxX, midY);
+            } else if (w <= THIN_FILL_MAX && h >= MIN_RULING_LEN) {
+                float midX = (minX + maxX) / 2;
+                addRuling(midX, minY, midX, maxY);
+            }
+        }
+
+        // -- everything else ignored
+
+        @Override public void drawImage(PDImage pdImage) {}
+        @Override public void clip(int windingRule) {}
+        @Override public void shadingFill(COSName shadingName) {}
+        @Override public void endPath() { path.clear(); }
+        @Override public Point2D.Float getCurrentPoint() {
+            if (path.isEmpty()) return new Point2D.Float(0, 0);
+            float[] last = path.get(path.size() - 1);
+            return new Point2D.Float(last[0], last[1]);
+        }
     }
 }

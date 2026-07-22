@@ -231,6 +231,9 @@ private boolean skipQrScan;
     @Option(names = {"--skip-phones"}, defaultValue = "false", description = "Skip phone number extraction")
     private boolean skipPhones;
 
+    @Option(names = {"--skip-tables"}, defaultValue = "false", description = "Skip table extraction")
+    private boolean skipTables;
+
     @Option(names = {"--skip-page-export"}, defaultValue = "false", description = "Skip per-page PDF export")
     private boolean skipPageExport;
 
@@ -264,6 +267,7 @@ private boolean skipQrScan;
     public void setSkipScreenshots(boolean v) { this.skipScreenshots = v; }
     public void setSkipImages(boolean v)      { this.skipImages = v; }
     public void setSkipPhones(boolean v)      { this.skipPhones = v; }
+    public void setSkipTables(boolean v)      { this.skipTables = v; }
     public void setSkipPageExport(boolean v)  { this.skipPageExport = v; }
     public void setSkipTextUrls(boolean v)    { this.skipTextUrls = v; }
     public void setNoSkipBlanks(boolean v) { this.noSkipBlanks = v; }
@@ -785,6 +789,18 @@ private boolean skipQrScan;
                 pt.page = ptd.page();
                 pt.text = ptd.stripper().getCollectedText().stripTrailing();
                 report.pageTexts.add(pt);
+            }
+
+            if (!skipTables) {
+                java.util.Map<Integer, java.util.List<TextPosition>> posByPage = new java.util.HashMap<>();
+                for (PageTextData ptd : pageTextData) {
+                    posByPage.put(ptd.page(), ptd.stripper().positionsForRange(0, Integer.MAX_VALUE));
+                }
+                TableExtractor.Result tablesResult = TableExtractor.extract(document, pagesToProcess, posByPage);
+                report.tables.addAll(tablesResult.tables);
+                if (tablesResult.truncated) report.tablesTruncated = Boolean.TRUE;
+                checkInterrupted();
+                profTick(_pt, "tables");
             }
 
             if (!skipPageExport) {
@@ -5245,6 +5261,7 @@ for (int pageNum : pagesToProcess) {
             @JsonProperty("skip_screenshots") boolean skipScreenshots,
             @JsonProperty("skip_images") boolean skipImages,
             @JsonProperty("skip_phones") boolean skipPhones,
+            @JsonProperty("skip_tables") boolean skipTables,
             @JsonProperty("skip_page_export") boolean skipPageExport,
             @JsonProperty("skip_text_urls") boolean skipTextUrls,
             @JsonProperty("no_skip_blanks") boolean noSkipBlanks,
@@ -5318,6 +5335,7 @@ for (int pageNum : pagesToProcess) {
         setSkipScreenshots(job.skipScreenshots());
         setSkipImages(job.skipImages());
         setSkipPhones(job.skipPhones());
+        setSkipTables(job.skipTables());
         setSkipPageExport(job.skipPageExport());
         setSkipTextUrls(job.skipTextUrls());
         setNoSkipBlanks(job.noSkipBlanks());
@@ -5447,6 +5465,8 @@ for (int pageNum : pagesToProcess) {
         public List<ImageArtifact> renderedImages = new ArrayList<>();
         public List<ImageArtifact> resourceImages = new ArrayList<>();
         public List<PageText> pageTexts = new ArrayList<>();
+        public List<TableExtractor.TableHit> tables = new ArrayList<>();
+        public Boolean tablesTruncated;   // only serialized when true (NON_NULL)
         public int revisionCount;
         @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
         public List<RevisionArtifact> revisions;

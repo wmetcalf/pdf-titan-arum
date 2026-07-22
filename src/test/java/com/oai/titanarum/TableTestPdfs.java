@@ -75,6 +75,26 @@ final class TableTestPdfs {
         }
     }
 
+    /** Same content as {@link #ruled3x3}, but with the page's /Rotate set to the given degrees. */
+    static void rotatedRuled3x3(Path file, int rotationDegrees) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) line(cs, x, 700, x, 610);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+            }
+            page.setRotation(rotationDegrees);
+            doc.save(file.toFile());
+        }
+    }
+
     /** No tables: a paragraph, an underlined word, and one boxed callout rectangle. */
     static void noTables(Path file) throws IOException {
         try (PDDocument doc = new PDDocument()) {

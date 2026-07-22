@@ -39,6 +39,14 @@ final class TableExtractor {
     // free-runs lineTo/curveTo without ever issuing a paint op would otherwise grow this
     // buffer unboundedly; see RulingCollector.addPoint for the drop-not-throw handling.
     static final int MAX_PATH_POINTS = 50_000;
+    // fillCellsFromPositions is O(cells x positions) with no other natural bound (unlike the
+    // ruling/cell caps above, which cap the geometry side). A page with a huge glyph count
+    // (text bomb) crossed with a table containing many cells could otherwise stall on this
+    // midpoint-containment scan; this budget counts each (cell, position) check across the
+    // WHOLE page (shared across every table component filled via the position path) and bails
+    // out deterministically, consistent with the other geometry caps' throw-and-skip-page
+    // handling in extract()'s per-page catch.
+    static final long MAX_TEXTFILL_WORK = 20_000_000;
 
     private TableExtractor() {}
 
@@ -416,7 +424,9 @@ final class TableExtractor {
     /**
      * Collect candidate ruling segments from a page's content stream: stroked axis-aligned
      * segments plus thin filled rectangles (many generators draw rules as fills).
-     * Output is in top-left-origin page space.
+     * Output is in the page's VISUAL top-left-origin space, i.e. after applying /Rotate
+     * (see {@link #applyPageRotation}) -- the same frame {@code PDFTextStripperByArea} and
+     * {@code TextPosition.getX()/getY()} use, so rulings and text always share one frame.
      */
     static List<Ruling> collectRulings(PDPage page) throws IOException {
         RulingCollector rc = new RulingCollector(page);
@@ -424,9 +434,30 @@ final class TableExtractor {
         return rc.rulings;
     }
 
+    /**
+     * Maps a point from the page's UNROTATED cropBox-relative, top-left, y-down frame (i.e.
+     * post shiftX/flipY, which is also the frame {@code TextPosition.getXDirAdj()/getYDirAdj()}
+     * always report in -- those track per-glyph text DIRECTION, not the page's /Rotate) into the
+     * page's VISUAL top-left frame after applying /Rotate. This is derived to match PDFBox's own
+     * rotation-aware {@code TextPosition.getX()/getY()} (which IS keyed off page.getRotation(),
+     * and which {@code PDFTextStripperByArea} compares region rectangles against): verified by
+     * constructing a rotated fixture and printing getX()/getY() against the formula below for
+     * r=90/180/270. {@code unrotatedW}/{@code unrotatedH} are the page's cropBox width/height
+     * BEFORE any 90/270 visual swap.
+     */
+    static float[] applyPageRotation(float x, float y, int rotation, float unrotatedW, float unrotatedH) {
+        switch (rotation) {
+            case 90:  return new float[]{ unrotatedH - y, x };
+            case 180: return new float[]{ unrotatedW - x, unrotatedH - y };
+            case 270: return new float[]{ y, unrotatedW - x };
+            default:  return new float[]{ x, y };
+        }
+    }
+
     private static final class RulingCollector extends PDFGraphicsStreamEngine {
         final List<Ruling> rulings = new ArrayList<>();
         private final PDRectangle cropBox;
+        private final int rotation;
 
         // A path may batch several subpaths (multiple m/l groups, or multiple re rects)
         // before a single paint op (S / f / B); each finished subpath is moved into
@@ -439,6 +470,7 @@ final class TableExtractor {
         RulingCollector(PDPage page) {
             super(page);
             this.cropBox = page.getCropBox();
+            this.rotation = page.getRotation();
         }
 
         // Page space is cropBox-relative (matches TextPosition space): shift x by the
@@ -450,7 +482,10 @@ final class TableExtractor {
         private void addRuling(float x1, float y1, float x2, float y2) {
             boolean axisAligned = Math.abs(x1 - x2) <= EPS || Math.abs(y1 - y2) <= EPS;
             if (!axisAligned) return;
-            Ruling r = new Ruling(shiftX(x1), flipY(y1), shiftX(x2), flipY(y2));
+            float uw = cropBox.getWidth(), uh = cropBox.getHeight();
+            float[] p1 = applyPageRotation(shiftX(x1), flipY(y1), rotation, uw, uh);
+            float[] p2 = applyPageRotation(shiftX(x2), flipY(y2), rotation, uw, uh);
+            Ruling r = new Ruling(p1[0], p1[1], p2[0], p2[1]);
             if (r.length() < MIN_RULING_LEN) return;
             if (rulings.size() >= MAX_RULINGS_PER_PAGE) throw new RulingOverflowException();
             rulings.add(r);
@@ -628,30 +663,77 @@ final class TableExtractor {
         return out.toString().strip();
     }
 
-    /** Midpoint-containment bucket of positions into a cell rect (top-left space). */
-    private static void fillCellsFromPositions(List<CellRect> cells, List<TextPosition> positions) {
+    /**
+     * Midpoint-containment bucket of positions into a cell rect (visual, /Rotate-applied space
+     * -- same as {@link #collectRulings}). {@code getXDirAdj()/getYDirAdj()} report per-glyph
+     * text DIRECTION, not the page's /Rotate (proven empirically: identical values regardless of
+     * page.getRotation() for upright text), so the raw midpoint computed from them is always in
+     * the UNROTATED frame; {@link #applyPageRotation} converts it into the same visual frame the
+     * (now rotation-aware) cell rects live in, using the shared transform also applied in
+     * {@code RulingCollector}.
+     *
+     * <p>Bounded by {@code budget} (see {@link #MAX_TEXTFILL_WORK}): a hostile page pairing a
+     * huge glyph count with a many-celled table would otherwise make this O(cells x positions)
+     * scan unbounded, unlike every other hot loop in this class.
+     */
+    static void fillCellsFromPositions(List<CellRect> cells, List<TextPosition> positions,
+                                        int rotation, float unrotatedW, float unrotatedH,
+                                        long[] work, long budget) {
         for (CellRect c : cells) {
             List<TextPosition> in = new ArrayList<>();
             for (TextPosition tp : positions) {
-                float mx = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
-                float my = tp.getYDirAdj() - tp.getHeightDir() / 2;
-                if (mx >= c.x0 && mx <= c.x1 && my >= c.y0 && my <= c.y1) in.add(tp);
+                if (++work[0] > budget) throw new RulingOverflowException();
+                float ux = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
+                float uy = tp.getYDirAdj() - tp.getHeightDir() / 2;
+                float[] v = applyPageRotation(ux, uy, rotation, unrotatedW, unrotatedH);
+                if (v[0] >= c.x0 && v[0] <= c.x1 && v[1] >= c.y0 && v[1] <= c.y1) in.add(tp);
             }
             c.text = joinText(in);
         }
     }
 
-    /** Fallback when no TextPositions were collected (--skip-text-urls): region-strip per cell. */
-    private static void fillCellsByRegion(List<CellRect> cells, PDPage page) throws IOException {
+    private static void fillCellsFromPositions(List<CellRect> cells, List<TextPosition> positions,
+                                               int rotation, float unrotatedW, float unrotatedH, long[] work) {
+        fillCellsFromPositions(cells, positions, rotation, unrotatedW, unrotatedH, work, MAX_TEXTFILL_WORK);
+    }
+
+    /**
+     * Fallback when no TextPositions were collected (--skip-text-urls): region-strip, batched
+     * into ONE {@code PDFTextStripperByArea} pass (one content-stream walk) for every qualifying
+     * table on the page, rather than one walk per table. Regions are namespaced
+     * {@code "t"+tableIdx+"c"+cellIdx} so cells from different tables never collide.
+     *
+     * <p>{@code PDFTextStripperByArea} matches a region against {@code TextPosition.getX()/getY()}
+     * (verified from source: {@code rect.contains(text.getX(), text.getY())}), which -- unlike
+     * getXDirAdj/getYDirAdj -- IS keyed off the page's actual /Rotate. Our cell rects are already
+     * in that same visual frame (via {@link #collectRulings}), so no extra transform is needed
+     * here.
+     *
+     * <p>{@code setSortByPosition(true)}: without it, on a page whose /Rotate disagrees with its
+     * glyphs' own (unrotated) text direction -- exactly the shape produced by rotating an
+     * otherwise-ordinary page via the /Rotate flag alone, which is how {@code rotatedRuled3x3}
+     * (and plenty of real scanned/rotated PDFs) are built -- the default line-grouping
+     * mis-splits a single token across several one-character lines (e.g. "R3C1" back as
+     * "R\n3C\n1"). Verified empirically: identical region, same characters matched, only this
+     * flag differs between the broken and clean output.
+     */
+    private static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page) throws IOException {
         PDFTextStripperByArea area = new PDFTextStripperByArea();
-        for (int i = 0; i < cells.size(); i++) {
-            CellRect c = cells.get(i);
-            area.addRegion("c" + i,
-                    new java.awt.geom.Rectangle2D.Float(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0));
+        area.setSortByPosition(true);
+        for (int ti = 0; ti < tables.size(); ti++) {
+            List<CellRect> comp = tables.get(ti);
+            for (int ci = 0; ci < comp.size(); ci++) {
+                CellRect c = comp.get(ci);
+                area.addRegion("t" + ti + "c" + ci,
+                        new java.awt.geom.Rectangle2D.Float(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0));
+            }
         }
         area.extractRegions(page);
-        for (int i = 0; i < cells.size(); i++) {
-            cells.get(i).text = area.getTextForRegion("c" + i).strip();
+        for (int ti = 0; ti < tables.size(); ti++) {
+            List<CellRect> comp = tables.get(ti);
+            for (int ci = 0; ci < comp.size(); ci++) {
+                comp.get(ci).text = area.getTextForRegion("t" + ti + "c" + ci).strip();
+            }
         }
     }
 
@@ -684,6 +766,11 @@ final class TableExtractor {
                                            List<TextPosition> positions, Result result) throws IOException {
         if (pageNum < 1 || pageNum > doc.getNumberOfPages()) return;
         PDPage page = doc.getPage(pageNum - 1);
+        int rotation = page.getRotation();
+        PDRectangle cropBox = page.getCropBox();
+        float unrotatedW = cropBox.getWidth();
+        float unrotatedH = cropBox.getHeight();
+
         List<Ruling> rulings = normalize(collectRulings(page));
         if (rulings.isEmpty()) return;
         List<Ruling> horiz = new ArrayList<>();
@@ -692,24 +779,37 @@ final class TableExtractor {
         List<CellRect> cells = findCells(horiz, vert);
         if (cells.isEmpty()) return;
 
+        // Decide which components actually become tables (geometry only - buildTable(...) here
+        // is used twice per kept table: once to gate on the 2x2 threshold / MAX_TABLES_PER_PAGE
+        // before any text is filled, and once for real below once cell text is in place. This
+        // (cheap, in-memory) double geometry pass is what lets the region-strip fallback below
+        // run ONE content-stream walk for the whole page instead of one per table.
+        List<List<CellRect>> kept = new ArrayList<>();
         int tablesOnPage = 0;
         for (List<CellRect> comp : groupIntoTables(cells)) {
             if (comp.size() > MAX_CELLS_PER_TABLE) {
                 result.truncated = true;
                 continue;
             }
-            // Tentatively fill text, then build (buildTable copies CellRect.text into cells).
-            if (positions != null && !positions.isEmpty()) {
-                fillCellsFromPositions(comp, positions);
-            } else {
-                fillCellsByRegion(comp, page);
-            }
-            TableHit t = buildTable(pageNum, comp, "lattice");
-            if (t == null) continue;
+            if (buildTable(pageNum, comp, "lattice") == null) continue;
             if (++tablesOnPage > MAX_TABLES_PER_PAGE) {
                 result.truncated = true;
                 break;
             }
+            kept.add(comp);
+        }
+
+        if (positions != null && !positions.isEmpty()) {
+            long[] work = {0};
+            for (List<CellRect> comp : kept) {
+                fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work);
+            }
+        } else if (!kept.isEmpty()) {
+            fillCellsByRegion(kept, page);
+        }
+
+        for (List<CellRect> comp : kept) {
+            TableHit t = buildTable(pageNum, comp, "lattice");
             renderViews(t);
             result.tables.add(t);
         }

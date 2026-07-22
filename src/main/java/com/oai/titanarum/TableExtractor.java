@@ -92,4 +92,240 @@ final class TableExtractor {
         if (s == null || s.isEmpty()) return "";
         return s.replace("\\", "\\\\").replace("|", "\\|").replace('\n', ' ');
     }
+
+    // ---------------------------------------------------------------- geometry
+
+    static final float SNAP = 2f;           // endpoint snap grid (pt)
+    static final float EPS = 1f;            // intersection tolerance (pt)
+    static final float MIN_RULING_LEN = 8f; // shorter segments are decoration
+    static final float THIN_FILL_MAX = 3f;  // filled rects thinner than this are lines
+
+    /** An axis-aligned ruling segment, normalized so x1<=x2 and y1<=y2. */
+    static final class Ruling {
+        final float x1, y1, x2, y2;
+
+        Ruling(float x1, float y1, float x2, float y2) {
+            this.x1 = Math.min(x1, x2);
+            this.x2 = Math.max(x1, x2);
+            this.y1 = Math.min(y1, y2);
+            this.y2 = Math.max(y1, y2);
+        }
+
+        boolean horizontal() { return y1 == y2; }
+        boolean vertical()   { return x1 == x2; }
+        float length()       { return horizontal() ? x2 - x1 : y2 - y1; }
+    }
+
+    /** A minimal (possibly spanning) cell rectangle found from rulings. */
+    static final class CellRect {
+        float x0, y0, x1, y1;
+        String text;
+    }
+
+    private static float snap(float v) { return Math.round(v / SNAP) * SNAP; }
+
+    /**
+     * Snap endpoints to the SNAP grid, merge collinear overlapping/adjacent fragments,
+     * then drop rulings that intersect no perpendicular ruling (isolated underlines).
+     */
+    static List<Ruling> normalize(List<Ruling> raw) {
+        List<Ruling> horiz = new ArrayList<>();
+        List<Ruling> vert = new ArrayList<>();
+        for (Ruling r : raw) {
+            Ruling s = new Ruling(snap(r.x1), snap(r.y1), snap(r.x2), snap(r.y2));
+            if (s.horizontal() && !s.vertical() && s.length() >= MIN_RULING_LEN) horiz.add(s);
+            else if (s.vertical() && !s.horizontal() && s.length() >= MIN_RULING_LEN) vert.add(s);
+        }
+        horiz = mergeCollinear(horiz, true);
+        vert = mergeCollinear(vert, false);
+
+        List<Ruling> keptH = new ArrayList<>();
+        for (Ruling h : horiz) if (intersectsAny(h, vert)) keptH.add(h);
+        List<Ruling> keptV = new ArrayList<>();
+        for (Ruling v : vert) if (intersectsAny(v, keptH)) keptV.add(v);
+        List<Ruling> out = new ArrayList<>(keptH);
+        out.addAll(keptV);
+        return out;
+    }
+
+    private static List<Ruling> mergeCollinear(List<Ruling> in, boolean horizontal) {
+        // Group by the fixed coordinate, then sweep-merge along the variable one.
+        java.util.Map<Float, List<Ruling>> byPos = new java.util.TreeMap<>();
+        for (Ruling r : in) byPos.computeIfAbsent(horizontal ? r.y1 : r.x1, k -> new ArrayList<>()).add(r);
+        List<Ruling> out = new ArrayList<>();
+        for (var e : byPos.entrySet()) {
+            List<Ruling> group = e.getValue();
+            group.sort(java.util.Comparator.comparingDouble(r -> horizontal ? r.x1 : r.y1));
+            float lo = horizontal ? group.get(0).x1 : group.get(0).y1;
+            float hi = horizontal ? group.get(0).x2 : group.get(0).y2;
+            for (int i = 1; i < group.size(); i++) {
+                Ruling r = group.get(i);
+                float s = horizontal ? r.x1 : r.y1, t = horizontal ? r.x2 : r.y2;
+                if (s <= hi + SNAP) { hi = Math.max(hi, t); }
+                else {
+                    out.add(horizontal ? new Ruling(lo, e.getKey(), hi, e.getKey())
+                                       : new Ruling(e.getKey(), lo, e.getKey(), hi));
+                    lo = s; hi = t;
+                }
+            }
+            out.add(horizontal ? new Ruling(lo, e.getKey(), hi, e.getKey())
+                               : new Ruling(e.getKey(), lo, e.getKey(), hi));
+        }
+        return out;
+    }
+
+    private static boolean intersectsAny(Ruling r, List<Ruling> perpendiculars) {
+        for (Ruling p : perpendiculars) if (intersects(r, p)) return true;
+        return false;
+    }
+
+    /** True when a horizontal and a vertical ruling cross (with EPS slack at endpoints). */
+    private static boolean intersects(Ruling a, Ruling b) {
+        Ruling h = a.horizontal() ? a : b;
+        Ruling v = a.horizontal() ? b : a;
+        if (!h.horizontal() || !v.vertical()) return false;
+        return v.x1 >= h.x1 - EPS && v.x1 <= h.x2 + EPS
+            && h.y1 >= v.y1 - EPS && h.y1 <= v.y2 + EPS;
+    }
+
+    /**
+     * tabula's spreadsheet algorithm: intersection points -> for each top-left corner,
+     * the nearest bottom-right corner whose four edges are fully covered by rulings
+     * forms a cell. Spanning cells fall out naturally where internal edges are absent.
+     */
+    static List<CellRect> findCells(List<Ruling> horiz, List<Ruling> vert) {
+        // All intersection points, sorted (y, x).
+        java.util.TreeSet<Long> pts = new java.util.TreeSet<>();
+        List<float[]> points = new ArrayList<>();
+        for (Ruling h : horiz) {
+            for (Ruling v : vert) {
+                if (intersects(h, v)) {
+                    long key = (((long) Float.floatToIntBits(v.x1)) << 32) | (Float.floatToIntBits(h.y1) & 0xffffffffL);
+                    if (pts.add(key)) points.add(new float[]{v.x1, h.y1});
+                }
+            }
+        }
+        points.sort((p, q) -> p[1] != q[1] ? Float.compare(p[1], q[1]) : Float.compare(p[0], q[0]));
+
+        java.util.Set<String> pointSet = new java.util.HashSet<>();
+        for (float[] p : points) pointSet.add(pkey(p[0], p[1]));
+
+        List<CellRect> cells = new ArrayList<>();
+        for (int i = 0; i < points.size(); i++) {
+            float[] tl = points.get(i);
+            CellRect best = null;
+            for (int j = i + 1; j < points.size() && best == null; j++) {
+                float[] br = points.get(j);
+                if (br[0] <= tl[0] + EPS || br[1] <= tl[1] + EPS) continue;
+                if (!pointSet.contains(pkey(br[0], tl[1]))) continue; // top-right corner
+                if (!pointSet.contains(pkey(tl[0], br[1]))) continue; // bottom-left corner
+                if (edgeCoveredH(horiz, tl[1], tl[0], br[0])
+                        && edgeCoveredH(horiz, br[1], tl[0], br[0])
+                        && edgeCoveredV(vert, tl[0], tl[1], br[1])
+                        && edgeCoveredV(vert, br[0], tl[1], br[1])) {
+                    CellRect c = new CellRect();
+                    c.x0 = tl[0]; c.y0 = tl[1]; c.x1 = br[0]; c.y1 = br[1];
+                    best = c;
+                }
+            }
+            if (best != null) cells.add(best);
+        }
+        return cells;
+    }
+
+    private static String pkey(float x, float y) { return snap(x) + ":" + snap(y); }
+
+    private static boolean edgeCoveredH(List<Ruling> horiz, float y, float xa, float xb) {
+        for (Ruling h : horiz) {
+            if (Math.abs(h.y1 - y) <= EPS && h.x1 <= xa + EPS && h.x2 >= xb - EPS) return true;
+        }
+        return false;
+    }
+
+    private static boolean edgeCoveredV(List<Ruling> vert, float x, float ya, float yb) {
+        for (Ruling v : vert) {
+            if (Math.abs(v.x1 - x) <= EPS && v.y1 <= ya + EPS && v.y2 >= yb - EPS) return true;
+        }
+        return false;
+    }
+
+    /** Union cells whose rectangles touch (within SNAP) into candidate tables. */
+    static List<List<CellRect>> groupIntoTables(List<CellRect> cells) {
+        int n = cells.size();
+        int[] parent = new int[n];
+        for (int i = 0; i < n; i++) parent[i] = i;
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                if (touches(cells.get(i), cells.get(j))) union(parent, i, j);
+            }
+        }
+        java.util.Map<Integer, List<CellRect>> comps = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < n; i++) comps.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(cells.get(i));
+        return new ArrayList<>(comps.values());
+    }
+
+    private static boolean touches(CellRect a, CellRect b) {
+        return a.x0 <= b.x1 + SNAP && b.x0 <= a.x1 + SNAP
+            && a.y0 <= b.y1 + SNAP && b.y0 <= a.y1 + SNAP;
+    }
+
+    private static int find(int[] p, int i) { while (p[i] != i) { p[i] = p[p[i]]; i = p[i]; } return i; }
+    private static void union(int[] p, int a, int b) { p[find(p, a)] = find(p, b); }
+
+    /**
+     * Assign row/col indices + spans from clustered edge boundaries and build the TableHit
+     * (no text, views not rendered). Returns null for components below 2x2 / 4 cells.
+     *
+     * <p>Note: the 2x2 threshold is enforced below via the clustered row/col boundary counts
+     * (rowCount, colCount), not via {@code comp.size()} — a component can legitimately contain
+     * fewer than 4 CellRects (e.g. 3) when a spanning cell covers more than one logical grid
+     * cell, while still representing a full 2x2 (4 logical cell) table.
+     */
+    static TableHit buildTable(int page, List<CellRect> comp, String method) {
+        if (comp.isEmpty()) return null;
+        java.util.TreeSet<Float> xsSet = new java.util.TreeSet<>();
+        java.util.TreeSet<Float> ysSet = new java.util.TreeSet<>();
+        for (CellRect c : comp) {
+            xsSet.add(snap(c.x0)); xsSet.add(snap(c.x1));
+            ysSet.add(snap(c.y0)); ysSet.add(snap(c.y1));
+        }
+        List<Float> xs = new ArrayList<>(xsSet);
+        List<Float> ys = new ArrayList<>(ysSet);
+        int colCount = xs.size() - 1;
+        int rowCount = ys.size() - 1;
+        if (rowCount < 2 || colCount < 2) return null;
+
+        TableHit t = new TableHit();
+        t.page = page;
+        t.extractionMethod = method;
+        t.rowCount = rowCount;
+        t.colCount = colCount;
+        t.cells = new ArrayList<>(comp.size());
+        float bx0 = Float.MAX_VALUE, by0 = Float.MAX_VALUE, bx1 = -Float.MAX_VALUE, by1 = -Float.MAX_VALUE;
+        for (CellRect c : comp) {
+            CellHit cell = new CellHit();
+            cell.col = nearestIndex(xs, c.x0);
+            cell.row = nearestIndex(ys, c.y0);
+            cell.colSpan = Math.max(1, nearestIndex(xs, c.x1) - cell.col);
+            cell.rowSpan = Math.max(1, nearestIndex(ys, c.y1) - cell.row);
+            cell.text = c.text;
+            cell.bbox = new float[]{c.x0, c.y0, c.x1, c.y1};
+            t.cells.add(cell);
+            bx0 = Math.min(bx0, c.x0); by0 = Math.min(by0, c.y0);
+            bx1 = Math.max(bx1, c.x1); by1 = Math.max(by1, c.y1);
+        }
+        t.bbox = new float[]{bx0, by0, bx1, by1};
+        t.cells.sort(java.util.Comparator.<CellHit>comparingInt(c -> c.row).thenComparingInt(c -> c.col));
+        return t;
+    }
+
+    private static int nearestIndex(List<Float> boundaries, float v) {
+        int best = 0;
+        float bestD = Float.MAX_VALUE;
+        for (int i = 0; i < boundaries.size(); i++) {
+            float d = Math.abs(boundaries.get(i) - v);
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
 }

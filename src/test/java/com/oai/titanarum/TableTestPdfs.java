@@ -1,9 +1,15 @@
 package com.oai.titanarum;
 
+import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureElement;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureTreeRoot;
+import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDPropertyList;
+import org.apache.pdfbox.pdmodel.documentinterchange.taggedpdf.PDTableAttributeObject;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 
@@ -108,6 +114,74 @@ final class TableTestPdfs {
                 cs.stroke();
                 text(cs, 60, 540, "callout box");
             }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A TAGGED 2x2 table (no drawn rulings): StructTreeRoot -> Table -> TR/TR with
+     * TH("Name") TH("Qty") / TD("Ada", colSpan=1) TD("3"). First-row cells are TH.
+     * The second row's first TD carries a ColSpan=1 attribute (attribute plumbing test).
+     */
+    static void tagged2x2(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            String[][] cells = {{"Name", "Qty"}, {"Ada", "3"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
+                                PDPropertyList.create(d));
+                        text(cs, 60 + c * 120, 700 - r * 30, cells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
+                    cell.setPage(page);
+                    if (r == 1 && c == 0) {
+                        PDTableAttributeObject att = new PDTableAttributeObject();
+                        att.setColSpan(1);
+                        cell.addAttribute(att);
+                    }
+                    cell.getCOSObject().setInt(COSName.K, mcid++); // kid = bare MCID
+                    tr.appendKid(cell);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /** Tagged Table element with NO TR children — degenerate; must be rejected. */
+    static void taggedDegenerate(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                text(cs, 60, 700, "not really a table");
+            }
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
             doc.save(file.toFile());
         }
     }

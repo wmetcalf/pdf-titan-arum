@@ -3,19 +3,30 @@ package com.oai.titanarum;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import org.apache.pdfbox.contentstream.PDFGraphicsStreamEngine;
+import org.apache.pdfbox.cos.COSBase;
+import org.apache.pdfbox.cos.COSInteger;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureElement;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureNode;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureTreeRoot;
+import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedContent;
+import org.apache.pdfbox.pdmodel.documentinterchange.taggedpdf.PDTableAttributeObject;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
+import org.apache.pdfbox.text.PDFMarkedContentExtractor;
 import org.apache.pdfbox.text.PDFTextStripperByArea;
 import org.apache.pdfbox.text.TextPosition;
 
 import java.awt.geom.Point2D;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Table extraction for report.json: a tagged-structure path (Table/TR/TH/TD from the
@@ -746,7 +757,14 @@ final class TableExtractor {
     static Result extract(PDDocument doc, List<Integer> pagesToProcess,
                           Map<Integer, List<TextPosition>> positionsByPage) {
         Result result = new Result();
+        Set<Integer> coveredByTagged = new HashSet<>();
+        try {
+            extractTagged(doc, new HashSet<>(pagesToProcess), coveredByTagged, result);
+        } catch (Exception e) {
+            System.err.println("WARNING: tagged table extraction failed: " + e);
+        }
         for (int pageNum : pagesToProcess) {
+            if (coveredByTagged.contains(pageNum)) continue;
             try {
                 extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result);
             } catch (RulingOverflowException e) {
@@ -812,6 +830,210 @@ final class TableExtractor {
             TableHit t = buildTable(pageNum, comp, "lattice");
             renderViews(t);
             result.tables.add(t);
+        }
+    }
+
+    // ---------------------------------------------------------------- tagged path
+
+    /** Internal: one tagged cell before grid placement. */
+    private static final class TaggedCell {
+        String text = "";
+        int rowSpan = 1, colSpan = 1;
+        boolean th;
+        float[] bbox;   // union of glyph boxes; null when no glyphs resolved
+        PDPage page;
+    }
+
+    private static void extractTagged(PDDocument doc, Set<Integer> pagesToProcess,
+                                      Set<Integer> coveredOut, Result result) throws IOException {
+        PDStructureTreeRoot root = doc.getDocumentCatalog().getStructureTreeRoot();
+        if (root == null) return;
+        List<PDStructureElement> tables = new ArrayList<>();
+        collectByType(root, "Table", tables, 0);
+        if (tables.isEmpty()) return;
+
+        // page -> (mcid -> glyphs), computed lazily, one content pass per page
+        Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache = new HashMap<>();
+        // page object -> 1-indexed number
+        Map<PDPage, Integer> pageNumbers = new HashMap<>();
+        int n = 0;
+        for (PDPage p : doc.getPages()) pageNumbers.put(p, ++n);
+
+        for (PDStructureElement tableEl : tables) {
+            TableHit t = buildTaggedTable(tableEl, mcidCache, pageNumbers);
+            if (t == null) continue;                      // degenerate -> lattice may still run
+            if (!pagesToProcess.contains(t.page)) continue;
+            renderViews(t);
+            result.tables.add(t);
+            coveredOut.add(t.page);
+        }
+    }
+
+    /** DFS for structure elements of a standard type; depth-capped against cyclic/hostile trees. */
+    private static void collectByType(PDStructureNode node, String type,
+                                      List<PDStructureElement> out, int depth) {
+        if (depth > 64 || out.size() > 10_000) return;
+        for (Object kid : node.getKids()) {
+            if (kid instanceof PDStructureElement el) {
+                if (type.equals(el.getStandardStructureType())) out.add(el);
+                else collectByType(el, type, out, depth + 1);
+            }
+        }
+    }
+
+    /** Build one tagged table; returns null when degenerate (no rows / no textful cells). */
+    private static TableHit buildTaggedTable(PDStructureElement tableEl,
+                                             Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache,
+                                             Map<PDPage, Integer> pageNumbers) throws IOException {
+        List<PDStructureElement> trs = new ArrayList<>();
+        collectByType(tableEl, "TR", trs, 0);
+        if (trs.isEmpty()) return null;
+
+        List<List<TaggedCell>> rows = new ArrayList<>();
+        for (PDStructureElement tr : trs) {
+            List<TaggedCell> row = new ArrayList<>();
+            for (Object kid : tr.getKids()) {
+                if (!(kid instanceof PDStructureElement el)) continue;
+                String st = el.getStandardStructureType();
+                if (!"TD".equals(st) && !"TH".equals(st)) continue;
+                TaggedCell cell = new TaggedCell();
+                cell.th = "TH".equals(st);
+                readSpans(el, cell);
+                resolveCellText(el, cell, mcidCache);
+                row.add(cell);
+            }
+            if (!row.isEmpty()) rows.add(row);
+        }
+        if (rows.isEmpty()) return null;
+        if (rows.stream().allMatch(r -> r.stream().allMatch(c -> c.text.isEmpty()))) return null;
+
+        // Grid placement with an occupancy map (HTML table algorithm).
+        int colCount = 0;
+        List<CellHit> placed = new ArrayList<>();
+        Map<Long, Boolean> occupied = new HashMap<>();
+        PDPage tablePage = null;
+        float bx0 = Float.MAX_VALUE, by0 = Float.MAX_VALUE, bx1 = -Float.MAX_VALUE, by1 = -Float.MAX_VALUE;
+        boolean anyBbox = false;
+        for (int r = 0; r < rows.size(); r++) {
+            int c = 0;
+            for (TaggedCell cell : rows.get(r)) {
+                while (occupied.containsKey(((long) r << 32) | c)) c++;
+                CellHit hit = new CellHit();
+                hit.row = r;
+                hit.col = c;
+                hit.rowSpan = cell.rowSpan;
+                hit.colSpan = cell.colSpan;
+                hit.text = cell.text;
+                hit.bbox = cell.bbox;
+                if (cell.th) hit.header = Boolean.TRUE;
+                placed.add(hit);
+                for (int rr = r; rr < r + cell.rowSpan; rr++) {
+                    for (int cc = c; cc < c + cell.colSpan; cc++) {
+                        occupied.put(((long) rr << 32) | cc, Boolean.TRUE);
+                    }
+                }
+                colCount = Math.max(colCount, c + cell.colSpan);
+                if (cell.page != null && tablePage == null) tablePage = cell.page;
+                if (cell.bbox != null) {
+                    anyBbox = true;
+                    bx0 = Math.min(bx0, cell.bbox[0]); by0 = Math.min(by0, cell.bbox[1]);
+                    bx1 = Math.max(bx1, cell.bbox[2]); by1 = Math.max(by1, cell.bbox[3]);
+                }
+                c += cell.colSpan;
+                if (placed.size() > MAX_CELLS_PER_TABLE) return null;
+            }
+        }
+        if (tablePage == null || colCount == 0) return null;
+        Integer pageNum = pageNumbers.get(tablePage);
+        if (pageNum == null) return null;
+
+        TableHit t = new TableHit();
+        t.page = pageNum;
+        t.extractionMethod = "tagged";
+        t.rowCount = rows.size();
+        t.colCount = colCount;
+        t.cells = placed;
+        if (anyBbox) t.bbox = new float[]{bx0, by0, bx1, by1};
+        return t;
+    }
+
+    private static void readSpans(PDStructureElement el, TaggedCell cell) {
+        try {
+            org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.Revisions<
+                    org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDAttributeObject> revisions =
+                    el.getAttributes();
+            // Revisions is not Iterable (no getAll()/iterator()) -- index by size()/getObject(i).
+            for (int i = 0; i < revisions.size(); i++) {
+                Object att = revisions.getObject(i);
+                if (att instanceof PDTableAttributeObject tao) {
+                    cell.rowSpan = Math.max(1, tao.getRowSpan());
+                    cell.colSpan = Math.max(1, tao.getColSpan());
+                }
+            }
+        } catch (Exception ignored) {
+            // hostile/malformed attribute dicts: keep 1x1
+        }
+    }
+
+    /** Gather the cell's MCIDs (bare integer kids and MCR kids), resolve to glyphs, join text. */
+    private static void resolveCellText(PDStructureElement el, TaggedCell cell,
+                                        Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache) throws IOException {
+        List<TextPosition> glyphs = new ArrayList<>();
+        collectGlyphs(el, el.getPage(), glyphs, mcidCache, 0);
+        cell.text = joinText(glyphs);
+        if (!glyphs.isEmpty()) {
+            float x0 = Float.MAX_VALUE, y0 = Float.MAX_VALUE, x1 = -Float.MAX_VALUE, y1 = -Float.MAX_VALUE;
+            for (TextPosition tp : glyphs) {
+                x0 = Math.min(x0, tp.getXDirAdj());
+                y0 = Math.min(y0, tp.getYDirAdj() - tp.getHeightDir());
+                x1 = Math.max(x1, tp.getXDirAdj() + tp.getWidthDirAdj());
+                y1 = Math.max(y1, tp.getYDirAdj());
+            }
+            cell.bbox = new float[]{x0, y0, x1, y1};
+        }
+        if (el.getPage() != null) cell.page = el.getPage();
+    }
+
+    private static void collectGlyphs(PDStructureNode node, PDPage inheritedPage, List<TextPosition> out,
+                                      Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache, int depth) throws IOException {
+        if (depth > 64) return;
+        PDPage page = inheritedPage;
+        if (node instanceof PDStructureElement el && el.getPage() != null) page = el.getPage();
+        for (Object kid : node.getKids()) {
+            if (kid instanceof PDStructureElement el) {
+                collectGlyphs(el, page, out, mcidCache, depth + 1);
+            } else if (kid instanceof Integer mcid && page != null) {
+                out.addAll(glyphsFor(page, mcid, mcidCache));
+            } else if (kid instanceof COSInteger ci && page != null) {
+                out.addAll(glyphsFor(page, (int) ci.longValue(), mcidCache));
+            } else if (kid instanceof org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkedContentReference mcr) {
+                PDPage mcrPage = mcr.getPage() != null ? mcr.getPage() : page;
+                if (mcrPage != null) out.addAll(glyphsFor(mcrPage, mcr.getMCID(), mcidCache));
+            }
+        }
+    }
+
+    private static List<TextPosition> glyphsFor(PDPage page, int mcid,
+                                                Map<PDPage, Map<Integer, List<TextPosition>>> cache) throws IOException {
+        Map<Integer, List<TextPosition>> byMcid = cache.get(page);
+        if (byMcid == null) {
+            byMcid = new HashMap<>();
+            PDFMarkedContentExtractor ex = new PDFMarkedContentExtractor();
+            ex.processPage(page);
+            for (PDMarkedContent mc : ex.getMarkedContents()) flattenMarkedContent(mc, byMcid);
+            cache.put(page, byMcid);
+        }
+        return byMcid.getOrDefault(mcid, List.of());
+    }
+
+    private static void flattenMarkedContent(PDMarkedContent mc, Map<Integer, List<TextPosition>> byMcid) {
+        int mcid = mc.getMCID();
+        for (Object content : mc.getContents()) {
+            if (content instanceof TextPosition tp && mcid >= 0) {
+                byMcid.computeIfAbsent(mcid, k -> new ArrayList<>()).add(tp);
+            } else if (content instanceof PDMarkedContent nested) {
+                flattenMarkedContent(nested, byMcid);
+            }
         }
     }
 }

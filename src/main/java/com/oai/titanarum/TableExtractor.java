@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import org.apache.pdfbox.contentstream.PDFGraphicsStreamEngine;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
 
 import java.awt.geom.Point2D;
@@ -29,6 +30,11 @@ final class TableExtractor {
     static final int MAX_TABLES_PER_PAGE = 50;
     static final int MAX_CELLS_PER_TABLE = 10_000;
     static final int MAX_RULINGS_PER_PAGE = 10_000;
+    // Total buffered path points (across all pending subpaths of one path) RulingCollector
+    // will hold before giving up on that path as a ruling candidate. A content stream that
+    // free-runs lineTo/curveTo without ever issuing a paint op would otherwise grow this
+    // buffer unboundedly; see RulingCollector.addPoint for the drop-not-throw handling.
+    static final int MAX_PATH_POINTS = 50_000;
 
     private TableExtractor() {}
 
@@ -416,77 +422,139 @@ final class TableExtractor {
 
     private static final class RulingCollector extends PDFGraphicsStreamEngine {
         final List<Ruling> rulings = new ArrayList<>();
-        private final float pageHeight;
-        // current subpath, as device-space points
-        private final List<float[]> path = new ArrayList<>();
+        private final PDRectangle cropBox;
+
+        // A path may batch several subpaths (multiple m/l groups, or multiple re rects)
+        // before a single paint op (S / f / B); each finished subpath is moved into
+        // `subpaths` by moveTo/appendRectangle, with `current` holding the one still open.
+        private final List<List<float[]>> subpaths = new ArrayList<>();
+        private List<float[]> current = new ArrayList<>();
+        private int pointCount = 0;
+        private boolean overflowed = false;
 
         RulingCollector(PDPage page) {
             super(page);
-            this.pageHeight = page.getCropBox().getHeight();
+            this.cropBox = page.getCropBox();
         }
 
-        private float flipY(float y) { return pageHeight - y; }
+        // Page space is cropBox-relative (matches TextPosition space): shift x by the
+        // cropBox's lower-left corner, and flip y around the cropBox's upper edge rather
+        // than the raw page height, so a non-origin CropBox doesn't leave rulings offset.
+        private float shiftX(float x) { return x - cropBox.getLowerLeftX(); }
+        private float flipY(float y) { return cropBox.getUpperRightY() - y; }
 
         private void addRuling(float x1, float y1, float x2, float y2) {
             boolean axisAligned = Math.abs(x1 - x2) <= EPS || Math.abs(y1 - y2) <= EPS;
             if (!axisAligned) return;
-            Ruling r = new Ruling(x1, flipY(y1), x2, flipY(y2));
+            Ruling r = new Ruling(shiftX(x1), flipY(y1), shiftX(x2), flipY(y2));
             if (r.length() < MIN_RULING_LEN) return;
             if (rulings.size() >= MAX_RULINGS_PER_PAGE) throw new RulingOverflowException();
             rulings.add(r);
         }
 
-        // -- path construction (coordinates arrive already CTM-transformed / device space)
+        // -- path accumulation (coordinates arrive already CTM-transformed / device space)
 
-        @Override public void moveTo(float x, float y) { path.clear(); path.add(new float[]{x, y}); }
+        /**
+         * Buffer one path point, subject to MAX_PATH_POINTS. On overflow we DROP the
+         * buffered geometry for this path rather than throwing: an enormous path is
+         * legitimate page content (vector art), just not a ruling candidate, and the
+         * caps that guard actual output size (MAX_RULINGS_PER_PAGE, findCells' caps)
+         * already bound the expensive parts of the pipeline. We stay "overflowed" -
+         * ignoring further points - until the next paint op or endPath resets state.
+         */
+        private void addPoint(float[] p) {
+            if (overflowed) return;
+            if (pointCount >= MAX_PATH_POINTS) {
+                overflowed = true;
+                subpaths.clear();
+                current = new ArrayList<>();
+                return;
+            }
+            current.add(p);
+            pointCount++;
+        }
 
-        @Override public void lineTo(float x, float y) { path.add(new float[]{x, y}); }
+        private void finalizeCurrentSubpath() {
+            if (!current.isEmpty()) {
+                subpaths.add(current);
+                current = new ArrayList<>();
+            }
+        }
+
+        private void resetPath() {
+            subpaths.clear();
+            current = new ArrayList<>();
+            pointCount = 0;
+            overflowed = false;
+        }
+
+        @Override public void moveTo(float x, float y) {
+            if (overflowed) return;
+            finalizeCurrentSubpath();
+            addPoint(new float[]{x, y});
+        }
+
+        @Override public void lineTo(float x, float y) {
+            if (overflowed) return;
+            addPoint(new float[]{x, y});
+        }
 
         @Override public void curveTo(float x1, float y1, float x2, float y2, float x3, float y3) {
-            path.add(new float[]{x3, y3}); // curves are not rulings; keep the endpoint for continuity
+            if (overflowed) return;
+            addPoint(new float[]{x3, y3}); // curves are not rulings; keep the endpoint for continuity
         }
 
         @Override public void appendRectangle(Point2D p0, Point2D p1, Point2D p2, Point2D p3) {
-            path.clear();
-            path.add(new float[]{(float) p0.getX(), (float) p0.getY()});
-            path.add(new float[]{(float) p1.getX(), (float) p1.getY()});
-            path.add(new float[]{(float) p2.getX(), (float) p2.getY()});
-            path.add(new float[]{(float) p3.getX(), (float) p3.getY()});
-            path.add(new float[]{(float) p0.getX(), (float) p0.getY()});
+            if (overflowed) return;
+            finalizeCurrentSubpath();
+            addPoint(new float[]{(float) p0.getX(), (float) p0.getY()});
+            addPoint(new float[]{(float) p1.getX(), (float) p1.getY()});
+            addPoint(new float[]{(float) p2.getX(), (float) p2.getY()});
+            addPoint(new float[]{(float) p3.getX(), (float) p3.getY()});
+            addPoint(new float[]{(float) p0.getX(), (float) p0.getY()});
         }
 
         @Override public void closePath() {
-            if (!path.isEmpty()) path.add(path.get(0).clone());
+            if (overflowed || current.isEmpty()) return;
+            float[] first = current.get(0);
+            addPoint(new float[]{first[0], first[1]});
         }
 
         @Override public void strokePath() {
-            for (int i = 1; i < path.size(); i++) {
-                float[] a = path.get(i - 1), b = path.get(i);
-                addRuling(a[0], a[1], b[0], b[1]);
+            finalizeCurrentSubpath();
+            for (List<float[]> sp : subpaths) {
+                for (int i = 1; i < sp.size(); i++) {
+                    float[] a = sp.get(i - 1), b = sp.get(i);
+                    addRuling(a[0], a[1], b[0], b[1]);
+                }
             }
-            path.clear();
+            resetPath();
         }
 
         @Override public void fillPath(int windingRule) {
-            emitThinFillAsRuling();
-            path.clear();
+            finalizeCurrentSubpath();
+            for (List<float[]> sp : subpaths) emitThinFillAsRuling(sp);
+            resetPath();
         }
 
         @Override public void fillAndStrokePath(int windingRule) {
-            // Stroke edges AND consider the thin-fill case.
-            for (int i = 1; i < path.size(); i++) {
-                float[] a = path.get(i - 1), b = path.get(i);
-                addRuling(a[0], a[1], b[0], b[1]);
+            finalizeCurrentSubpath();
+            for (List<float[]> sp : subpaths) {
+                // Stroke edges AND consider the thin-fill case, per subpath.
+                for (int i = 1; i < sp.size(); i++) {
+                    float[] a = sp.get(i - 1), b = sp.get(i);
+                    addRuling(a[0], a[1], b[0], b[1]);
+                }
+                emitThinFillAsRuling(sp);
             }
-            emitThinFillAsRuling();
-            path.clear();
+            resetPath();
         }
 
         /** A filled axis-aligned rect thinner than THIN_FILL_MAX in one dimension is a drawn line. */
-        private void emitThinFillAsRuling() {
-            if (path.isEmpty()) return;
+        private void emitThinFillAsRuling(List<float[]> sp) {
+            if (sp.isEmpty()) return;
             float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
-            for (float[] p : path) {
+            for (float[] p : sp) {
                 minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
                 minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
             }
@@ -505,11 +573,20 @@ final class TableExtractor {
         @Override public void drawImage(PDImage pdImage) {}
         @Override public void clip(int windingRule) {}
         @Override public void shadingFill(COSName shadingName) {}
-        @Override public void endPath() { path.clear(); }
+        @Override public void endPath() { resetPath(); }
         @Override public Point2D.Float getCurrentPoint() {
-            if (path.isEmpty()) return new Point2D.Float(0, 0);
-            float[] last = path.get(path.size() - 1);
-            return new Point2D.Float(last[0], last[1]);
+            if (!current.isEmpty()) {
+                float[] last = current.get(current.size() - 1);
+                return new Point2D.Float(last[0], last[1]);
+            }
+            if (!subpaths.isEmpty()) {
+                List<float[]> lastSp = subpaths.get(subpaths.size() - 1);
+                if (!lastSp.isEmpty()) {
+                    float[] p = lastSp.get(lastSp.size() - 1);
+                    return new Point2D.Float(p[0], p[1]);
+                }
+            }
+            return new Point2D.Float(0, 0);
         }
     }
 }

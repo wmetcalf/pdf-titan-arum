@@ -102,7 +102,17 @@ final class TableExtractor {
     // A hair above the intersection-point count of a MAX_CELLS_PER_TABLE-sized grid
     // (101x101 points ~ 10k cells); MAX_RULINGS_PER_PAGE alone (5k horiz x 5k vert) still
     // allows a 25M-point cross product, so findCells enforces this cap independently.
+    // This bounds memory (point count); it does NOT bound the O(P^2) pair-matching work
+    // below the cap, which is why MAX_FINDCELLS_WORK exists separately.
     static final int MAX_INTERSECTIONS = 40_000;
+    // Deterministic bound on (top-left, bottom-right) candidate pairs examined in findCells'
+    // matching loop. A legitimate dense grid completes almost every top-left's search within
+    // a handful of candidates (the very next point along usually closes the cell), so real
+    // tables finish far under this budget. A "tick-mark grid" adversarial layout — many
+    // intersection points, none of which ever complete a cell — instead forces a full O(P^2)
+    // scan with per-candidate edge-coverage checks; that pathological case now fails fast and
+    // deterministically instead of after a long, input-dependent wall-clock stall.
+    static final long MAX_FINDCELLS_WORK = 2_000_000;
 
     /** Thrown when a page exceeds a geometry cap (ruling/intersection bomb) — caller skips the page. */
     static final class RulingOverflowException extends RuntimeException {
@@ -229,19 +239,33 @@ final class TableExtractor {
         java.util.Set<String> pointSet = new java.util.HashSet<>();
         for (float[] p : points) pointSet.add(pkey(p[0], p[1]));
 
+        // Index rulings by their fixed (snapped) coordinate so an edge-coverage query only
+        // scans the (usually one) rulings actually at that coordinate, instead of every
+        // horizontal/vertical ruling on the page. Since all rulings passed in are
+        // normalize()-snapped to the SNAP grid, a query at a snapped coordinate need only
+        // check that exact key plus its +-SNAP neighbors to preserve the |coord| <= EPS
+        // tolerance the old linear scan gave (EPS < SNAP, so no coordinate 2*SNAP+ away can
+        // ever satisfy it).
+        java.util.Map<Float, List<Ruling>> hByY = new java.util.HashMap<>();
+        for (Ruling h : horiz) hByY.computeIfAbsent(snap(h.y1), k -> new ArrayList<>()).add(h);
+        java.util.Map<Float, List<Ruling>> vByX = new java.util.HashMap<>();
+        for (Ruling v : vert) vByX.computeIfAbsent(snap(v.x1), k -> new ArrayList<>()).add(v);
+
         List<CellRect> cells = new ArrayList<>();
+        long work = 0;
         for (int i = 0; i < points.size(); i++) {
             float[] tl = points.get(i);
             CellRect best = null;
             for (int j = i + 1; j < points.size() && best == null; j++) {
+                if (++work > MAX_FINDCELLS_WORK) throw new RulingOverflowException();
                 float[] br = points.get(j);
                 if (br[0] <= tl[0] + EPS || br[1] <= tl[1] + EPS) continue;
                 if (!pointSet.contains(pkey(br[0], tl[1]))) continue; // top-right corner
                 if (!pointSet.contains(pkey(tl[0], br[1]))) continue; // bottom-left corner
-                if (edgeCoveredH(horiz, tl[1], tl[0], br[0])
-                        && edgeCoveredH(horiz, br[1], tl[0], br[0])
-                        && edgeCoveredV(vert, tl[0], tl[1], br[1])
-                        && edgeCoveredV(vert, br[0], tl[1], br[1])) {
+                if (edgeCoveredH(hByY, tl[1], tl[0], br[0])
+                        && edgeCoveredH(hByY, br[1], tl[0], br[0])
+                        && edgeCoveredV(vByX, tl[0], tl[1], br[1])
+                        && edgeCoveredV(vByX, br[0], tl[1], br[1])) {
                     CellRect c = new CellRect();
                     c.x0 = tl[0]; c.y0 = tl[1]; c.x1 = br[0]; c.y1 = br[1];
                     best = c;
@@ -254,16 +278,26 @@ final class TableExtractor {
 
     private static String pkey(float x, float y) { return snap(x) + ":" + snap(y); }
 
-    private static boolean edgeCoveredH(List<Ruling> horiz, float y, float xa, float xb) {
-        for (Ruling h : horiz) {
-            if (Math.abs(h.y1 - y) <= EPS && h.x1 <= xa + EPS && h.x2 >= xb - EPS) return true;
+    private static boolean edgeCoveredH(java.util.Map<Float, List<Ruling>> hByY, float y, float xa, float xb) {
+        float key = snap(y);
+        for (float k : new float[]{key - SNAP, key, key + SNAP}) {
+            List<Ruling> bucket = hByY.get(k);
+            if (bucket == null) continue;
+            for (Ruling h : bucket) {
+                if (Math.abs(h.y1 - y) <= EPS && h.x1 <= xa + EPS && h.x2 >= xb - EPS) return true;
+            }
         }
         return false;
     }
 
-    private static boolean edgeCoveredV(List<Ruling> vert, float x, float ya, float yb) {
-        for (Ruling v : vert) {
-            if (Math.abs(v.x1 - x) <= EPS && v.y1 <= ya + EPS && v.y2 >= yb - EPS) return true;
+    private static boolean edgeCoveredV(java.util.Map<Float, List<Ruling>> vByX, float x, float ya, float yb) {
+        float key = snap(x);
+        for (float k : new float[]{key - SNAP, key, key + SNAP}) {
+            List<Ruling> bucket = vByX.get(k);
+            if (bucket == null) continue;
+            for (Ruling v : bucket) {
+                if (Math.abs(v.x1 - x) <= EPS && v.y1 <= ya + EPS && v.y2 >= yb - EPS) return true;
+            }
         }
         return false;
     }

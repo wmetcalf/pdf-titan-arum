@@ -163,6 +163,53 @@ class TableGeometryTest {
         assertTrue(dashed.length() > 80, "merged dashed ruling should be close to full span, not filtered piecewise");
     }
 
+    @Test
+    void tickMarkGridFailsFastViaWorkBudget() {
+        // Reviewer's worst-case reproducer: n=60 rows x 60 cols of 10pt tick-mark fragments
+        // (>= MIN_RULING_LEN, so they survive normalize's length filter), with >SNAP gaps
+        // between same-row fragments (so mergeCollinear does NOT merge them), each fragment
+        // crossing only its own column's vertical. This is fully normalize()-legal (no direct
+        // findCells() bypass) and yields ~3.6k intersection points (9% of MAX_INTERSECTIONS)
+        // where essentially no (top-left, bottom-right) candidate pair ever completes a cell
+        // -- forcing a near-full O(P^2) pair scan. Must fail deterministically via the work
+        // budget, and fast (well under a second), not after a long input-dependent stall.
+        int n = 60;
+        float spacing = 20f;
+        List<TableExtractor.Ruling> raw = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            float y = i * spacing;
+            for (int j = 0; j < n; j++) {
+                float x = j * spacing;
+                raw.add(new TableExtractor.Ruling(x - 5, y, x + 5, y));
+            }
+        }
+        for (int j = 0; j < n; j++) {
+            float x = j * spacing;
+            raw.add(new TableExtractor.Ruling(x, 0, x, (n - 1) * spacing));
+        }
+        List<TableExtractor.Ruling> normed = TableExtractor.normalize(raw);
+        List<TableExtractor.Ruling> horiz = normed.stream().filter(TableExtractor.Ruling::horizontal).toList();
+        List<TableExtractor.Ruling> vert = normed.stream().filter(TableExtractor.Ruling::vertical).toList();
+        assertThrows(TableExtractor.RulingOverflowException.class,
+                () -> TableExtractor.findCells(horiz, vert));
+    }
+
+    @Test
+    void denseLegitGridStillCompletes() {
+        // A full 60x60 REAL grid (complete rulings, every cell closed) must still complete
+        // well under the work budget -- proves the cap doesn't harm legitimate dense tables.
+        int n = 60;
+        float spacing = 20f;
+        List<TableExtractor.Ruling> raw = new ArrayList<>();
+        for (int i = 0; i < n; i++) raw.add(h(i * spacing, 0, (n - 1) * spacing));
+        for (int j = 0; j < n; j++) raw.add(v(j * spacing, 0, (n - 1) * spacing));
+        List<TableExtractor.Ruling> normed = TableExtractor.normalize(raw);
+        List<TableExtractor.Ruling> horiz = normed.stream().filter(TableExtractor.Ruling::horizontal).toList();
+        List<TableExtractor.Ruling> vert = normed.stream().filter(TableExtractor.Ruling::vertical).toList();
+        List<TableExtractor.CellRect> cells = TableExtractor.findCells(horiz, vert);
+        assertEquals((n - 1) * (n - 1), cells.size());
+    }
+
     private static TableExtractor.CellRect cellRect(float x0, float y0, float x1, float y1) {
         TableExtractor.CellRect c = new TableExtractor.CellRect();
         c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;

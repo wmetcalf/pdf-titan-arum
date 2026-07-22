@@ -72,3 +72,17 @@ def test_timed_out_false_without_pagesspec_still_rejected():
     report["timedOut"] = False
     with pytest.raises(SchemaValidationError):
         validate_report(report)
+
+
+def test_tables_key_accepted():
+    report = _load()
+    report["tables"] = [{
+        "page": 1, "extractionMethod": "lattice",
+        "bbox": [50.0, 100.0, 350.0, 190.0],
+        "rowCount": 2, "colCount": 2,
+        "rows": [["A", "B"], ["C", "D"]],
+        "cells": [{"row": 0, "col": 0, "rowSpan": 1, "colSpan": 1, "text": "A"}],
+        "markdown": "| A | B |\n|---|---|\n| C | D |",
+    }]
+    report["tablesTruncated"] = True
+    validate_report(report)  # must not raise

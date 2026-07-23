@@ -81,6 +81,38 @@ class TableLatticeTest {
     }
 
     @Test
+    void adjacentIndependentTablesSplitIntoTwoCorrectTables() throws Exception {
+        // FIX 5 reproducer: two independent, axis-aligned tables (A: 2x2 @ 30pt row pitch; B: 3x2
+        // @ 20pt row pitch) drawn directly touching, sharing one vertical border ruling at x=250.
+        // groupIntoTables' edge-adjacency union-find merges them into ONE component; without the
+        // split fix this used to yield a single bogus rowCount=4/colCount=4 table with invented
+        // spans and interleaved rows. Must now split into exactly two correct tables.
+        Path pdf = tmp.resolve("adjacent.pdf");
+        TableTestPdfs.adjacentIndependentTables(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), stripPositions(doc, List.of(1)));
+            assertFalse(r.truncated);
+            assertEquals(2, r.tables.size(), "two independent adjacent tables must split, not merge: " + r.tables);
+
+            TableExtractor.TableHit a = r.tables.stream()
+                    .filter(t -> t.rowCount == 2 && t.colCount == 2)
+                    .findFirst().orElseThrow(() -> new AssertionError("2x2 table A not found: " + r.tables));
+            TableExtractor.TableHit b = r.tables.stream()
+                    .filter(t -> t.rowCount == 3 && t.colCount == 2)
+                    .findFirst().orElseThrow(() -> new AssertionError("3x2 table B not found: " + r.tables));
+
+            assertEquals(List.of(List.of("A11", "A12"), List.of("A21", "A22")), a.rows);
+            assertTrue(a.cells.stream().allMatch(c -> c.rowSpan == 1 && c.colSpan == 1),
+                    "table A must have no invented spans: " + a.cells);
+
+            assertEquals(List.of(
+                    List.of("B11", "B12"), List.of("B21", "B22"), List.of("B31", "B32")), b.rows);
+            assertTrue(b.cells.stream().allMatch(c -> c.rowSpan == 1 && c.colSpan == 1),
+                    "table B must have no invented spans: " + b.cells);
+        }
+    }
+
+    @Test
     void underlinesAndBoxesAreNotTables() throws Exception {
         Path pdf = tmp.resolve("none.pdf");
         TableTestPdfs.noTables(pdf);

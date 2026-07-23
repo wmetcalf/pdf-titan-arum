@@ -274,6 +274,110 @@ class TableGeometryTest {
                 "a legit " + (side * side) + "-cell table must group in well under a second, took " + elapsedMs + "ms");
     }
 
+    // ---------------------------------------------------------------- FIX 5: splitComponent
+
+    /** Table A: 2 rows x 2 cols, 30pt row pitch, x in [0,100,200], y in [0,30,60]. */
+    private static List<TableExtractor.CellRect> tableA() {
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (float y : new float[]{0, 30}) {
+            for (float x : new float[]{0, 100}) {
+                cells.add(cellRect(x, y, x + 100, y + 30));
+            }
+        }
+        return cells;
+    }
+
+    /** Table B: 3 rows x 2 cols, 20pt row pitch, x in [200,300,400], y in [0,20,40,60] --
+     * directly right of {@link #tableA}, sharing its border at x=200, same total y-range [0,60]
+     * but an INCOMPATIBLE row partition (20pt pitch vs A's 30pt). */
+    private static List<TableExtractor.CellRect> tableB() {
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (float y : new float[]{0, 20, 40}) {
+            for (float x : new float[]{200, 300}) {
+                cells.add(cellRect(x, y, x + 100, y + 20));
+            }
+        }
+        return cells;
+    }
+
+    @Test
+    void splitComponentSeparatesTwoAdjacentTablesOfDifferentPitch() {
+        // FIX 5 core repro, driven directly against splitComponent (no PDF/rendering involved):
+        // table A (2x2 @ 30pt pitch) and table B (3x2 @ 20pt pitch) touch at x=200 but their
+        // combined y-range [0,60] happens to tile evenly either way (2*30 == 3*20 == 60) -- so a
+        // naive "does the merged grid cover every slot" check would (wrongly) call this coherent.
+        List<TableExtractor.CellRect> merged = new ArrayList<>();
+        merged.addAll(tableA());
+        merged.addAll(tableB());
+
+        // Sanity: groupIntoTables really does merge these into ONE component (edge-adjacency
+        // only), which is exactly the situation splitComponent must repair.
+        assertEquals(1, TableExtractor.groupIntoTables(merged).size(),
+                "sanity: edge-adjacent A+B must merge into one component before the split fix runs");
+
+        List<List<TableExtractor.CellRect>> split = TableExtractor.splitComponent(merged);
+        assertEquals(2, split.size(), "must split into exactly two independent tables");
+
+        List<TableExtractor.TableHit> hits = split.stream()
+                .map(part -> TableExtractor.buildTable(1, part, "lattice"))
+                .toList();
+        TableExtractor.TableHit a = hits.stream().filter(t -> t.rowCount == 2 && t.colCount == 2)
+                .findFirst().orElseThrow(() -> new AssertionError("2x2 table not found: " + hits));
+        TableExtractor.TableHit b = hits.stream().filter(t -> t.rowCount == 3 && t.colCount == 2)
+                .findFirst().orElseThrow(() -> new AssertionError("3x2 table not found: " + hits));
+        assertTrue(a.cells.stream().allMatch(c -> c.rowSpan == 1 && c.colSpan == 1),
+                "table A must carry no invented spans: " + a.cells);
+        assertTrue(b.cells.stream().allMatch(c -> c.rowSpan == 1 && c.colSpan == 1),
+                "table B must carry no invented spans: " + b.cells);
+    }
+
+    @Test
+    void splitComponentDoesNotFragmentAGenuineSpannedTable() {
+        // Regression guard: a real single table with a genuine spanning cell (missing internal
+        // vertical in the top row, per missingInternalEdgeYieldsSpanningCell) must NOT be split --
+        // splitComponent must return it unchanged, and buildTable must still report the correct
+        // colSpan=2 header cell.
+        List<TableExtractor.Ruling> r = new ArrayList<>();
+        for (float y : new float[]{100, 130, 160}) r.add(h(y, 50, 250));
+        r.add(v(50, 100, 160));
+        r.add(v(250, 100, 160));
+        r.add(v(150, 130, 160)); // internal vertical only exists in the bottom row
+        List<TableExtractor.Ruling> n = TableExtractor.normalize(r);
+        List<TableExtractor.CellRect> cells = TableExtractor.findCells(
+                n.stream().filter(TableExtractor.Ruling::horizontal).toList(),
+                n.stream().filter(TableExtractor.Ruling::vertical).toList());
+
+        List<List<TableExtractor.CellRect>> split = TableExtractor.splitComponent(cells);
+        assertEquals(1, split.size(), "a genuinely spanned single table must not be fragmented");
+
+        TableExtractor.TableHit t = TableExtractor.buildTable(1, split.get(0), "lattice");
+        assertNotNull(t);
+        assertEquals(2, t.rowCount);
+        assertEquals(2, t.colCount);
+        TableExtractor.CellHit wide = t.cells.stream()
+                .filter(c -> c.row == 0 && c.col == 0).findFirst().orElseThrow();
+        assertEquals(2, wide.colSpan, "genuine span must be preserved, not clamped");
+        assertEquals(1, wide.rowSpan);
+    }
+
+    @Test
+    void splitComponentLeavesPlainGridUnsplit() {
+        // A fully-connected, dense, non-spanning grid (no cell has any span at all) must hit
+        // splitComponent's fast path and come back completely unchanged as ONE component --
+        // splitting must never fragment an ordinary table just because SOME internal boundary
+        // happens to allow a clean cut.
+        int side = 20;
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (int rIdx = 0; rIdx < side; rIdx++) {
+            for (int cIdx = 0; cIdx < side; cIdx++) {
+                cells.add(cellRect(cIdx * 10f, rIdx * 10f, cIdx * 10f + 10f, rIdx * 10f + 10f));
+            }
+        }
+        List<List<TableExtractor.CellRect>> split = TableExtractor.splitComponent(cells);
+        assertEquals(1, split.size(), "a plain non-spanning grid must never be split");
+        assertEquals(cells.size(), split.get(0).size());
+    }
+
     private static TableExtractor.CellRect cellRect(float x0, float y0, float x1, float y1) {
         TableExtractor.CellRect c = new TableExtractor.CellRect();
         c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;

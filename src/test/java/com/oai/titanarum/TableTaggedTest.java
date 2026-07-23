@@ -167,6 +167,45 @@ class TableTaggedTest {
     }
 
     @Test
+    void pgInheritedFromTableAncestorStillExtracts() throws Exception {
+        // FIX 7 reproducer: /Pg is set ONLY on the Table structure element (not on TR/TD, as
+        // ISO 32000 permits via inheritance). A page lookup that checks only the TD/TH element
+        // itself resolves null for every cell -> firstCellPage() returns null -> the whole table
+        // is silently dropped (0 tables, no lattice fallback since there are no rulings, no log).
+        // With ancestor-fallback page resolution the table must still extract correctly.
+        Path pdf = tmp.resolve("pg_ancestor.pdf");
+        TableTestPdfs.taggedPgOnTableAncestorOnly(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1, 2), Map.of());
+            assertEquals(1, r.tables.size(),
+                    "a table whose /Pg is only set on an ancestor (Table) must still be extracted, not silently dropped");
+            TableExtractor.TableHit t = r.tables.get(0);
+            assertEquals(2, t.page, "table's page resolved via ancestor /Pg inheritance");
+            assertEquals(2, t.rowCount);
+            assertEquals(2, t.colCount);
+            assertEquals(List.of(List.of("Name", "Qty"), List.of("Ada", "3")), t.rows);
+        }
+    }
+
+    @Test
+    void pgInheritedFromTableAncestorOnOutOfScopePageNeverWalksItsContentStream() throws Exception {
+        // Companion hostile-input guard: the SAME ancestor-/Pg-only fixture, but with page 2
+        // excluded from pagesToProcess. Ancestor-fallback page resolution must remain a cheap,
+        // /Pg-only lookup (no MCID/glyph work) so an out-of-scope table is still rejected before
+        // its page's content stream is ever walked -- this must not reintroduce the
+        // out-of-scope-page-walk DoS the pagesToProcess gating previously fixed.
+        Path pdf = tmp.resolve("pg_ancestor_oos.pdf");
+        TableTestPdfs.taggedPgOnTableAncestorOnly(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            int before = TableExtractor.taggedProcessPageCalls;
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertTrue(r.tables.isEmpty(), "table's only page (2) is out of scope -- must not be emitted");
+            assertEquals(before, TableExtractor.taggedProcessPageCalls,
+                    "page 2's content stream must never be walked when pagesToProcess=[1], even via ancestor /Pg resolution");
+        }
+    }
+
+    @Test
     void crossPageTaggedTableExcludesOtherPagesBbox() throws Exception {
         Path pdf = tmp.resolve("crosspage.pdf");
         TableTestPdfs.taggedCrossPage(pdf);

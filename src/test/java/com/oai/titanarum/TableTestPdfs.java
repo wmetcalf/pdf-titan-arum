@@ -81,6 +81,47 @@ final class TableTestPdfs {
         }
     }
 
+    /**
+     * Reviewer's FIX 5 reproducer: two INDEPENDENT, axis-aligned tables drawn directly touching,
+     * sharing one vertical border ruling at x=250, but with incompatible row pitches --
+     * table A (2 rows x 2 cols, 30pt row pitch, x in [50,250]) and table B (3 rows x 2 cols, 20pt
+     * row pitch, x in [250,450]), both spanning the same y-range [640,700]. Since A and B share
+     * only that one border edge (not a common row partition), groupIntoTables' edge-adjacency
+     * union-find merges them into ONE component -- exercising the split-detection fix. Cell text
+     * is "A{row}{col}" / "B{row}{col}" (1-indexed) so the two expected output tables are easy to
+     * tell apart and verify independently.
+     */
+    static void adjacentIndependentTables(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                // Table A: 2 rows x 2 cols, 30pt pitch, x in [50,150,250].
+                for (float y : new float[]{700, 670, 640}) line(cs, 50, y, 250, y);
+                for (float x : new float[]{50, 150, 250}) line(cs, x, 700, x, 640);
+                String[][] aCells = {{"A11", "A12"}, {"A21", "A22"}};
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        text(cs, 55 + c * 100, 700 - 20 - r * 30, aCells[r][c]);
+                    }
+                }
+                // Table B: 3 rows x 2 cols, 20pt pitch, x in [250,350,450]. Shares the x=250
+                // border with A's right edge, but its OWN row partition (700/680/660/640) has no
+                // correspondence to A's (700/670/640).
+                for (float y : new float[]{700, 680, 660, 640}) line(cs, 250, y, 450, y);
+                for (float x : new float[]{250, 350, 450}) line(cs, x, 700, x, 640);
+                String[][] bCells = {{"B11", "B12"}, {"B21", "B22"}, {"B31", "B32"}};
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        text(cs, 255 + c * 100, 700 - 13 - r * 20, bCells[r][c]);
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
     /** Same content as {@link #ruled3x3}, but with the page's /Rotate set to the given degrees. */
     static void rotatedRuled3x3(Path file, int rotationDegrees) throws IOException {
         try (PDDocument doc = new PDDocument()) {
@@ -121,6 +162,39 @@ final class TableTestPdfs {
                         }
                     }
                 }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A single page with three lines of raw (untagged, unruled) text: "Total" at normal 10pt
+     * baseline (bottom-left y=700), immediately followed by a superscripted "1" at 5pt whose
+     * baseline is raised 4pt above "Total"'s (y=704) -- a footnote-marker-style annotation -- and
+     * a genuine second line "next" a full line-height (12pt) below "Total"'s baseline (y=688).
+     * Used to drive {@code TableExtractor.joinText} directly against real, PDFBox-measured
+     * TextPositions (not hand-constructed ones) to pin the superscript-safe line-grouping fix.
+     */
+    static void superscriptFootnote(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.beginText();
+                cs.setFont(HELV, 10);
+                cs.newLineAtOffset(60, 700);
+                cs.showText("Total");
+                cs.endText();
+                cs.beginText();
+                cs.setFont(HELV, 5);
+                cs.newLineAtOffset(82.3f, 704); // touching "Total"'s right edge, raised 4pt
+                cs.showText("1");
+                cs.endText();
+                cs.beginText();
+                cs.setFont(HELV, 10);
+                cs.newLineAtOffset(60, 688); // one 12pt line-height below "Total"'s baseline
+                cs.showText("next");
+                cs.endText();
             }
             doc.save(file.toFile());
         }
@@ -343,6 +417,59 @@ final class TableTestPdfs {
                 for (int c = 0; c < 2; c++) {
                     PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
                     cell.setPage(page2);
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * Same layout as {@link #taggedOnPageTwo} (page 1 plain text, page 2 the whole tagged 2x2
+     * table's marked content), EXCEPT /Pg is set ONLY on the Table structure element itself --
+     * neither the TR nor the TD/TH elements call {@code setPage(...)} at all. Per ISO 32000, /Pg
+     * is commonly inherited from an ancestor rather than repeated on every leaf; a page lookup
+     * that only checks the TD/TH element itself (no ancestor fallback) resolves {@code null} for
+     * every cell here and must not silently drop the whole table.
+     */
+    static void taggedPgOnTableAncestorOnly(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page1 = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page1);
+            PDPage page2 = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page2);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page1)) {
+                text(cs, 60, 700, "page one, no table");
+            }
+
+            String[][] cells = {{"Name", "Qty"}, {"Ada", "3"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page2)) {
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
+                                PDPropertyList.create(d));
+                        text(cs, 60 + c * 120, 700 - r * 30, cells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page2); // /Pg lives ONLY here -- no TR/TD below ever calls setPage()
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                table.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
                     cell.getCOSObject().setInt(COSName.K, mcid++);
                     tr.appendKid(cell);
                 }

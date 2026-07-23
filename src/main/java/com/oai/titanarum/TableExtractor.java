@@ -174,6 +174,17 @@ final class TableExtractor {
     // scan with per-candidate edge-coverage checks; that pathological case now fails fast and
     // deterministically instead of after a long, input-dependent wall-clock stall.
     static final long MAX_FINDCELLS_WORK = 2_000_000;
+    // Bounds splitComponent's (rowCount x colCount) coherence-check work, counted cumulatively
+    // across every placeGrid/isCoherentPlacement evaluation in one top-level splitComponent call
+    // (including all recursive sub-splits attempted). A genuine touching-but-independent-tables
+    // shape (the FIX 5 repro) resolves in a handful of candidate cuts on a component already
+    // capped at MAX_CELLS_PER_TABLE, so real input finishes far under this budget -- but
+    // rowCount*colCount is NOT itself bounded by comp.size() alone (a component with few CellRects
+    // but many distinct, unaligned boundary coordinates can still cluster into a huge grid), so an
+    // adversarial or pathologically irregular shape, re-evaluated across recursive cut attempts,
+    // could otherwise blow up combinatorially. Sized generously above a legitimate dense
+    // MAX_CELLS_PER_TABLE-sized table's cost (~10,000) for headroom on real irregular tables.
+    static final long MAX_SPLIT_WORK = 20_000_000;
 
     /** Thrown when a page exceeds a geometry cap (ruling/intersection bomb) — caller skips the page. */
     static final class RulingOverflowException extends RuntimeException {
@@ -447,16 +458,23 @@ final class TableExtractor {
     private static void union(int[] p, int a, int b) { p[find(p, a)] = find(p, b); }
 
     /**
-     * Assign row/col indices + spans from clustered edge boundaries and build the TableHit
-     * (no text, views not rendered). Returns null for components below 2x2 / 4 cells.
-     *
-     * <p>Note: the 2x2 threshold is enforced below via the clustered row/col boundary counts
-     * (rowCount, colCount), not via {@code comp.size()} — a component can legitimately contain
-     * fewer than 4 CellRects (e.g. 3) when a spanning cell covers more than one logical grid
-     * cell, while still representing a full 2x2 (4 logical cell) table.
+     * Clustered-grid placement shared by {@link #buildTable} and the split/coherence-detection
+     * logic below: the sorted x/y grid-line boundaries, plus, PARALLEL to the input {@code comp}
+     * (same index i &lt;-&gt; comp.get(i)), each cell's placed row/col/rowSpan/colSpan.
      */
-    static TableHit buildTable(int page, List<CellRect> comp, String method) {
-        if (comp.isEmpty()) return null;
+    private static final class GridPlacement {
+        final List<Float> xs, ys;
+        final int rowCount, colCount;
+        final int[] row, col, rowSpan, colSpan;
+
+        GridPlacement(List<Float> xs, List<Float> ys, int rowCount, int colCount,
+                      int[] row, int[] col, int[] rowSpan, int[] colSpan) {
+            this.xs = xs; this.ys = ys; this.rowCount = rowCount; this.colCount = colCount;
+            this.row = row; this.col = col; this.rowSpan = rowSpan; this.colSpan = colSpan;
+        }
+    }
+
+    private static GridPlacement placeGrid(List<CellRect> comp) {
         java.util.TreeSet<Float> xsSet = new java.util.TreeSet<>();
         java.util.TreeSet<Float> ysSet = new java.util.TreeSet<>();
         for (CellRect c : comp) {
@@ -467,21 +485,198 @@ final class TableExtractor {
         List<Float> ys = new ArrayList<>(ysSet);
         int colCount = xs.size() - 1;
         int rowCount = ys.size() - 1;
-        if (rowCount < 2 || colCount < 2) return null;
+        int n = comp.size();
+        int[] row = new int[n], col = new int[n], rowSpan = new int[n], colSpan = new int[n];
+        for (int i = 0; i < n; i++) {
+            CellRect c = comp.get(i);
+            col[i] = nearestIndex(xs, c.x0);
+            row[i] = nearestIndex(ys, c.y0);
+            colSpan[i] = Math.max(1, nearestIndex(xs, c.x1) - col[i]);
+            rowSpan[i] = Math.max(1, nearestIndex(ys, c.y1) - row[i]);
+        }
+        return new GridPlacement(xs, ys, rowCount, colCount, row, col, rowSpan, colSpan);
+    }
+
+    /**
+     * A genuine single table -- even one with row/col-spanning cells -- covers every (row, col)
+     * slot of its clustered rowCount x colCount grid EXACTLY once. Used by {@link #buildTable} as
+     * a last-resort guard: when {@link #splitComponent} could not cleanly resolve a component (no
+     * valid cut found), a still-incoherent grid here means the clustered spans are untrustworthy
+     * and must be suppressed rather than emitted as invented.
+     */
+    private static boolean isCoherentPlacement(GridPlacement g) {
+        boolean[][] occ = new boolean[g.rowCount][g.colCount];
+        int n = g.row.length;
+        for (int i = 0; i < n; i++) {
+            int r1 = Math.min(g.rowCount, g.row[i] + g.rowSpan[i]);
+            int c1 = Math.min(g.colCount, g.col[i] + g.colSpan[i]);
+            for (int r = g.row[i]; r < r1; r++) {
+                for (int c = g.col[i]; c < c1; c++) {
+                    if (occ[r][c]) return false; // double-covered -> incoherent merge
+                    occ[r][c] = true;
+                }
+            }
+        }
+        for (boolean[] rowOcc : occ) {
+            for (boolean b : rowOcc) if (!b) return false; // uncovered slot -> incoherent merge
+        }
+        return true;
+    }
+
+    /** True when ANY cell in the placement has a rowSpan or colSpan greater than 1. A grid with
+     * no spans at all cannot be a merge artifact (see {@link #splitComponent}'s doc) -- inventing
+     * a span is exactly the mechanism by which two independent tables' foreign boundaries corrupt
+     * each other's cell placement, so "no spans anywhere" is a cheap, safe fast-path out of the
+     * (more expensive) split search below. */
+    private static boolean hasAnySpan(GridPlacement g) {
+        for (int i = 0; i < g.rowSpan.length; i++) {
+            if (g.rowSpan[i] > 1 || g.colSpan[i] > 1) return true;
+        }
+        return false;
+    }
+
+    /** {@code placeGrid}, charging the shared split-work budget (see {@link #MAX_SPLIT_WORK}) for
+     * the O(rowCount*colCount) cost the caller is about to incur (coherence/coverage-style scans,
+     * or simply the cost of having clustered this many boundaries). */
+    private static GridPlacement placeGridBudgeted(List<CellRect> comp, long[] work) {
+        GridPlacement g = placeGrid(comp);
+        work[0] += (long) g.rowCount * g.colCount;
+        if (work[0] > MAX_SPLIT_WORK) throw new RulingOverflowException();
+        return g;
+    }
+
+    /**
+     * Detect whether a grouped component (from {@link #groupIntoTables}) is actually the union of
+     * two or more geometrically DISJOINT tables that merely touch along a shared border, and if
+     * so, split it into its maximal independent sub-grids -- e.g. two adjacent, axis-aligned
+     * tables of different row/column pitch that share one drawn border line. Returns a singleton
+     * list containing {@code comp} unchanged when there is nothing to split (no cell has any span
+     * at all, or the component is too small to be a table -- {@link #buildTable} rejects that
+     * case as before).
+     *
+     * <p>Naively checking "does the merged grid cover every slot exactly once" is NOT sufficient
+     * to detect a merge artifact: two independent tables whose total extents happen to tile
+     * evenly (e.g. A: 2 rows x 30pt = 60pt, B: 3 rows x 20pt = 60pt, stacked over the identical
+     * y-range) can still cover the merged grid perfectly, just via mutually-exclusive INVENTED
+     * spans on each side -- coverage alone can't tell that apart from a genuine single spanned
+     * table. Instead, a candidate axis-aligned cut (along one of the component's own clustered x
+     * or y boundaries, chosen so every CellRect falls ENTIRELY on one side -- none straddle it) is
+     * only accepted as a genuine split when BOTH of these hold:
+     * <ul>
+     *   <li>each side independently clusters into its own real (&gt;=2x2) candidate table -- a
+     *       cut through the middle of one genuinely uniform table (e.g. bisecting a plain 5x6
+     *       grid at some arbitrary interior column) produces two sides that are still &gt;=2x2,
+     *       but see the second condition below;</li>
+     *   <li>the MERGED component's own boundary count on the axis PERPENDICULAR to the cut (e.g.
+     *       rowCount for a vertical/column cut) is strictly greater than EITHER side's own,
+     *       independently-clustered count on that same axis. This is the actual signature of two
+     *       incompatible partitions being conflated: A merged with B's foreign row boundaries
+     *       always needs MORE distinct rows than A or B needs alone. A true single uniform table
+     *       cut at an arbitrary internal line shares the identical row structure on both sides
+     *       (merged rowCount == each side's rowCount), so this condition correctly rejects it.
+     * </ul>
+     *
+     * <p>Recurses on each accepted side (bounded by comp's own size, since each recursive call
+     * strictly partitions -- never grows -- the CellRect list) to support more than two mutually
+     * touching tables. Falls back to returning the component UNSPLIT when no cut satisfies both
+     * conditions on either axis (e.g. a genuinely ambiguous/pathological shape); {@link
+     * #buildTable} independently re-checks {@link #isCoherentPlacement} and clamps spans to 1 in
+     * that fallback case, so an unsplittable component still never emits an INVENTED span, even
+     * if its row/col placement ends up implausible.
+     *
+     * <p>Bounded by {@link #MAX_SPLIT_WORK}: see that constant's doc for why rowCount*colCount
+     * (charged on every placeGrid call, including recursive sub-splits) needs an explicit budget
+     * here, separate from the existing per-table cell-count cap.
+     */
+    static List<List<CellRect>> splitComponent(List<CellRect> comp) {
+        return splitComponent(comp, new long[]{0});
+    }
+
+    private static List<List<CellRect>> splitComponent(List<CellRect> comp, long[] work) {
+        if (comp.size() < 2) return List.of(comp);
+        GridPlacement g = placeGridBudgeted(comp, work);
+        if (g.rowCount < 2 || g.colCount < 2 || !hasAnySpan(g)) return List.of(comp);
+
+        List<List<CellRect>> viaVertical = tryCuts(comp, g.xs, true, g.rowCount, work);
+        if (viaVertical != null) return viaVertical;
+        List<List<CellRect>> viaHorizontal = tryCuts(comp, g.ys, false, g.colCount, work);
+        if (viaHorizontal != null) return viaHorizontal;
+        return List.of(comp); // no clean cut -- unsplit fallback; buildTable will clamp spans
+    }
+
+    /** Try every interior boundary of one axis as a candidate cut; returns the flattened,
+     * recursively-split result for the first candidate that satisfies both acceptance conditions
+     * documented on {@link #splitComponent}, else null. {@code mergedPerpCount} is the ORIGINAL
+     * (undivided) component's boundary count on the axis perpendicular to the cut (rowCount for a
+     * vertical cut, colCount for a horizontal one). */
+    private static List<List<CellRect>> tryCuts(List<CellRect> comp, List<Float> boundaries,
+                                                 boolean vertical, int mergedPerpCount, long[] work) {
+        for (int k = 1; k < boundaries.size() - 1; k++) {
+            float cut = boundaries.get(k);
+            List<CellRect> side1 = new ArrayList<>();
+            List<CellRect> side2 = new ArrayList<>();
+            boolean straddle = false;
+            for (CellRect c : comp) {
+                float lo = vertical ? snap(c.x0) : snap(c.y0);
+                float hi = vertical ? snap(c.x1) : snap(c.y1);
+                boolean onSide1 = hi <= cut;
+                boolean onSide2 = lo >= cut;
+                if (onSide1 && !onSide2) side1.add(c);
+                else if (onSide2 && !onSide1) side2.add(c);
+                else { straddle = true; break; }
+            }
+            if (straddle || side1.isEmpty() || side2.isEmpty()) continue;
+
+            GridPlacement g1 = placeGridBudgeted(side1, work);
+            GridPlacement g2 = placeGridBudgeted(side2, work);
+            if (g1.rowCount < 2 || g1.colCount < 2 || g2.rowCount < 2 || g2.colCount < 2) continue;
+            int perp1 = vertical ? g1.rowCount : g1.colCount;
+            int perp2 = vertical ? g2.rowCount : g2.colCount;
+            if (!(mergedPerpCount > perp1 && mergedPerpCount > perp2)) continue;
+
+            List<List<CellRect>> result = new ArrayList<>();
+            result.addAll(splitComponent(side1, work));
+            result.addAll(splitComponent(side2, work));
+            return result;
+        }
+        return null;
+    }
+
+    /**
+     * Assign row/col indices + spans from clustered edge boundaries and build the TableHit
+     * (no text, views not rendered). Returns null for components below 2x2 / 4 cells.
+     *
+     * <p>Note: the 2x2 threshold is enforced below via the clustered row/col boundary counts
+     * (rowCount, colCount), not via {@code comp.size()} — a component can legitimately contain
+     * fewer than 4 CellRects (e.g. 3) when a spanning cell covers more than one logical grid
+     * cell, while still representing a full 2x2 (4 logical cell) table.
+     *
+     * <p>FIX 5 safety net: independently re-checks {@link #isCoherentPlacement} regardless of
+     * whether the caller already ran {@link #splitComponent} on this component. When the grid is
+     * still incoherent here (i.e. no clean split was found upstream), every cell's row/colSpan is
+     * clamped to 1 rather than using the clustered-but-untrustworthy span -- a merged, unsplit
+     * component may look implausible, but must never emit an INVENTED span.
+     */
+    static TableHit buildTable(int page, List<CellRect> comp, String method) {
+        if (comp.isEmpty()) return null;
+        GridPlacement g = placeGrid(comp);
+        if (g.rowCount < 2 || g.colCount < 2) return null;
+        boolean coherent = isCoherentPlacement(g);
 
         TableHit t = new TableHit();
         t.page = page;
         t.extractionMethod = method;
-        t.rowCount = rowCount;
-        t.colCount = colCount;
+        t.rowCount = g.rowCount;
+        t.colCount = g.colCount;
         t.cells = new ArrayList<>(comp.size());
         float bx0 = Float.MAX_VALUE, by0 = Float.MAX_VALUE, bx1 = -Float.MAX_VALUE, by1 = -Float.MAX_VALUE;
-        for (CellRect c : comp) {
+        for (int i = 0; i < comp.size(); i++) {
+            CellRect c = comp.get(i);
             CellHit cell = new CellHit();
-            cell.col = nearestIndex(xs, c.x0);
-            cell.row = nearestIndex(ys, c.y0);
-            cell.colSpan = Math.max(1, nearestIndex(xs, c.x1) - cell.col);
-            cell.rowSpan = Math.max(1, nearestIndex(ys, c.y1) - cell.row);
+            cell.col = g.col[i];
+            cell.row = g.row[i];
+            cell.colSpan = coherent ? g.colSpan[i] : 1;
+            cell.rowSpan = coherent ? g.rowSpan[i] : 1;
             cell.text = c.text;
             cell.bbox = new float[]{c.x0, c.y0, c.x1, c.y1};
             t.cells.add(cell);
@@ -715,34 +910,77 @@ final class TableExtractor {
 
     // ---------------------------------------------------------------- text fill
 
+    // Fraction of the taller of two glyphs' getHeightDir() used as the same-line tolerance in
+    // joinText's line clustering, replacing a fixed 2pt cutoff. A superscript/subscript glyph
+    // (footnote marker, exponent, trademark symbol) commonly has its baseline offset a few pt
+    // off the main text's baseline -- well under one glyph-height -- while a genuine next line
+    // sits a full line-height (~1x-1.2x font size, i.e. more than one glyph-height) further down.
+    // 0.9 keeps a several-pt superscript offset on the same line while still breaking cleanly on
+    // real next lines (verified against actual PDFBox-measured glyph geometry, not assumed).
+    private static final float LINE_GROUP_HEIGHT_FRACTION = 0.9f;
+
     /**
-     * Join per-char TextPositions into cell text: group into lines by y (2pt tolerance),
-     * order lines top-to-bottom and chars left-to-right, insert a space on word-sized gaps,
-     * join lines with '\n'.
+     * Join per-char TextPositions into cell text: cluster into lines by baseline (YDirAdj)
+     * proximity scaled to glyph height (see {@link #LINE_GROUP_HEIGHT_FRACTION}) rather than a
+     * fixed pt tolerance, so a superscript/subscript glyph stays on its base text's line instead
+     * of sorting as a spurious separate (and mis-ordered) line; order each line's glyphs
+     * left-to-right by XDirAdj (so a superscript that sorts earliest by Y still lands after its
+     * base character), insert a space on word-sized gaps, join lines with '\n'.
      */
     static String joinText(List<TextPosition> chars) {
         if (chars.isEmpty()) return "";
         List<TextPosition> sorted = new ArrayList<>(chars);
         sorted.sort(java.util.Comparator.comparingDouble(TextPosition::getYDirAdj)
                 .thenComparingDouble(TextPosition::getXDirAdj));
-        StringBuilder out = new StringBuilder();
-        float lineY = sorted.get(0).getYDirAdj();
-        TextPosition prev = null;
+
+        // Chain-cluster into lines. `lineTopY` is the Y of the first (topmost, since `sorted` is
+        // Y-ascending) member of the current group -- it never regresses, so later members are
+        // always compared against the group's topmost baseline, not merely the previous glyph.
+        // `lineMaxHeight` tracks the tallest glyph seen so far in the group so the tolerance grows
+        // to cover the "real" text's height even when the group started with a small glyph (e.g.
+        // a raised superscript sorts before its larger base-text line).
+        List<List<TextPosition>> lines = new ArrayList<>();
+        List<TextPosition> currentLine = new ArrayList<>();
+        float lineTopY = 0f;
+        float lineMaxHeight = 0f;
         for (TextPosition tp : sorted) {
-            if (tp.getYDirAdj() - lineY > 2f) {           // new line
-                out.append('\n');
-                lineY = tp.getYDirAdj();
-                prev = null;
+            if (currentLine.isEmpty()) {
+                currentLine.add(tp);
+                lineTopY = tp.getYDirAdj();
+                lineMaxHeight = tp.getHeightDir();
+                continue;
             }
-            if (prev != null) {
-                float gap = tp.getXDirAdj() - (prev.getXDirAdj() + prev.getWidthDirAdj());
-                if (gap > Math.max(1.5f, 0.25f * tp.getHeightDir()) && out.length() > 0
-                        && out.charAt(out.length() - 1) != ' ') {
-                    out.append(' ');
+            float tol = Math.max(2f, LINE_GROUP_HEIGHT_FRACTION * Math.max(lineMaxHeight, tp.getHeightDir()));
+            if (tp.getYDirAdj() - lineTopY > tol) {
+                lines.add(currentLine);
+                currentLine = new ArrayList<>();
+                currentLine.add(tp);
+                lineTopY = tp.getYDirAdj();
+                lineMaxHeight = tp.getHeightDir();
+            } else {
+                currentLine.add(tp);
+                lineMaxHeight = Math.max(lineMaxHeight, tp.getHeightDir());
+            }
+        }
+        if (!currentLine.isEmpty()) lines.add(currentLine);
+
+        StringBuilder out = new StringBuilder();
+        for (int li = 0; li < lines.size(); li++) {
+            List<TextPosition> line = lines.get(li);
+            line.sort(java.util.Comparator.comparingDouble(TextPosition::getXDirAdj));
+            TextPosition prev = null;
+            for (TextPosition tp : line) {
+                if (prev != null) {
+                    float gap = tp.getXDirAdj() - (prev.getXDirAdj() + prev.getWidthDirAdj());
+                    if (gap > Math.max(1.5f, 0.25f * tp.getHeightDir()) && out.length() > 0
+                            && out.charAt(out.length() - 1) != ' ') {
+                        out.append(' ');
+                    }
                 }
+                out.append(tp.getUnicode());
+                prev = tp;
             }
-            out.append(tp.getUnicode());
-            prev = tp;
+            if (li < lines.size() - 1) out.append('\n');
         }
         return out.toString().strip();
     }
@@ -904,19 +1142,29 @@ final class TableExtractor {
         // before any text is filled, and once for real below once cell text is in place. This
         // (cheap, in-memory) double geometry pass is what lets the region-strip fallback below
         // run ONE content-stream walk for the whole page instead of one per table.
+        //
+        // FIX 5: groupIntoTables' union-find only requires edge-adjacency (see its own doc
+        // comment), so two genuinely separate tables that merely share a drawn border line get
+        // merged into one component. splitComponent (run per grouped component, BEFORE the
+        // MAX_CELLS_PER_TABLE / MAX_TABLES_PER_PAGE gates below, so each resulting sub-table is
+        // gated on its own true size/count) detects that case and emits the maximal coherent
+        // sub-grids instead of one bogus merged grid.
         List<List<CellRect>> kept = new ArrayList<>();
         int tablesOnPage = 0;
+        pageLoop:
         for (List<CellRect> comp : groupIntoTables(cells)) {
             if (comp.size() > MAX_CELLS_PER_TABLE) {
                 result.truncated = true;
                 continue;
             }
-            if (buildTable(pageNum, comp, "lattice") == null) continue;
-            if (++tablesOnPage > MAX_TABLES_PER_PAGE) {
-                result.truncated = true;
-                break;
+            for (List<CellRect> sub : splitComponent(comp)) {
+                if (buildTable(pageNum, sub, "lattice") == null) continue;
+                if (++tablesOnPage > MAX_TABLES_PER_PAGE) {
+                    result.truncated = true;
+                    break pageLoop;
+                }
+                kept.add(sub);
             }
-            kept.add(comp);
         }
 
         if (positions != null && !positions.isEmpty()) {
@@ -1019,17 +1267,49 @@ final class TableExtractor {
         }
     }
 
-    /** Cheap page lookup with NO content-stream access: first TD/TH (in row/cell order) carrying
-     * an explicit /Pg. Used both to gate a table against pagesToProcess before any MCID work, and
-     * (by construction, same row/cell order as buildTaggedTable) to pick the table's own page. */
+    /** Cheap page lookup with NO content-stream access: first TD/TH (in row/cell order) whose
+     * /Pg resolves via {@link #resolveElementPage}. Used both to gate a table against
+     * pagesToProcess before any MCID work, and (by construction, same row/cell order as
+     * buildTaggedTable) to pick the table's own page. */
     private static PDPage firstCellPage(List<PDStructureElement> trs) {
         for (PDStructureElement tr : trs) {
             for (Object kid : tr.getKids()) {
                 if (kid instanceof PDStructureElement el) {
                     String st = el.getStandardStructureType();
-                    if (("TD".equals(st) || "TH".equals(st)) && el.getPage() != null) return el.getPage();
+                    if ("TD".equals(st) || "TH".equals(st)) {
+                        PDPage page = resolveElementPage(el);
+                        if (page != null) return page;
+                    }
                 }
             }
+        }
+        return null;
+    }
+
+    /**
+     * Resolve a structure element's page, walking up ANCESTOR structure elements
+     * ({@code getParent()}) when the element itself carries no explicit /Pg. Per ISO 32000, /Pg
+     * is commonly inherited -- set once on an ancestor (e.g. the enclosing Table or TR) rather
+     * than repeated on every TD/TH leaf -- so checking only the element itself silently treats a
+     * spec-conforming, accessibility-tagged table as pageless.
+     *
+     * <p>Cheap and side-effect-free: only reads each ancestor's /Pg dictionary reference, no MCID
+     * resolution or content-stream access, so callers can gate the resolved page against
+     * pagesToProcess BEFORE any glyph work -- this must not reintroduce the out-of-scope-page-walk
+     * DoS the pagesToProcess gating previously fixed.
+     *
+     * <p>Depth-capped (mirrors collectByType/collectGlyphs' existing depth&gt;64 guards) against a
+     * cyclic/hostile structure tree; past the cap this simply gives up and returns null (same as
+     * "no /Pg found anywhere"), it does not loop or overflow.
+     */
+    private static PDPage resolveElementPage(PDStructureElement el) {
+        PDStructureNode node = el;
+        int depth = 0;
+        while (node instanceof PDStructureElement se && depth <= 64) {
+            PDPage page = se.getPage();
+            if (page != null) return page;
+            node = se.getParent();
+            depth++;
         }
         return null;
     }
@@ -1166,8 +1446,13 @@ final class TableExtractor {
                                         Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache,
                                         Map<PDPage, Integer> pageNumbers,
                                         Set<Integer> pagesToProcess) throws IOException {
+        // Ancestor-fallback resolution (FIX 7): the TD/TH itself may carry no /Pg at all when it
+        // is inherited from an enclosing TR/Table, per ISO 32000. Seeding collectGlyphs with this
+        // resolved page (rather than the bare el.getPage()) is what lets glyphsFor's own
+        // pagesToProcess gate work correctly for such a cell.
+        PDPage resolvedPage = resolveElementPage(el);
         List<TextPosition> glyphs = new ArrayList<>();
-        collectGlyphs(el, el.getPage(), glyphs, mcidCache, 0, pageNumbers, pagesToProcess);
+        collectGlyphs(el, resolvedPage, glyphs, mcidCache, 0, pageNumbers, pagesToProcess);
         cell.text = joinText(glyphs);
         if (!glyphs.isEmpty()) {
             float x0 = Float.MAX_VALUE, y0 = Float.MAX_VALUE, x1 = -Float.MAX_VALUE, y1 = -Float.MAX_VALUE;
@@ -1179,7 +1464,7 @@ final class TableExtractor {
             }
             cell.bbox = new float[]{x0, y0, x1, y1};
         }
-        if (el.getPage() != null) cell.page = el.getPage();
+        if (resolvedPage != null) cell.page = resolvedPage;
     }
 
     private static void collectGlyphs(PDStructureNode node, PDPage inheritedPage, List<TextPosition> out,

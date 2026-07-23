@@ -174,16 +174,26 @@ final class TableExtractor {
     // scan with per-candidate edge-coverage checks; that pathological case now fails fast and
     // deterministically instead of after a long, input-dependent wall-clock stall.
     static final long MAX_FINDCELLS_WORK = 2_000_000;
-    // Bounds splitComponent's (rowCount x colCount) coherence-check work, counted cumulatively
-    // across every placeGrid/isCoherentPlacement evaluation in one top-level splitComponent call
-    // (including all recursive sub-splits attempted). A genuine touching-but-independent-tables
-    // shape (the FIX 5 repro) resolves in a handful of candidate cuts on a component already
-    // capped at MAX_CELLS_PER_TABLE, so real input finishes far under this budget -- but
-    // rowCount*colCount is NOT itself bounded by comp.size() alone (a component with few CellRects
-    // but many distinct, unaligned boundary coordinates can still cluster into a huge grid), so an
-    // adversarial or pathologically irregular shape, re-evaluated across recursive cut attempts,
-    // could otherwise blow up combinatorially. Sized generously above a legitimate dense
-    // MAX_CELLS_PER_TABLE-sized table's cost (~10,000) for headroom on real irregular tables.
+    // Bounds ALL of splitComponent's work, counted cumulatively across a single shared counter
+    // for one top-level splitComponent invocation (including every recursive sub-split attempted):
+    // both (a) placeGrid/isCoherentPlacement's O(rowCount*colCount) coherence-check cost, and
+    // (b) tryCuts' straddle-scan, an O(comp.size()) pass run once per candidate cut BEFORE any
+    // placeGrid call -- charged per cell examined, so an adversarial offset-pitch shape (many
+    // candidate cuts, each straddled by a cell near the end of the component's iteration order,
+    // forcing a near-full scan every time) can't do that work uncounted. Without charging (b),
+    // this reintroduces an O(candidates x cells) DoS: measured at 561ms/10k cells, 1954ms/20k
+    // cells (quadratic) before this was closed, without ever tripping the budget.
+    //
+    // A genuine touching-but-independent-tables shape (the FIX 5 repro) resolves in a handful of
+    // candidate cuts on a component already capped at MAX_CELLS_PER_TABLE, so real input finishes
+    // far under this budget -- and neither rowCount*colCount nor the straddle-scan cost is itself
+    // bounded by comp.size() alone (a component with few CellRects but many distinct, unaligned
+    // boundary coordinates can still cluster into a huge grid; an offset-pitch shape can force a
+    // near-full straddle-scan on nearly every candidate), so an adversarial or pathologically
+    // irregular shape, re-evaluated across recursive cut attempts, could otherwise blow up
+    // combinatorially. Sized generously above a legitimate dense MAX_CELLS_PER_TABLE-sized table's
+    // cost (~10,000) for headroom on real irregular tables, while still failing fast (well under a
+    // second) on the adversarial case.
     static final long MAX_SPLIT_WORK = 20_000_000;
 
     /** Thrown when a page exceeds a geometry cap (ruling/intersection bomb) — caller skips the page. */
@@ -535,6 +545,16 @@ final class TableExtractor {
         return false;
     }
 
+    private static boolean hasRowSpan(GridPlacement g) {
+        for (int s : g.rowSpan) if (s > 1) return true;
+        return false;
+    }
+
+    private static boolean hasColSpan(GridPlacement g) {
+        for (int s : g.colSpan) if (s > 1) return true;
+        return false;
+    }
+
     /** {@code placeGrid}, charging the shared split-work budget (see {@link #MAX_SPLIT_WORK}) for
      * the O(rowCount*colCount) cost the caller is about to incur (coherence/coverage-style scans,
      * or simply the cost of having clustered this many boundaries). */
@@ -597,9 +617,17 @@ final class TableExtractor {
         GridPlacement g = placeGridBudgeted(comp, work);
         if (g.rowCount < 2 || g.colCount < 2 || !hasAnySpan(g)) return List.of(comp);
 
-        List<List<CellRect>> viaVertical = tryCuts(comp, g.xs, true, g.rowCount, work);
+        // A vertical (column) cut can only ever satisfy the row-inflation acceptance condition
+        // (see this method's doc) if some cell's rowSpan is ALREADY inflated in the merged
+        // placement -- achieving "both sides strictly fewer rows than merged" requires a foreign
+        // boundary interleaved inside some cell's own span, which is exactly what rowSpan>1 means
+        // here. Symmetrically, a horizontal cut needs some inflated colSpan. Skipping an axis
+        // with no such precondition avoids a full O(candidates x cells) search that is guaranteed
+        // to reject every candidate anyway -- the common case for a real table whose only
+        // spanning runs along one axis (e.g. a merged header row: colSpan only, never rowSpan).
+        List<List<CellRect>> viaVertical = hasRowSpan(g) ? tryCuts(comp, g.xs, true, g.rowCount, work) : null;
         if (viaVertical != null) return viaVertical;
-        List<List<CellRect>> viaHorizontal = tryCuts(comp, g.ys, false, g.colCount, work);
+        List<List<CellRect>> viaHorizontal = hasColSpan(g) ? tryCuts(comp, g.ys, false, g.colCount, work) : null;
         if (viaHorizontal != null) return viaHorizontal;
         return List.of(comp); // no clean cut -- unsplit fallback; buildTable will clamp spans
     }
@@ -617,6 +645,14 @@ final class TableExtractor {
             List<CellRect> side2 = new ArrayList<>();
             boolean straddle = false;
             for (CellRect c : comp) {
+                // Charged against the SAME shared budget as placeGridBudgeted (see
+                // MAX_SPLIT_WORK's doc): this straddle-scan is itself O(comp.size()) PER
+                // candidate cut, run for up to O(boundaries.size()) candidates, entirely BEFORE
+                // any placeGridBudgeted call below -- an adversarial, offset-pitch shape (many
+                // candidates, each straddled by a cell near the end of `comp`'s iteration order)
+                // previously did this work uncounted, reintroducing an O(n^2) DoS the budget was
+                // meant to close.
+                if (++work[0] > MAX_SPLIT_WORK) throw new RulingOverflowException();
                 float lo = vertical ? snap(c.x0) : snap(c.y0);
                 float hi = vertical ? snap(c.x1) : snap(c.y1);
                 boolean onSide1 = hi <= cut;
@@ -688,14 +724,32 @@ final class TableExtractor {
         return t;
     }
 
+    /**
+     * Index of the boundary closest to {@code v}. {@code boundaries} is always sorted ascending
+     * (built from a TreeSet by every caller), so this binary-searches rather than scanning
+     * linearly -- O(log n) instead of O(n) per call. This matters well beyond a single-shot
+     * per-table {@link #buildTable} call: {@link #splitComponent}'s candidate-cut search invokes
+     * {@link #placeGrid} (which calls this 4x per cell) on independently re-clustered sub-lists
+     * for EVERY candidate cut it tries, so an O(n) nearestIndex compounds into the dominant cost
+     * of the whole search on a large component -- this was the difference between a legit
+     * MAX_CELLS_PER_TABLE-scale spanned table completing in ~500ms vs. well under 200ms.
+     * On an exact tie (v equidistant from two boundaries -- not expected in practice, since v is
+     * always one of the exact values originally inserted into the boundary set, but preserved for
+     * safety) this returns the LOWER index, matching the original linear scan's strict-less-than
+     * tie-break.
+     */
     private static int nearestIndex(List<Float> boundaries, float v) {
-        int best = 0;
-        float bestD = Float.MAX_VALUE;
-        for (int i = 0; i < boundaries.size(); i++) {
-            float d = Math.abs(boundaries.get(i) - v);
-            if (d < bestD) { bestD = d; best = i; }
+        int lo = 0, hi = boundaries.size() - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (boundaries.get(mid) < v) lo = mid + 1; else hi = mid;
         }
-        return best;
+        if (lo > 0) {
+            float dPrev = Math.abs(boundaries.get(lo - 1) - v);
+            float dLo = Math.abs(boundaries.get(lo) - v);
+            if (dPrev <= dLo) return lo - 1;
+        }
+        return lo;
     }
 
     // ---------------------------------------------------------------- ruling collection

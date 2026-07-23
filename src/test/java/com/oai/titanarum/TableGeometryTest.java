@@ -378,6 +378,71 @@ class TableGeometryTest {
         assertEquals(cells.size(), split.get(0).size());
     }
 
+    // ------------------------------------------------------- split-search work budget (DoS close)
+
+    @Test
+    void splitComponentThrowsOnStraddleScanWorkBudget() {
+        // Reviewer's DoS reproducer: tryCuts' per-candidate straddle-scan is itself O(comp.size()),
+        // run once per candidate cut, BEFORE placeGridBudgeted runs -- previously uncounted against
+        // MAX_SPLIT_WORK. Two row-bands of ~5,000 columns each, at OFFSET (mismatched) pitch, so
+        // literally every interior vertical-cut candidate straddles some cell (verified: A's pitch
+        // and B's half-pitch-shifted columns never share a boundary), forcing a near-full scan of
+        // the ~10,000-cell component for most/all of the ~10,000 candidates -- quadratic, and
+        // (pre-fix) measured at 561ms/10k cells, 1954ms/20k cells without ever tripping the budget.
+        // Column 0 is a single cell bridging BOTH row-bands (rowSpan=2 in the merged placement) so
+        // hasRowSpan(g) is true and the vertical/row-inflation search actually runs (isn't skipped
+        // by the axis-pruning fast path, which correctly prunes an axis with no possible inflation
+        // at all -- this shape must still exercise, and trip, the budget on the axis that DOES).
+        int cols = 5000;
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        cells.add(cellRect(0f, 0f, 10f, 20f));
+        for (int c = 1; c < cols; c++) {
+            cells.add(cellRect(c * 10f, 0f, c * 10f + 10f, 10f));           // row-band A
+            cells.add(cellRect(c * 10f + 5f, 10f, c * 10f + 15f, 20f));    // row-band B, half-pitch shifted
+        }
+        assertEquals(2 * cols - 1, cells.size());
+
+        long start = System.nanoTime();
+        assertThrows(TableExtractor.RulingOverflowException.class,
+                () -> TableExtractor.splitComponent(cells),
+                "an offset-pitch shape with no valid resolving cut must fail via the work budget");
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+        assertTrue(elapsedMs < 1000,
+                "must fail FAST (budget-bounded, not merely bounded by eventually finishing), took " + elapsedMs + "ms");
+    }
+
+    @Test
+    void splitComponentHandlesLegitimateLargeSpannedTableWithoutTrippingBudget() {
+        // Positive guard, paired with the negative test above: a real, single coherent table at
+        // MAX_CELLS_PER_TABLE scale (100x100 = 10,000 minimal cells, with ONE genuine merged-header
+        // -style spanning cell so splitComponent's search actually runs instead of short-circuiting
+        // via the "no spans anywhere" fast path) must complete WITHOUT tripping the work budget,
+        // and fast -- the budget must be a backstop for the adversarial case above, not something
+        // a legitimate large table comes anywhere close to on the way to its correct (unsplit)
+        // result.
+        int side = 100;
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (int r = 0; r < side; r++) {
+            for (int c = 0; c < side; c++) {
+                if (r == 0 && c == 1) continue; // merged into the row0/col0 cell below
+                float x0 = c * 10f, y0 = r * 10f;
+                float x1 = (r == 0 && c == 0) ? 20f : x0 + 10f; // row0/col0 spans 2 columns
+                cells.add(cellRect(x0, y0, x1, y0 + 10f));
+            }
+        }
+        assertEquals(side * side - 1, cells.size());
+
+        long start = System.nanoTime();
+        List<List<TableExtractor.CellRect>> split = TableExtractor.splitComponent(cells);
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        assertEquals(1, split.size(), "a genuinely single coherent large table must not be split");
+        assertEquals(cells.size(), split.get(0).size());
+        assertTrue(elapsedMs < 1000,
+                "a legit " + cells.size() + "-cell spanned table must complete well under a second, took "
+                        + elapsedMs + "ms");
+    }
+
     private static TableExtractor.CellRect cellRect(float x0, float y0, float x1, float y1) {
         TableExtractor.CellRect c = new TableExtractor.CellRect();
         c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;

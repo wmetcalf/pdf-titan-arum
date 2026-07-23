@@ -27,7 +27,7 @@
 
 ## Requirements
 
-- Java 17+
+- Java 25
 - Maven 3.9+
 - For server mode: PostgreSQL 14+, Docker (optional)
 - For QR/barcode scanning: the zxing-cpp `ZXingReader` binary on `PATH` (or set `TITANARUM_ZXING_BIN` to its path). Any release works — titanarum auto-detects `-json` (≥ 2.3) and falls back to the 2.2.x plaintext format. Optional — if the binary is absent, titanarum prints a one-time warning and skips QR scanning; all other analysis is unaffected. Pass `--skip-qr` to opt out entirely. (The Docker images below bundle it, so QR works there out of the box.)
@@ -680,8 +680,7 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 
 | Library              | Version  | Purpose                                  |
 |----------------------|----------|------------------------------------------|
-| Apache PDFBox        | 3.0.6    | PDF parsing and rendering                |
-| ZXing                | 3.5.4    | QR / barcode detection                   |
+| Apache PDFBox        | 3.0.8    | PDF parsing and rendering                |
 | libphonenumber       | 9.0.25   | Phone number extraction and normalisation |
 | Guava                | 33.5.0   | Public suffix list for domain checks     |
 | Jackson              | 2.19.0   | JSON serialisation                       |
@@ -692,5 +691,5 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 | Pebble               | 3.2.4    | HTML templates (server mode)             |
 | HikariCP             | 5.1.0    | Connection pool (server mode)            |
 | Flyway               | 10.15.0  | DB schema migrations (server mode)       |
-| PostgreSQL JDBC      | 42.7.3   | Database driver (server mode)            |
+| PostgreSQL JDBC      | 42.7.7   | Database driver (server mode)            |
 | zip4j                | 2.11.5   | AES-256 encrypted ZIP downloads (server mode) |

@@ -1,6 +1,6 @@
 # AppCDS/AOT warmup corpus (Warm-Mode Task 6, `warm-plan.md` W-3)
 
-`PdfTitanArumApp --appcds-warmup <dir>` (W-2, `PdfTitanArumApp.java:5563` `runAppcdsWarmup`) runs
+`PdfTitanArumApp --appcds-warmup <dir>` (W-2, `PdfTitanArumApp.runAppcdsWarmup`) runs
 every `*.pdf` file in this directory through the exact same `callWith(...)` entry point a real job
 uses (QR scanning ON, OCR off, `password=null`), so an AOT-record build
 (`-XX:AOTMode=record ... --appcds-warmup deploy/docker/appcds-warmup-corpus`) actually

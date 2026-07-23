@@ -66,6 +66,19 @@ final class TableExtractor {
     // out deterministically, consistent with the other geometry caps' throw-and-skip-page
     // handling in extract()'s per-page catch.
     static final long MAX_TEXTFILL_WORK = 20_000_000;
+    // groupIntoTables' touches()/union() double loop runs over the WHOLE page's CellRect list
+    // BEFORE any per-table cap (MAX_CELLS_PER_TABLE, MAX_TABLES_PER_PAGE) gates it, so it is
+    // reachable at full page-cell-count scale (up to MAX_INTERSECTIONS-derived cell counts).
+    // Counts each touches() pair evaluation across the whole call; a legit page (a few thousand
+    // cells at most) stays far under this budget, consistent with the other geometry caps'
+    // throw-and-skip-page handling.
+    static final long MAX_GROUPING_WORK = 4_000_000;
+    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion), which unlike
+    // fillCellsFromPositions had no work budget: it registers one PDFTextStripperByArea region
+    // per kept cell (up to ~40k) and extractRegions() is O(glyphs x cells). Counted per page,
+    // across every kept table combined (fillCellsByRegion already batches all of them into one
+    // content-stream walk).
+    static final int MAX_REGION_CELLS = 5_000;
 
     private TableExtractor() {}
 
@@ -351,8 +364,10 @@ final class TableExtractor {
         int n = cells.size();
         int[] parent = new int[n];
         for (int i = 0; i < n; i++) parent[i] = i;
+        long work = 0;
         for (int i = 0; i < n; i++) {
             for (int j = i + 1; j < n; j++) {
+                if (++work > MAX_GROUPING_WORK) throw new RulingOverflowException();
                 if (touches(cells.get(i), cells.get(j))) union(parent, i, j);
             }
         }
@@ -736,7 +751,18 @@ final class TableExtractor {
      * "R\n3C\n1"). Verified empirically: identical region, same characters matched, only this
      * flag differs between the broken and clean output.
      */
-    private static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page) throws IOException {
+    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
+        // Bound the cells side (see MAX_REGION_CELLS): unlike fillCellsFromPositions, this path
+        // has no other natural work budget -- one PDFTextStripperByArea region per kept cell,
+        // then an O(glyphs x cells) extractRegions() pass. A hostile page whose kept-cell count
+        // (across every table combined) exceeds the cap must not register any regions / walk the
+        // content stream at all; flag truncated and bail out promptly instead.
+        long totalCells = 0;
+        for (List<CellRect> comp : tables) totalCells += comp.size();
+        if (totalCells > MAX_REGION_CELLS) {
+            result.truncated = true;
+            return;
+        }
         PDFTextStripperByArea area = new PDFTextStripperByArea();
         area.setSortByPosition(true);
         for (int ti = 0; ti < tables.size(); ti++) {
@@ -761,6 +787,15 @@ final class TableExtractor {
     /**
      * Extract tables for the given (1-indexed) pages. Never throws: per-page failures are
      * logged and skipped. positionsByPage may be empty (--skip-text-urls) -> region fallback.
+     *
+     * <p>Checks {@code Thread.currentThread().isInterrupted()} at the TOP of the per-page loop,
+     * BEFORE the try block -- every sibling pipeline stage checks interruption in-loop, but this
+     * one previously didn't, so a multi-page hostile doc would ignore a soft --timeout entirely
+     * (only checked by the caller AFTER extract() returns) and eventually trip the hard-halt
+     * watchdog. Checking before the try (rather than inside it) is deliberate: an
+     * InterruptedException/the interrupt flag must never be swallowed by the per-page
+     * catch(Exception) below. FIX 1 and FIX 2 already bound the work a single page can do, so a
+     * between-page check is sufficient -- no in-loop check is needed within one page.
      */
     static Result extract(PDDocument doc, List<Integer> pagesToProcess,
                           Map<Integer, List<TextPosition>> positionsByPage) {
@@ -768,10 +803,19 @@ final class TableExtractor {
         Set<Integer> coveredByTagged = new HashSet<>();
         try {
             extractTagged(doc, new HashSet<>(pagesToProcess), coveredByTagged, result);
+        } catch (StackOverflowError e) {
+            // A pathologically deep (or cyclic-looking) structure/marked-content tree can still
+            // overflow inside pdfbox's own traversal even with our depth guards in place; degrade
+            // to "skip tagged, lattice still runs" rather than killing the worker thread.
+            System.err.println("WARNING: tagged table extraction overflowed the stack (skipped): " + e);
         } catch (Exception e) {
             System.err.println("WARNING: tagged table extraction failed: " + e);
         }
         for (int pageNum : pagesToProcess) {
+            if (Thread.currentThread().isInterrupted()) {
+                result.truncated = true;
+                break;
+            }
             if (coveredByTagged.contains(pageNum)) continue;
             try {
                 extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result);
@@ -831,7 +875,7 @@ final class TableExtractor {
                 fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work);
             }
         } else if (!kept.isEmpty()) {
-            fillCellsByRegion(kept, page);
+            fillCellsByRegion(kept, page, result);
         }
 
         for (List<CellRect> comp : kept) {
@@ -889,6 +933,14 @@ final class TableExtractor {
         Map<Integer, Integer> tablesPerPage = new HashMap<>();
 
         for (PDStructureElement tableEl : tables) {
+            // Same between-item interrupt check as extract()'s per-page loop, and for the same
+            // reason: a hostile structure tree can carry thousands of Table elements, so this
+            // loop must also honor a soft --timeout rather than only being checked after
+            // extract() returns.
+            if (Thread.currentThread().isInterrupted()) {
+                result.truncated = true;
+                break;
+            }
             List<PDStructureElement> trs = new ArrayList<>();
             collectByType(tableEl, "TR", trs, 0, STOP_AT_TABLE);
             if (trs.isEmpty()) continue;                     // degenerate -> lattice may still run
@@ -1120,19 +1172,24 @@ final class TableExtractor {
             taggedProcessPageCalls++;
             PDFMarkedContentExtractor ex = new PDFMarkedContentExtractor();
             ex.processPage(page);
-            for (PDMarkedContent mc : ex.getMarkedContents()) flattenMarkedContent(mc, byMcid);
+            for (PDMarkedContent mc : ex.getMarkedContents()) flattenMarkedContent(mc, byMcid, 0);
             cache.put(page, byMcid);
         }
         return byMcid.getOrDefault(mcid, List.of());
     }
 
-    private static void flattenMarkedContent(PDMarkedContent mc, Map<Integer, List<TextPosition>> byMcid) {
+    /** Depth-capped (mirrors collectGlyphs' depth>64 guard): attacker-controlled nested marked
+     * content with no bound here would StackOverflowError -- an Error that escapes
+     * extractTagged's catch(Exception) entirely. Past the cap we simply stop descending; any
+     * text further down that nested chain is lost, not corrupted. */
+    static void flattenMarkedContent(PDMarkedContent mc, Map<Integer, List<TextPosition>> byMcid, int depth) {
+        if (depth > 64) return;
         int mcid = mc.getMCID();
         for (Object content : mc.getContents()) {
             if (content instanceof TextPosition tp && mcid >= 0) {
                 byMcid.computeIfAbsent(mcid, k -> new ArrayList<>()).add(tp);
             } else if (content instanceof PDMarkedContent nested) {
-                flattenMarkedContent(nested, byMcid);
+                flattenMarkedContent(nested, byMcid, depth + 1);
             }
         }
     }

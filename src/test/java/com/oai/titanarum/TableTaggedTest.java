@@ -1,11 +1,15 @@
 package com.oai.titanarum;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedContent;
+import org.apache.pdfbox.text.TextPosition;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -152,6 +156,43 @@ class TableTaggedTest {
             assertNull(t.cells.get(2).bbox, "a cell resolved from a different page must not carry a bbox");
             assertNull(t.cells.get(3).bbox);
             assertNotNull(t.bbox, "table bbox must still be built from the page-1 cells");
+        }
+    }
+
+    @Test
+    void flattenMarkedContentDoesNotStackOverflowOnDeepNesting() {
+        // Reviewer's reproducer: flattenMarkedContent recurses over attacker-controlled nested
+        // marked content with NO depth guard, so a deeply nested PDMarkedContent tree
+        // (achievable via deeply nested BDC/EMC in a hostile content stream) blows the stack
+        // with a StackOverflowError -- an Error, which escapes extractTagged's catch(Exception)
+        // entirely. Build a synthetic chain far deeper than any real JVM stack tolerates and
+        // drive flattenMarkedContent directly: it must return normally once depth-capped
+        // (mirroring collectGlyphs' existing depth>64 guard), not overflow.
+        int depth = 500_000;
+        PDMarkedContent root = new PDMarkedContent(COSName.getPDFName("Span"), null);
+        PDMarkedContent cur = root;
+        for (int i = 1; i < depth; i++) {
+            PDMarkedContent next = new PDMarkedContent(COSName.getPDFName("Span"), null);
+            cur.addMarkedContent(next);
+            cur = next;
+        }
+        Map<Integer, List<TextPosition>> byMcid = new HashMap<>();
+        assertDoesNotThrow(() -> TableExtractor.flattenMarkedContent(root, byMcid, 0),
+                "deeply nested marked content must not StackOverflowError");
+    }
+
+    @Test
+    void extractNeverThrowsOnDeeplyNestedMarkedContent() throws Exception {
+        // End-to-end companion: a real tagged fixture whose TD's marked content is wrapped in
+        // many nested (untagged) BDC/EMC spans must still extract without extract() propagating
+        // a StackOverflowError out of the whole pipeline.
+        Path pdf = tmp.resolve("deepnest.pdf");
+        TableTestPdfs.taggedDeeplyNestedMarkedContent(pdf, 100_000);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = assertDoesNotThrow(
+                    () -> TableExtractor.extract(doc, List.of(1), Map.of()),
+                    "extract() must never propagate a StackOverflowError");
+            assertNotNull(r);
         }
     }
 

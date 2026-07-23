@@ -2,11 +2,14 @@ package com.oai.titanarum;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.text.TextPosition;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -152,6 +155,67 @@ class TableLatticeTest {
                 TableExtractor.Result rRegion = TableExtractor.extract(doc, List.of(1), Map.of());
                 assertEquals(1, rRegion.tables.size(), "region-fallback path, rotation=" + rotation);
                 assertEquals(expected.get(rotation), rRegion.tables.get(0).rows, "region-fallback path, rotation=" + rotation);
+            }
+        }
+    }
+
+    @Test
+    void fillCellsByRegionCapsRegionCellsAndSetsTruncated() throws Exception {
+        // Reviewer's reproducer: fillCellsByRegion (the --skip-text-urls fallback) had NO work
+        // budget, unlike fillCellsFromPositions -- it would register one PDFTextStripperByArea
+        // region per kept cell (up to ~40k) with an O(glyphs x cells) extractRegions() pass.
+        // Drive it directly with a synthetic cell list well past MAX_REGION_CELLS and confirm it
+        // bails out promptly (no region registration / content-stream walk) and flags truncated.
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            List<TableExtractor.CellRect> comp = new ArrayList<>();
+            int overCap = TableExtractor.MAX_REGION_CELLS + 500;
+            for (int i = 0; i < overCap; i++) {
+                TableExtractor.CellRect c = new TableExtractor.CellRect();
+                c.x0 = i; c.y0 = 0; c.x1 = i + 1; c.y1 = 1;
+                comp.add(c);
+            }
+            List<List<TableExtractor.CellRect>> tables = List.of(comp);
+
+            TableExtractor.Result result = new TableExtractor.Result();
+            long start = System.nanoTime();
+            TableExtractor.fillCellsByRegion(tables, page, result);
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+            assertTrue(result.truncated, "exceeding MAX_REGION_CELLS must set Result.truncated");
+            assertTrue(elapsedMs < 5000, "must bail out promptly instead of registering " + overCap + " regions");
+        }
+    }
+
+    @Test
+    void interruptedThreadStopsProcessingFurtherPages() throws Exception {
+        // extract() had zero interrupt checks: a multi-page hostile doc would ignore a soft
+        // --timeout entirely (only checked by the caller AFTER extract() returns), eventually
+        // triggering the hard-halt watchdog. A between-page check (top of the per-page loop,
+        // before the try block, so it can never be swallowed by catch(Exception)) must stop
+        // promptly and flag truncated, instead of processing every page.
+        Path pdf = tmp.resolve("multipage.pdf");
+        int pageCount = 20;
+        TableTestPdfs.multiPageRuled3x3(pdf, pageCount);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            List<Integer> pages = new ArrayList<>();
+            for (int p = 1; p <= pageCount; p++) pages.add(p);
+
+            TableExtractor.Result full = TableExtractor.extract(doc, pages, Map.of());
+            assertEquals(pageCount, full.tables.size(), "sanity: every page yields one table when uninterrupted");
+            assertFalse(full.truncated);
+
+            Thread.currentThread().interrupt();
+            try {
+                TableExtractor.Result interrupted = TableExtractor.extract(doc, pages, Map.of());
+                assertTrue(interrupted.truncated, "interrupted extract() must set Result.truncated");
+                assertTrue(interrupted.tables.size() < pageCount,
+                        "interrupted extract() must not process every page: got "
+                                + interrupted.tables.size() + " of " + pageCount);
+            } finally {
+                Thread.interrupted(); // clear the flag so it doesn't leak into other tests
             }
         }
     }

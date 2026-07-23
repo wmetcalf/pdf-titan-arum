@@ -101,6 +101,31 @@ final class TableTestPdfs {
         }
     }
 
+    /**
+     * A {@code pageCount}-page document, each page an independent copy of {@link #ruled3x3}'s
+     * ruled 3x3 grid (own rulings, own text). Used to exercise multi-page lifecycle behavior
+     * (e.g. an interrupted extract() must stop between pages rather than processing all of them).
+     */
+    static void multiPageRuled3x3(Path file, int pageCount) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            for (int i = 0; i < pageCount; i++) {
+                PDPage page = new PDPage(PDRectangle.LETTER);
+                doc.addPage(page);
+                try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                    cs.setLineWidth(0.75f);
+                    for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                    for (float x : new float[]{50, 150, 250, 350}) line(cs, x, 700, x, 610);
+                    for (int r = 0; r < 3; r++) {
+                        for (int c = 0; c < 3; c++) {
+                            text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));
+                        }
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
     /** No tables: a paragraph, an underlined word, and one boxed callout rectangle. */
     static void noTables(Path file) throws IOException {
         try (PDDocument doc = new PDDocument()) {
@@ -165,6 +190,44 @@ final class TableTestPdfs {
                     tr.appendKid(cell);
                 }
             }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A tagged 1x1 table (one TD, MCID 0) whose text is wrapped in {@code nestDepth} nested,
+     * untagged "Span" BDC/EMC marked-content blocks in the content stream -- exercising
+     * flattenMarkedContent's recursive walk over a deeply nested {@code PDMarkedContent} tree
+     * built by {@code PDFMarkedContentExtractor} from real (if hostile) content-stream nesting.
+     */
+    static void taggedDeeplyNestedMarkedContent(Path file, int nestDepth) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                COSName span = COSName.getPDFName("Span");
+                for (int i = 0; i < nestDepth; i++) cs.beginMarkedContent(span);
+                COSDictionary d = new COSDictionary();
+                d.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                text(cs, 60, 700, "DEEP");
+                cs.endMarkedContent();
+                for (int i = 0; i < nestDepth; i++) cs.endMarkedContent();
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(page);
+            cell.getCOSObject().setInt(COSName.K, 0);
+            tr.appendKid(cell);
             doc.save(file.toFile());
         }
     }

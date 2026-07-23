@@ -210,6 +210,38 @@ class TableGeometryTest {
         assertEquals((n - 1) * (n - 1), cells.size());
     }
 
+    @Test
+    void groupIntoTablesThrowsOnGroupingWorkBudget() {
+        // Reviewer's reproducer: groupIntoTables' double loop over touches()/union() runs
+        // BEFORE any per-table cap gates it, so a page whose findCells() output is a large,
+        // mutually-non-touching CellRect list (each far from every other -> full O(n^2) work,
+        // no early union short-circuit) must fail fast via MAX_GROUPING_WORK rather than
+        // grinding through every pair. n=3000 -> 3000*2999/2 = 4,498,500 pair checks, just
+        // over the 4,000,000 budget.
+        int n = 3000;
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            float base = i * 1000f;
+            cells.add(cellRect(base, base, base + 10f, base + 10f));
+        }
+        assertThrows(TableExtractor.RulingOverflowException.class,
+                () -> TableExtractor.groupIntoTables(cells));
+    }
+
+    @Test
+    void groupIntoTablesHandlesNormalPageSizePromptly() {
+        // A legitimate page (a few hundred cells) must stay far under the grouping work
+        // budget and return normal, correct grouping.
+        int n = 200;
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            float base = i * 1000f;
+            cells.add(cellRect(base, base, base + 10f, base + 10f));
+        }
+        List<List<TableExtractor.CellRect>> comps = TableExtractor.groupIntoTables(cells);
+        assertEquals(n, comps.size(), "far-apart cells must remain separate components");
+    }
+
     private static TableExtractor.CellRect cellRect(float x0, float y0, float x1, float y1) {
         TableExtractor.CellRect c = new TableExtractor.CellRect();
         c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;

@@ -387,14 +387,17 @@ class TableTaggedTest {
         }
     }
 
-    // ---------------------------------------------------------------- FIX 2: tagged no longer
-    // ---------------------------------------------------------------- suppresses whole-page lattice
+    // ---------------------------------------------------------------- FIX 2 / final decision:
+    // ---------------------------------------------------------------- lattice is NEVER suppressed;
+    // ---------------------------------------------------------------- likelyDuplicateOfTagged is
+    // ---------------------------------------------------------------- an advisory flag only.
 
     @Test
     void taggedTableDoesNotSuppressSeparateRuledTableOnSamePage() throws Exception {
         // Codex P1 / ledger M-T6-2 reproducer: a page carrying a tagged table used to be entirely
         // SKIPPED for lattice extraction (coveredByTagged), silently dropping a second, genuinely
-        // separate ruled (untagged) table living elsewhere on the same page. Both must now survive.
+        // separate ruled (untagged) table living elsewhere on the same page. Both must now survive,
+        // and (this fix) the distinct ruled table must NOT be flagged as a likely duplicate either.
         Path pdf = tmp.resolve("tagged_plus_ruled.pdf");
         TableTestPdfs.taggedPlusSeparateRuledTable(pdf);
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
@@ -406,28 +409,46 @@ class TableTaggedTest {
                     .filter(t -> "tagged".equals(t.extractionMethod))
                     .findFirst().orElseThrow(() -> new AssertionError("tagged table missing: " + r.tables));
             assertEquals("Tagged", tagged.cells.get(0).text);
+            assertNull(tagged.likelyDuplicateOfTagged, "the flag is only ever set on a lattice table");
 
             TableExtractor.TableHit lattice = r.tables.stream()
                     .filter(t -> "lattice".equals(t.extractionMethod))
                     .findFirst().orElseThrow(
                             () -> new AssertionError("the separate ruled table must not be silently dropped: " + r.tables));
             assertEquals(List.of(List.of("L", "R"), List.of("C", "D")), lattice.rows);
+            assertNull(lattice.likelyDuplicateOfTagged,
+                    "a genuinely distinct ruled table must not be flagged as a likely duplicate of the "
+                            + "tagged table: " + lattice.likelyDuplicateOfTagged);
         }
     }
 
     @Test
-    void tableBothTaggedAndRuledIsEmittedOnce() throws Exception {
-        // FIX 2 control: a table that BOTH paths independently find (same visual location, same
-        // cells) must surface exactly ONCE (the tagged copy, which carries header/th info), not
-        // duplicated as tagged-plus-lattice.
+    void tableBothTaggedAndRuledEmitsBothWithLatticeFlaggedDuplicate() throws Exception {
+        // FINAL DECISION (this fix): a table that BOTH paths independently find (same visual
+        // location, same cells) is no longer deduped away -- BOTH copies are emitted, ALWAYS.
+        // The lattice copy is instead marked with the advisory likelyDuplicateOfTagged flag (the
+        // tagged copy, which carries header/th info, is never flagged), so a downstream consumer
+        // can still collapse the pair if it chooses -- but this extractor never silently drops one.
         Path pdf = tmp.resolve("tagged_and_ruled_same.pdf");
         TableTestPdfs.taggedAndRuledSameTable(pdf);
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
-            assertEquals(1, r.tables.size(),
-                    "the same table found by both paths must be emitted once, not duplicated: " + r.tables);
-            assertEquals("tagged", r.tables.get(0).extractionMethod,
-                    "the tagged copy (with header info) must win the dedup");
+            assertEquals(2, r.tables.size(),
+                    "both the tagged AND lattice copies of the same table must now be emitted, "
+                            + "never silently suppressed: " + r.tables);
+
+            TableExtractor.TableHit tagged = r.tables.stream()
+                    .filter(t -> "tagged".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("tagged table missing: " + r.tables));
+            assertNull(tagged.likelyDuplicateOfTagged,
+                    "the tagged table itself is never the CANDIDATE side of the flag");
+
+            TableExtractor.TableHit lattice = r.tables.stream()
+                    .filter(t -> "lattice".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("lattice table missing: " + r.tables));
+            assertEquals(Boolean.TRUE, lattice.likelyDuplicateOfTagged,
+                    "the lattice copy of a table also found (identically) by the tagged path must be "
+                            + "flagged likelyDuplicateOfTagged=true: " + r.tables);
         }
     }
 
@@ -461,6 +482,9 @@ class TableTaggedTest {
                     .findFirst().orElseThrow(
                             () -> new AssertionError("the distinct ruled table must survive, not be suppressed: " + r.tables));
             assertEquals(List.of(List.of("L", "R"), List.of("C", "D")), lattice.rows);
+            assertNull(lattice.likelyDuplicateOfTagged,
+                    "the distinct ruled table must not be flagged just because its centroid falls "
+                            + "inside a sparse tagged cell's inflated bbox: " + lattice.likelyDuplicateOfTagged);
         }
     }
 
@@ -497,6 +521,9 @@ class TableTaggedTest {
                     List.of("R1C1", "R1C2", "R1C3"),
                     List.of("R2C1", "R2C2", "R2C3"),
                     List.of("R3C1", "R3C2", "R3C3")), lattice.rows);
+            assertNull(lattice.likelyDuplicateOfTagged,
+                    "a large distinct ruled table must not be flagged just because it fills most of "
+                            + "a 1-cell sparse tagged table's inflated bbox: " + lattice.likelyDuplicateOfTagged);
         }
     }
 
@@ -533,6 +560,10 @@ class TableTaggedTest {
                     List.of("R1C1", "R1C2", "R1C3"),
                     List.of("R2C1", "R2C2", "R2C3"),
                     List.of("R3C1", "R3C2", "R3C3")), lattice.rows);
+            assertNull(lattice.likelyDuplicateOfTagged,
+                    "a distinct 9-cell ruled table must not be flagged just because a spread, "
+                            + "structurally-real 9-cell tagged table also inflates to near-page size: "
+                            + lattice.likelyDuplicateOfTagged);
         }
     }
 
@@ -569,6 +600,9 @@ class TableTaggedTest {
                     .findFirst().orElseThrow(
                             () -> new AssertionError("the distinct ruled table in the gap must survive, not be suppressed: " + r.tables));
             assertEquals(List.of(List.of("MID", ""), List.of("L", "R")), lattice.rows);
+            assertNull(lattice.likelyDuplicateOfTagged,
+                    "a distinct ruled table sitting in the hollow middle between two dense tagged "
+                            + "blocks must not be flagged as a likely duplicate: " + lattice.likelyDuplicateOfTagged);
         }
     }
 
@@ -588,7 +622,12 @@ class TableTaggedTest {
                     "a candidate table only PARTIALLY (well under half) covered by the tagged table's "
                             + "real cells must be kept, not treated as the same table: " + r.tables);
             assertTrue(r.tables.stream().anyMatch(t -> "tagged".equals(t.extractionMethod)));
-            assertTrue(r.tables.stream().anyMatch(t -> "lattice".equals(t.extractionMethod)));
+            TableExtractor.TableHit lattice = r.tables.stream()
+                    .filter(t -> "lattice".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("lattice table missing: " + r.tables));
+            assertNull(lattice.likelyDuplicateOfTagged,
+                    "partial (well under threshold) cell-footprint overlap must not set the advisory "
+                            + "duplicate flag: " + lattice.likelyDuplicateOfTagged);
         }
     }
 

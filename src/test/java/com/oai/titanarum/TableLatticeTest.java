@@ -67,6 +67,11 @@ class TableLatticeTest {
             assertTrue(t.markdown.startsWith("| R1C1 | R1C2 | R1C3 |"));
             // header is unknown on the lattice path -> omitted
             assertTrue(t.cells.stream().allMatch(c -> c.header == null));
+            // (C) pure-lattice page, no tagged table anywhere on it -> the advisory dedup flag
+            // must never be set (left null, so omitted from report.json entirely).
+            assertNull(t.likelyDuplicateOfTagged,
+                    "a lattice table on a page with no tagged tables must never be flagged as a "
+                            + "likely duplicate of one: " + t.likelyDuplicateOfTagged);
         }
     }
 

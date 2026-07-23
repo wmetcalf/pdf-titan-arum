@@ -220,6 +220,14 @@ final class TableExtractor {
         public List<List<String>> rows;   // jq-friendly grid; span anchors carry text, covered = ""
         public List<CellHit> cells;       // faithful structure
         public String markdown;
+        // Advisory-only hint: true when this LATTICE table's own cell footprint is substantially
+        // covered by an already-emitted TAGGED table on the same page (see
+        // #isLikelyDuplicateOfTaggedTable). Never causes suppression -- both tables are ALWAYS
+        // emitted; a downstream consumer may use this to dedup if it chooses. Left null (and so
+        // omitted from report.json, via the class's NON_NULL inclusion) for every tagged table and
+        // for any lattice table that isn't flagged, so existing consumers that ignore unknown
+        // fields see no change in shape for the common case.
+        public Boolean likelyDuplicateOfTagged;
     }
 
     /** One cell (span anchor) of a table. */
@@ -1416,10 +1424,19 @@ final class TableExtractor {
         // FIX 2 (Codex P1 / ledger M-T6-2): a page carrying a tagged table used to be entirely
         // SKIPPED here (coveredByTagged), so a second, separate ruled-but-untagged table on that
         // same page was silently dropped from report.json. Lattice now runs on EVERY processed
-        // page regardless of tagged coverage; {@link #renderKeptTables} dedups a lattice table
-        // against an already-emitted tagged table on the same page by bbox overlap (relies on
-        // FIX 1: tagged and lattice bboxes now share one visual frame, so the overlap test is
-        // valid on rotated pages too), so the SAME table found by both paths is still emitted once.
+        // page regardless of tagged coverage.
+        //
+        // FINAL DECISION (this fix, supersedes every suppression round below): geometric dedup
+        // between the tagged and lattice paths is PROVABLY LEAKY (see the round 2-5 history still
+        // documented on {@link #isLikelyDuplicateOfTaggedTable}) and risks the one outcome this
+        // threat model treats as worst-case -- silently dropping a real, distinct table from
+        // report.json. Suppression is REMOVED entirely: {@link #renderKeptTables} now ALWAYS
+        // emits every lattice table it builds, tagged or not, overlapping or not. The same
+        // per-cell footprint signal that used to gate a `continue` (skip) now only sets an
+        // ADVISORY {@code likelyDuplicateOfTagged} flag on the lattice copy when it looks like the
+        // same table as an already-emitted tagged one -- a hint a downstream consumer may use to
+        // dedup, never a reason for this extractor to drop data. Over-flagging is a mild cosmetic
+        // issue; silent-drop is now structurally impossible from this path.
         for (int pageNum : pagesToProcess) {
             if (Thread.currentThread().isInterrupted()) {
                 result.truncated = true;
@@ -1514,11 +1531,14 @@ final class TableExtractor {
             try {
                 TableHit t = buildTable(pageNum, comp, "lattice");
                 renderViews(t);
-                // FIX 2: don't double-emit a table both the tagged and lattice paths found. Tagged
-                // extraction (see extract()) always runs to completion for every page BEFORE this
-                // per-page lattice loop starts, so every tagged TableHit for THIS page is already
-                // in result.tables by the time we get here.
-                if (overlapsAlreadyEmittedTaggedTable(t, result.tables)) continue;
+                // FINAL DECISION (this fix): never drop a lattice table because it overlaps a
+                // tagged one -- ALWAYS add it. Tagged extraction (see extract()) always runs to
+                // completion for every page BEFORE this per-page lattice loop starts, so every
+                // tagged TableHit for THIS page is already in result.tables by the time we get
+                // here, making it safe to check for an advisory match against them now.
+                if (isLikelyDuplicateOfTaggedTable(t, result.tables)) {
+                    t.likelyDuplicateOfTagged = Boolean.TRUE;
+                }
                 result.tables.add(t);
             } catch (RulingOverflowException e) {
                 result.truncated = true;
@@ -1530,11 +1550,15 @@ final class TableExtractor {
     /**
      * FIX 2 (Codex P1 / ledger M-T6-2): lattice extraction now runs on every processed page even
      * when that page also has a tagged table (see {@link #extract}'s doc), so a genuinely SEPARATE
-     * ruled table is no longer silently dropped -- but a table that both paths independently find
-     * must still surface only ONCE (the tagged copy, which carries header/th info the lattice path
-     * can't). Relies on FIX 1 (tagged and lattice bboxes share one visual/rotated frame) to be
-     * valid on rotated pages, same as everywhere else in this class that compares the two paths'
-     * geometry.
+     * ruled table is no longer silently dropped. Rounds 2-5 (below) then chased whether a table
+     * that BOTH paths independently find could be safely surfaced only ONCE, by suppressing the
+     * lattice copy -- that suppression is GONE as of this fix (see the FINAL DECISION paragraph
+     * on {@link #extract}'s own doc): a lattice table is now NEVER dropped for overlapping a
+     * tagged one. This method's boolean result no longer gates a skip; it only decides whether
+     * {@link #renderKeptTables} sets the ADVISORY {@code likelyDuplicateOfTagged} flag on a
+     * lattice table it is emitting UNCONDITIONALLY either way. Relies on FIX 1 (tagged and
+     * lattice bboxes share one visual/rotated frame) to be valid on rotated pages, same as
+     * everywhere else in this class that compares the two paths' geometry.
      *
      * <p>Rounds 2-4 (post-review, all reverted/superseded -- see git history) tried, in turn:
      * candidate-bbox-CENTROID-inside-tagged-bbox, then Intersection-over-Union of the two OUTER
@@ -1543,39 +1567,41 @@ final class TableExtractor {
      * AGGREGATE comparison -- centroid, whole-bbox geometry, cell count, cell-area-sum-vs-own-bbox
      * -- and every one was eventually defeated by a differently-shaped tagged bbox that is not a
      * tight fit for its own cells: a sparse 1-cell table (round 2/3), a spread-but-real N-cell
-     * table (round 4), and FINALLY (round 5, the reproducer that ended this) a tagged table whose
-     * bbox is the union of two far-apart DENSE blocks ("dense bookends, hollow middle" -- e.g. a
-     * real header block and a real footer block that are legitimately one tagged table together,
-     * such as a continued-on-next-page note): its fill ratio (~0.37), cell count, and IoU-via-
-     * containment ALL clear every prior guard's threshold, yet a genuinely distinct ruled table
-     * sitting in the EMPTY MIDDLE between the two dense blocks overlaps NEITHER tagged block and
-     * was still silently dropped. No aggregate statistic over the tagged table's cells can ever
-     * close this: the blind spot is structural, not a wrong threshold -- none of rounds 2-4 ever
-     * asks WHERE the tagged content actually is relative to the candidate.
+     * table (round 4), and (round 5) a tagged table whose bbox is the union of two far-apart DENSE
+     * blocks ("dense bookends, hollow middle" -- e.g. a real header block and a real footer block
+     * that are legitimately one tagged table together, such as a continued-on-next-page note): its
+     * fill ratio (~0.37), cell count, and IoU-via-containment ALL cleared every prior guard's
+     * threshold, yet a genuinely distinct ruled table sitting in the EMPTY MIDDLE between the two
+     * dense blocks overlaps NEITHER tagged block. Back when this method's result gated a skip,
+     * that meant a real table was silently dropped -- the exact failure mode that motivated
+     * removing suppression entirely. No aggregate statistic over the tagged table's cells could
+     * ever close this: the blind spot is structural, not a wrong threshold -- none of rounds 2-4
+     * ever asked WHERE the tagged content actually is relative to the candidate.
      *
-     * <p>Round 5 (DEFINITIVE): dedup on the tagged table's actual CELL FOOTPRINT, not any
-     * aggregate over its outer bbox. {@link #taggedCellFootprintCoversCandidate} sums, over every
-     * one of the tagged table's own cell rectangles, the area of that cell's intersection with the
-     * candidate lattice table's bbox, and suppresses only when that summed overlap covers a
-     * majority of the candidate's own area. This is the invariant every prior round missed: a
-     * genuinely DISTINCT table shares no cell-level footprint with the tagged table it's compared
-     * against, no matter how its OUTER bbox happens to relate to the tagged table's outer bbox --
+     * <p>Round 5 (the signal THIS method still uses, now purely advisory): compare against the
+     * tagged table's actual CELL FOOTPRINT, not any aggregate over its outer bbox. {@link
+     * #taggedCellFootprintCoversCandidate} sums, over every one of the tagged table's own cell
+     * rectangles, the area of that cell's intersection with the candidate lattice table's bbox,
+     * and reports a likely match only when that summed overlap covers a majority of the
+     * candidate's own area. This is the invariant every prior round missed: a genuinely DISTINCT
+     * table shares no cell-level footprint with the tagged table it's compared against, no matter
+     * how its OUTER bbox happens to relate to the tagged table's outer bbox --
      * <ul>
      *   <li>hollow-middle (round 5's own reproducer): the candidate sits in the gap between the two
-     *       dense tagged blocks -- it intersects ZERO tagged cell rectangles -- overlap 0 -- kept;</li>
+     *       dense tagged blocks -- it intersects ZERO tagged cell rectangles -- overlap 0 -- kept,
+     *       unflagged;</li>
      *   <li>sparse-1-cell / spread-N-cell inflated bbox (rounds 2-4's reproducers): the candidate
      *       can only overlap the tagged table's few small ACTUAL cells, never the inflated gaps
-     *       between them -- overlap fraction stays low -- kept;</li>
+     *       between them -- overlap fraction stays low -- kept, unflagged;</li>
      *   <li>a genuine same-table match: the candidate's bbox IS the same grid the tagged cells
-     *       tile, so the summed per-cell overlap covers nearly all of it -- suppressed, correctly
-     *       deduped to the tagged copy.</li>
+     *       tile, so the summed per-cell overlap covers nearly all of it -- kept AND flagged
+     *       {@code likelyDuplicateOfTagged=true}, leaving the choice to dedup to the consumer.</li>
      * </ul>
-     * No gappy/inflated/union tagged bbox can ever suppress a table it doesn't actually cover cell
-     * by cell, closing the whole class rather than one more shape of it. The now-redundant IoU/
-     * fill-ratio/cell-count-ratio guards and their helpers were removed; this single check replaces
-     * them.
+     * Even if this signal is ever wrong in some future shape (over- or under-flagging), the
+     * consequence is now purely cosmetic -- a flag set or unset on data that is ALWAYS present --
+     * never data silently missing from report.json.
      */
-    private static boolean overlapsAlreadyEmittedTaggedTable(TableHit candidate, List<TableHit> tables) {
+    private static boolean isLikelyDuplicateOfTaggedTable(TableHit candidate, List<TableHit> tables) {
         if (candidate.bbox == null) return false;
         for (TableHit t : tables) {
             if (t.page != candidate.page) continue;
@@ -1587,17 +1613,21 @@ final class TableExtractor {
     }
 
     // A majority of the candidate's own area must be covered by the tagged table's REAL cells for
-    // suppression to fire. A genuinely distinct table (hollow-middle, sparse-suppressor gaps) never
-    // approaches this -- its overlap with the tagged table's actual cell footprint is near zero,
-    // regardless of how the two tables' OUTER bboxes relate. A genuine same-table match has its
-    // entire bbox tiled by the tagged cells (they're the same grid), so overlap approaches the
-    // candidate's full area, clearing 0.5 with room to spare.
+    // the advisory likelyDuplicateOfTagged flag to be set (this signal no longer suppresses
+    // anything -- see isLikelyDuplicateOfTaggedTable's doc). A genuinely distinct table
+    // (hollow-middle, sparse-inflated-bbox shapes) never approaches this -- its overlap with the
+    // tagged table's actual cell footprint is near zero, regardless of how the two tables' OUTER
+    // bboxes relate. A genuine same-table match has its entire bbox tiled by the tagged cells
+    // (they're the same grid), so overlap approaches the candidate's full area, clearing 0.5 with
+    // room to spare.
     private static final float CELL_FOOTPRINT_COVERAGE_THRESHOLD = 0.5f;
 
     /**
      * True when tagged table {@code t}'s own cell rectangles cover a majority of candidate lattice
-     * table {@code c}'s bbox area -- the sole test for whether {@code t} may act as a dedup
-     * suppressor of {@code c}. Tagged grid cells never overlap each other (occupancy-map-placed,
+     * table {@code c}'s bbox area -- the sole test for whether {@code c} should be flagged {@code
+     * likelyDuplicateOfTagged} against {@code t}. This is now purely advisory (see {@link
+     * #isLikelyDuplicateOfTaggedTable}'s doc for the FINAL DECISION that ended suppression); {@code
+     * c} is emitted either way. Tagged grid cells never overlap each other (occupancy-map-placed,
      * one structure element per grid slot -- see {@link #buildTaggedTable}), so summing each cell's
      * OWN intersection with {@code c.bbox} is a correct (no double-count) substitute for a proper
      * union-of-rectangles computation.
@@ -1607,7 +1637,7 @@ final class TableExtractor {
      * zero-area bbox (a textless placeholder cell, or one resolved from a different page -- see
      * {@link #buildTaggedTable}'s {@code onTablePage} gate) contributes zero overlap, never a
      * divide-by-zero or a spurious match. Guards {@code c.bbox}'s own area being non-positive
-     * (degenerate candidate bbox -> never eligible to be suppressed, the safe direction).
+     * (degenerate candidate bbox -> never eligible to be flagged, the safe direction).
      *
      * <p>Requires {@code t.cells.size() >= 2} -- discovered necessary by direct measurement, not
      * merely a leftover from the prior (round 3) cell-count guard. A tagged table with EXACTLY one
@@ -1616,12 +1646,12 @@ final class TableExtractor {
      * mathematically IDENTICAL. For round 2/3's sparse reproducer (one TD cell whose /K lists two
      * far-apart MCIDs), that single cell's own bbox is exactly the same huge, gappy rectangle its
      * outer table bbox is -- so the per-cell-footprint test, run over exactly one cell, reduces
-     * right back to plain outer-bbox containment and WOULD wrongly re-suppress a small distinct
+     * right back to plain outer-bbox containment and WOULD wrongly re-flag a small distinct
      * candidate sitting inside it (verified directly: re-ran round 2/3's fixtures against the
-     * cell-footprint test with no floor and confirmed the false suppression recurred). A table
-     * that resolves to a single cell is not a distinguishable multi-cell grid at all -- there is no
-     * "footprint versus outer bbox" distinction left to check for it -- so it is never eligible to
-     * suppress anything under this test, independent of geometry.
+     * cell-footprint test with no floor and confirmed the false match recurred back when this test
+     * gated suppression). A table that resolves to a single cell is not a distinguishable
+     * multi-cell grid at all -- there is no "footprint versus outer bbox" distinction left to check
+     * for it -- so it is never eligible to flag anything under this test, independent of geometry.
      */
     private static boolean taggedCellFootprintCoversCandidate(TableHit t, TableHit c) {
         float candidateArea = bboxArea(c.bbox);

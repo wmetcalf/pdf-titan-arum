@@ -109,6 +109,34 @@ class TableTaggedTest {
     }
 
     @Test
+    void taggedGridProductCapRejectsSparseWideTableWithoutOOM() throws Exception {
+        // FIX B (round 3) reproducer: 5,000 TRs (TR#0: 5 TDs each ColSpan=1000; TR#1..4999: a
+        // plain 1x1 TD each). cumulativeArea (9,999) stays UNDER MAX_CELLS_PER_TABLE, so the
+        // existing per-cell area guard never trips -- but the clustered grid is 5,000 rows x
+        // 5,000 cols (product 25,000,000). Before the fix this reached renderViews, which
+        // allocated a 5,000x5,000 String[][] (~25,000,000 cells) plus a full-grid markdown
+        // StringBuilder for this ONE table. The fixed buildTaggedTable must reject the table
+        // (grid product > MAX_CELLS_PER_TABLE) and flag truncated, the SAME non-silent signal
+        // the cumulativeArea guard already uses -- the table must be ABSENT from the result, not
+        // merely present-but-wrong, and extract() must return promptly (no multi-hundred-MB
+        // allocation, no long stall) rather than hanging or OOMing while rendering it.
+        Path pdf = tmp.resolve("gridproductbomb.pdf");
+        TableTestPdfs.taggedGridProductBomb(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            long startMs = System.nanoTime();
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            long elapsedMs = (System.nanoTime() - startMs) / 1_000_000;
+
+            assertTrue(r.tables.stream().noneMatch(t -> "tagged".equals(t.extractionMethod)),
+                    "the 5,000x5,000-grid-product tagged table must be rejected, not emitted: " + r.tables);
+            assertTrue(r.truncated,
+                    "grid-product cap rejection must set Result.truncated, like the cumulativeArea cap does");
+            assertTrue(elapsedMs < 15_000,
+                    "must reject promptly, not stall/allocate rendering a 25,000,000-cell grid: took " + elapsedMs + "ms");
+        }
+    }
+
+    @Test
     void taggedTablesPerPageCapped() throws Exception {
         // MAX_TABLES_PER_PAGE + 5 independent 1x1 tagged tables, all resolving to page 1: a
         // hostile structure tree with many Table elements must not emit unbounded duplicates

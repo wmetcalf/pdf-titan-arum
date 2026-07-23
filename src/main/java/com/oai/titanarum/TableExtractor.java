@@ -19,7 +19,7 @@ import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedConte
 import org.apache.pdfbox.pdmodel.documentinterchange.taggedpdf.PDTableAttributeObject;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
 import org.apache.pdfbox.text.PDFMarkedContentExtractor;
-import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.pdfbox.text.PDFTextStripperByArea;
 import org.apache.pdfbox.text.TextPosition;
 
 import java.awt.geom.Point2D;
@@ -79,17 +79,41 @@ final class TableExtractor {
     // grid at that size completes in low hundreds of thousands of pair checks, comfortably under
     // 1% of this budget). Counts each touches() pair evaluation across the whole call.
     static final long MAX_GROUPING_WORK = 60_000_000;
-    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion). FIX 2: this path used
-    // to register one PDFTextStripperByArea region per kept cell (up to ~40k) and run an
-    // extractRegions() pass that was O(glyphs x cells) with NO other work budget -- a few-KB PDF
-    // with millions of glyphs could blow past the hard-halt in one uninterruptible call even
-    // with cells capped. fillCellsByRegion now does a single O(glyphs) content-stream strip (see
-    // stripAllPositions) feeding the already-budgeted fillCellsFromPositions (MAX_TEXTFILL_WORK)
-    // instead, so the glyph side is bounded the same way the normal (non--skip-text-urls) path
-    // always was. This cap remains as a cheap, independent backstop on the cell side (still
-    // bounds memory/region count semantics for callers/tests that rely on it) even though the
-    // glyph-matching cost it used to guard no longer exists in its old unbounded form.
+    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the CELL side: a
+    // hostile page whose kept-cell count (across every table combined) exceeds this cap must not
+    // register any PDFTextStripperByArea regions / walk the content stream at all; flag truncated
+    // and bail out promptly instead. See MAX_REGION_GLYPHS below for the companion GLYPH-side cap.
+    //
+    // round-3 history: a prior round (FIX 2, ledger r9-region) replaced this method's original
+    // PDFTextStripperByArea-based region strip with an anonymous PDFTextStripper subclass
+    // (stripAllPositions) that BUFFERED every page glyph into a List before bucketing, to close
+    // an O(glyphs x cells) CPU concern on the glyph side (extractRegions() had no work budget at
+    // all). That rewrite introduced its own regression: PDFTextStripper's base-class per-glyph
+    // bookkeeping is unbounded, so a hostile page with millions of glyphs OOM'd building that
+    // list BEFORE any cell-side or work-side budget could bound anything (REPRODUCED: a
+    // 12,483-byte one-page PDF with 6,000,000 glyphs threw OutOfMemoryError at -Xmx2g via
+    // fillCellsByRegion, vs. ~3MB/562ms for the streaming PDFTextStripperByArea approach on the
+    // same file). This round reverts to the original streaming PDFTextStripperByArea approach
+    // (see RegionStripper) -- O(1)-ish memory, since a glyph outside every registered region
+    // never reaches the base class's per-glyph bookkeeping at all -- while ALSO closing the
+    // original CPU concern that motivated FIX 2, via MAX_REGION_GLYPHS (a hard glyph-count cap
+    // RegionStripper enforces BEFORE delegating to the base class), so neither regression can
+    // recur. This also restores the original region-overlap cell-assignment semantics (a glyph
+    // is in a cell when PDFTextStripperByArea's own /Rotate-aware rect.contains(getX(),getY())
+    // says so), rather than the FIX 2 rewrite's midpoint-containment reimplementation.
     static final int MAX_REGION_CELLS = 5_000;
+    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the GLYPH side:
+    // RegionStripper (see below) counts every TextPosition the content-stream engine reports --
+    // regardless of whether it falls inside any registered cell region -- and throws once this
+    // cap is exceeded, BEFORE delegating to PDFTextStripperByArea's own (unbounded-per-glyph)
+    // bookkeeping. This is what closes the original FIX 2 CPU concern (O(glyphs x cells), no
+    // bound on glyphs) without reintroducing FIX 2's own buffer-the-whole-page memory regression:
+    // memory stays bounded because (a) unmatched glyphs are never retained past the containment
+    // check, and (b) even a pathological all-cells-overlap-every-glyph shape can retain at most
+    // MAX_REGION_GLYPHS matched positions total. 2,000,000 is comfortably above any legitimate
+    // page's real glyph count (a dense page of small type rarely reaches even tens of thousands)
+    // while still bounding per-page work to a finite, deterministic amount.
+    static final int MAX_REGION_GLYPHS = 2_000_000;
     // FIX 4: caps splitComponent/tryCuts' OWN recursion depth (distinct from MAX_SPLIT_WORK,
     // which bounds total work but not stack depth), mirroring the depth>64 convention used by
     // every other recursive walk in this class (collectByType/collectGlyphs/resolveElementPage).
@@ -139,8 +163,20 @@ final class TableExtractor {
 
     // ---------------------------------------------------------------- views
 
-    /** Fill {@code t.rows} and {@code t.markdown} from cells + rowCount/colCount. */
+    /**
+     * Fill {@code t.rows} and {@code t.markdown} from cells + rowCount/colCount.
+     *
+     * <p>FIX B (round 3) defense-in-depth: every caller already rejects a table whose grid
+     * product exceeds {@link #MAX_CELLS_PER_TABLE} before reaching here (the tagged path via
+     * {@link #buildTaggedTable}'s own grid-product guard; the lattice path because {@link
+     * #placeGridBudgeted} already charged that same rowCount*colCount cost against {@link
+     * #MAX_SPLIT_WORK} while resolving the final placement). This is a cheap backstop, not the
+     * primary defense, against a future caller forgetting that gate -- refuse the giant {@code
+     * String[rowCount][colCount]} + full-grid markdown allocation outright rather than silently
+     * materializing hundreds of MB for one table.
+     */
     static void renderViews(TableHit t) {
+        if ((long) t.rowCount * t.colCount > MAX_CELLS_PER_TABLE) throw new RulingOverflowException();
         String[][] grid = new String[t.rowCount][t.colCount];
         for (String[] row : grid) java.util.Arrays.fill(row, "");
         for (CellHit c : t.cells) {
@@ -1089,34 +1125,77 @@ final class TableExtractor {
     }
 
     /**
-     * Fallback when no TextPositions were collected (--skip-text-urls). FIX 2: previously this
-     * batched every qualifying table's cells into ONE {@code PDFTextStripperByArea} pass (one
-     * content-stream walk), registering one region per kept cell and letting
-     * {@code extractRegions()} do its own O(glyphs x cells) region-matching internally, with NO
-     * work budget on the glyph side -- a hostile few-KB page with a huge glyph count crossed
-     * with a many-celled table could stall well past the hard-halt in that single
-     * uninterruptible call, even with the cell side capped (see {@link #MAX_REGION_CELLS}).
+     * FIX A (round 3): streaming, glyph-budgeted subclass of {@code PDFTextStripperByArea} used
+     * by {@link #fillCellsByRegion}. {@code PDFTextStripperByArea}'s own {@code
+     * processTextPosition(TextPosition)} (called once per glyph by the underlying content-stream
+     * engine, the SAME entry point the base {@code PDFTextStripper} uses) tests the glyph against
+     * every registered region and, ONLY for a region it actually falls in, forwards it to {@code
+     * super.processTextPosition(...)} (the base class's own per-glyph text bookkeeping). A glyph
+     * that matches no region is therefore never retained anywhere -- this is what makes the
+     * region-strip approach streaming/O(1)-ish memory, unlike the {@code stripAllPositions}
+     * approach it replaces (see {@link #MAX_REGION_GLYPHS}'s doc for that regression).
      *
-     * <p>Instead this now does a single O(glyphs) content-stream strip ({@link
-     * #stripAllPositions}), collecting every {@code TextPosition} on the page exactly once, and
-     * feeds them through the SAME already-budgeted {@link #fillCellsFromPositions} bucketing
-     * (MAX_TEXTFILL_WORK) the normal (non--skip-text-urls) path already uses -- the glyph side is
-     * now bounded the identical way for both paths, and the two are verified to produce identical
-     * output on rotated pages (see {@code TableLatticeTest.rotatedPageExtractsFaithfully}).
+     * <p>But the per-glyph region-containment scan itself still runs once per glyph regardless of
+     * match, so a hostile page with a huge glyph count is still unbounded CPU-wise without an
+     * explicit cap. This subclass counts EVERY glyph the engine reports (matched or not) and
+     * throws {@link RulingOverflowException} once {@code glyphBudget} is exceeded, BEFORE calling
+     * {@code super.processTextPosition(...)} -- bounding both the CPU (no more than {@code
+     * glyphBudget} glyphs are ever scanned against the region map) and, as a hard backstop, the
+     * memory a pathological all-glyphs-match-every-region shape could retain (at most {@code
+     * glyphBudget} matched positions total, across every region combined).
      */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
-        fillCellsByRegion(tables, page, result, MAX_TEXTFILL_WORK);
+    private static final class RegionStripper extends PDFTextStripperByArea {
+        private final long glyphBudget;
+        private long glyphCount = 0;
+
+        RegionStripper(long glyphBudget) throws IOException {
+            super();
+            this.glyphBudget = glyphBudget;
+        }
+
+        @Override
+        protected void processTextPosition(TextPosition text) {
+            if (++glyphCount > glyphBudget) throw new RulingOverflowException();
+            super.processTextPosition(text);
+        }
     }
 
-    /** Package-private overload taking an explicit glyph-work budget, mirroring {@link
-     * #fillCellsFromPositions(List, List, int, float, float, long[], long)}'s test-only budget
-     * override -- lets a test pin FIX 2's glyph-work bound deterministically without needing a
-     * real multi-hundred-thousand-glyph PDF fixture. */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result, long budget)
+    /**
+     * Fallback when no TextPositions were collected (--skip-text-urls): a single {@code
+     * PDFTextStripperByArea}-based content-stream pass (via {@link RegionStripper}), registering
+     * one region per kept cell (across every qualifying table on the page, namespaced {@code
+     * "t"+tableIdx+"c"+cellIdx} so cells from different tables never collide) and reading each
+     * cell's matched text back out afterwards.
+     *
+     * <p>{@code PDFTextStripperByArea} matches a region against {@code TextPosition.getX()/getY()}
+     * (verified from source: {@code rect.contains(text.getX(), text.getY())}), which -- unlike
+     * getXDirAdj/getYDirAdj -- IS keyed off the page's actual /Rotate. Our cell rects are already
+     * in that same visual frame (via {@link #collectRulings}), so no extra transform is needed
+     * here, and this restores the ORIGINAL region-overlap cell-assignment semantics (rather than
+     * a since-reverted midpoint-containment reimplementation that changed cell-boundary text
+     * inclusion behavior).
+     *
+     * <p>{@code setSortByPosition(true)}: without it, on a page whose /Rotate disagrees with its
+     * glyphs' own (unrotated) text direction -- exactly the shape produced by rotating an
+     * otherwise-ordinary page via the /Rotate flag alone, which is how {@code rotatedRuled3x3}
+     * (and plenty of real scanned/rotated PDFs) are built -- the default line-grouping
+     * mis-splits a single token across several one-character lines (e.g. "R3C1" back as
+     * "R\n3C\n1"). Verified empirically: identical region, same characters matched, only this
+     * flag differs between the broken and clean output.
+     */
+    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
+        fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS);
+    }
+
+    /** Package-private overload taking an explicit glyph-count budget (see {@link
+     * RegionStripper}), mirroring {@link #fillCellsFromPositions(List, List, int, float, float,
+     * long[], long)}'s test-only budget override -- lets a test pin {@link #MAX_REGION_GLYPHS}
+     * deterministically without needing a real multi-million-glyph PDF fixture. */
+    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result, long glyphBudget)
             throws IOException {
         // Bound the cells side (see MAX_REGION_CELLS): a hostile page whose kept-cell count
-        // (across every table combined) exceeds the cap must not walk the content stream at all;
-        // flag truncated and bail out promptly instead.
+        // (across every table combined) exceeds the cap must not register any regions / walk the
+        // content stream at all; flag truncated and bail out promptly instead.
         long totalCells = 0;
         for (List<CellRect> comp : tables) totalCells += comp.size();
         if (totalCells > MAX_REGION_CELLS) {
@@ -1125,58 +1204,23 @@ final class TableExtractor {
         }
         if (tables.isEmpty()) return;
 
-        int rotation = page.getRotation();
-        PDRectangle cropBox = page.getCropBox();
-        float unrotatedW = cropBox.getWidth();
-        float unrotatedH = cropBox.getHeight();
-
-        List<TextPosition> positions = stripAllPositions(page);
-        long[] work = {0};
-        for (List<CellRect> comp : tables) {
-            fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, budget);
+        RegionStripper area = new RegionStripper(glyphBudget);
+        area.setSortByPosition(true);
+        for (int ti = 0; ti < tables.size(); ti++) {
+            List<CellRect> comp = tables.get(ti);
+            for (int ci = 0; ci < comp.size(); ci++) {
+                CellRect c = comp.get(ci);
+                area.addRegion("t" + ti + "c" + ci,
+                        new java.awt.geom.Rectangle2D.Float(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0));
+            }
         }
-    }
-
-    /**
-     * Single linear (O(glyphs)) content-stream walk collecting every {@code TextPosition} on the
-     * page -- the FIX 2 replacement for the old per-region {@code PDFTextStripperByArea} pass.
-     * {@code getXDirAdj()/getYDirAdj()} (which {@link #fillCellsFromPositions} keys off) report
-     * per-glyph text DIRECTION, not the page's /Rotate, so this is the SAME raw-position
-     * collection the normal (non--skip-text-urls) path already uses; {@link #applyPageRotation}
-     * (inside fillCellsFromPositions) reconciles it against the /Rotate-aware cell rects.
-     *
-     * <p>{@code setSortByPosition(true)} mirrors {@code PositionAwareTextStripper}'s production
-     * usage (the normal path's own text stripper) for consistency; {@link #joinText} does its own
-     * from-scratch line clustering over the raw positions regardless of how PDFTextStripper
-     * batches characters into {@code writeString} calls, so this collection is order-independent.
-     *
-     * <p>{@code processPage(page)} is called directly (no {@code getText(document)} call, no
-     * explicit setStartPage/setEndPage): PDFTextStripper's defaults (currentPageNo=1,
-     * startPage=1, endPage=MAX_VALUE) already satisfy processPage's own page-range gate for a
-     * single freshly-constructed stripper, the same reason {@code PDFTextStripperByArea
-     * .extractRegions(page)} could call processPage(page) directly before this fix.
-     */
-    private static List<TextPosition> stripAllPositions(PDPage page) throws IOException {
-        List<TextPosition> positions = new ArrayList<>();
-        PDFTextStripper stripper = new PDFTextStripper() {
-            {
-                // processPage() is called directly below (see this method's own doc comment on
-                // why that's safe), bypassing getText(document) -- which is normally what
-                // initializes the protected `output` Writer before any page is processed.
-                // Internal writeXxx hooks other than writeString (paragraph/line separators etc.)
-                // still write straight to `output` regardless of our override below, so it must
-                // be a real (if discarded) Writer, not null.
-                output = new java.io.StringWriter();
+        area.extractRegions(page);
+        for (int ti = 0; ti < tables.size(); ti++) {
+            List<CellRect> comp = tables.get(ti);
+            for (int ci = 0; ci < comp.size(); ci++) {
+                comp.get(ci).text = area.getTextForRegion("t" + ti + "c" + ci).strip();
             }
-
-            @Override
-            protected void writeString(String s, List<TextPosition> textPositions) {
-                positions.addAll(textPositions);
-            }
-        };
-        stripper.setSortByPosition(true);
-        stripper.processPage(page);
-        return positions;
+        }
     }
 
     // ---------------------------------------------------------------- entry point
@@ -1581,6 +1625,26 @@ final class TableExtractor {
             }
         }
         if (colCount == 0) return null;
+
+        // FIX B (round 3): cumulativeArea above bounds the sum of each INDIVIDUAL cell's
+        // rowSpan*colSpan area, but a sparse/pathological structure tree can keep that sum small
+        // while still clustering into a huge ALLOCATED grid -- e.g. one row with a handful of
+        // wide-colSpan cells (only the first of which carries an MCID, so its declared colSpan
+        // alone pushes colCount out) followed by thousands of mostly-empty 1x1 rows (each adding
+        // just +1 to cumulativeArea but +1 to rowCount). REPRODUCED: 5,000 TRs (TR#0: 5 TDs each
+        // ColSpan=1000; TR#1..4999: near-empty 1x1 rows) -> cumulativeArea 9,999 (under
+        // MAX_CELLS_PER_TABLE, so the guard above never trips) but rowCount=5000 x colCount=5000
+        // -> a 25,000,000-slot grid; renderViews' {@code new String[rowCount][colCount]} plus its
+        // full-grid markdown StringBuilder then allocate ~250MB for this ONE table (x up to
+        // MAX_TABLES_PER_PAGE on the same page -> gigabytes -> OOM), entirely BEFORE
+        // renderViews is reached. A legitimate table's grid product approximates its real cell
+        // count, so MAX_CELLS_PER_TABLE is the same consistent bound here as cumulativeArea uses
+        // above -- reject (not silently drop: same truncated signal as the cumulativeArea cap)
+        // BEFORE the caller ever calls renderViews on this table.
+        if ((long) rows.size() * colCount > MAX_CELLS_PER_TABLE) {
+            result.truncated = true;
+            return null;
+        }
 
         TableHit t = new TableHit();
         t.page = pageNum;

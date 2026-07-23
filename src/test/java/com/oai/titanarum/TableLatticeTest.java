@@ -8,10 +8,17 @@ import org.apache.pdfbox.text.TextPosition;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -223,16 +230,15 @@ class TableLatticeTest {
 
     @Test
     void fillCellsByRegionGlyphWorkIsBudgeted() throws Exception {
-        // FIX 2 reproducer: fillCellsByRegion's GLYPH side (as opposed to the cell side capped by
-        // MAX_REGION_CELLS above) used to be unbounded -- it registered one PDFTextStripperByArea
-        // region per kept cell and let extractRegions() do its own O(glyphs x cells) matching
-        // internally, with no work budget at all. A hostile page pairing a huge glyph count with
-        // a many-celled table (well under MAX_REGION_CELLS) could stall past the hard-halt in
-        // that single call. fillCellsByRegion now collects positions via one linear strip and
-        // feeds them through the SAME budgeted fillCellsFromPositions bucketing the normal path
-        // uses -- pin that with the package-private explicit-budget overload (mirroring
+        // MAX_REGION_GLYPHS reproducer (round 3, FIX A): fillCellsByRegion's GLYPH side (as
+        // opposed to the cell side capped by MAX_REGION_CELLS above) must be bounded regardless
+        // of cell count. RegionStripper counts every glyph the content-stream engine reports --
+        // whether or not it falls inside a registered cell region -- and throws once the budget
+        // is exceeded, BEFORE delegating to PDFTextStripperByArea's own per-glyph bookkeeping.
+        // Pin that with the package-private explicit-glyph-budget overload (mirroring
         // fillCellsFromPositions' own test-only budget override) rather than needing a real
-        // multi-hundred-thousand-glyph fixture.
+        // multi-million-glyph fixture -- see regionGlyphBombIsBoundedNotBufferedOrOOMed below for
+        // the full-scale (real MAX_REGION_GLYPHS, millions of glyphs) proof.
         Path pdf = tmp.resolve("regionbudget.pdf");
         TableTestPdfs.ruled3x3(pdf); // a handful of real glyphs (R1C1..R3C3) is plenty
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
@@ -251,7 +257,56 @@ class TableLatticeTest {
             TableExtractor.Result result = new TableExtractor.Result();
             assertThrows(TableExtractor.RulingOverflowException.class,
                     () -> TableExtractor.fillCellsByRegion(tables, page, result, 2L),
-                    "a glyph-count x cell-count product exceeding the budget must throw, not stall unbounded");
+                    "a glyph count exceeding MAX_REGION_GLYPHS must throw, not stall/buffer unbounded");
+        }
+    }
+
+    @Test
+    void regionGlyphBombIsBoundedNotBufferedOrOOMed() throws Exception {
+        // FIX A (round 3) regression reproducer, matching the reviewer's own methodology exactly:
+        // a small-on-disk, one-page PDF (a single Flate-compressed (AAAA...) Tj) carrying
+        // 6,000,000 glyphs, run through the PRODUCTION entry point
+        // TableExtractor.fillCellsByRegion(tables, page, result) in a CHILD JVM capped at
+        // -Xmx256m.
+        //
+        // Before this fix, fillCellsByRegion's --skip-text-urls fallback (stripAllPositions, an
+        // anonymous PDFTextStripper subclass) BUFFERED every page glyph into a List before
+        // bucketing -- PDFTextStripper's own per-glyph bookkeeping is itself unbounded, so this
+        // OOMs even at -Xmx2g (verified directly against the pre-fix implementation: same
+        // fixture, same entry point, OutOfMemoryError at TreeMap.subMap inside
+        // PDFTextStripper.processTextPosition). After this fix, fillCellsByRegion streams via a
+        // glyph-budgeted PDFTextStripperByArea (RegionStripper) -- a glyph outside every
+        // registered cell region is never retained -- and MAX_REGION_GLYPHS additionally bounds
+        // the per-glyph region-scan CPU, so the child must exit cleanly within a small, fixed
+        // heap (256m, comfortably below what buffering 6,000,000 TextPositions would need, and
+        // comfortably above what the streaming/capped implementation actually uses).
+        Path pdf = tmp.resolve("bomb.pdf");
+        int glyphCount = 6_000_000;
+
+        List<String> cmd = new ArrayList<>();
+        cmd.add(javaBinary());
+        cmd.add("-Xmx256m");
+        cmd.add("-cp");
+        cmd.add(currentTestClasspath());
+        cmd.add("com.oai.titanarum.TableRegionGlyphBombProbe");
+        cmd.add(String.valueOf(glyphCount));
+        cmd.add(pdf.toString());
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.redirectErrorStream(true);
+        Path log = tmp.resolve("probe.log");
+        pb.redirectOutput(log.toFile());
+
+        Process proc = pb.start();
+        boolean exited = proc.waitFor(60, TimeUnit.SECONDS);
+        String output = exited ? java.nio.file.Files.readString(log) : "(child did not exit)";
+        try {
+            assertTrue(exited, "the probe child JVM must complete (not hang) within 60s: " + output);
+            assertEquals(0, proc.exitValue(),
+                    "fillCellsByRegion on a 6,000,000-glyph page must not OOM/crash at -Xmx256m: " + output);
+            assertTrue(output.contains("PROBE_OK"), "probe must report success: " + output);
+        } finally {
+            proc.destroyForcibly();
         }
     }
 
@@ -302,5 +357,38 @@ class TableLatticeTest {
             assertThrows(TableExtractor.RulingOverflowException.class, () ->
                     TableExtractor.fillCellsFromPositions(List.of(cell), positions, 0, 612f, 792f, work, 2L));
         }
+    }
+
+    private static String javaBinary() {
+        return Path.of(System.getProperty("java.home"), "bin", "java").toString();
+    }
+
+    /**
+     * Builds the classpath to hand to a freshly-launched child JVM so it can find {@code
+     * TableRegionGlyphBombProbe} and its dependencies (PDFBox, ...). Surefire sometimes forks its
+     * own test JVM using a single manifest-only "booter" jar (to dodge OS command-line length
+     * limits) whose {@code java.class.path} system property is therefore just that one jar; the
+     * real classpath lives in its {@code Class-Path} manifest attribute. Handle both cases so
+     * this test is robust to Surefire's forking strategy (mirrors {@code HardWatchdogTest}'s own
+     * identical helper).
+     */
+    private static String currentTestClasspath() throws IOException {
+        String cp = System.getProperty("java.class.path");
+        String[] entries = cp.split(File.pathSeparator);
+        if (entries.length == 1 && entries[0].toLowerCase(Locale.ROOT).endsWith(".jar")) {
+            try (JarFile jf = new JarFile(entries[0])) {
+                String classPathAttr = jf.getManifest() == null ? null
+                        : jf.getManifest().getMainAttributes().getValue(Attributes.Name.CLASS_PATH);
+                if (classPathAttr != null && !classPathAttr.isBlank()) {
+                    StringBuilder sb = new StringBuilder(entries[0]);
+                    for (String part : classPathAttr.split(" ")) {
+                        if (part.isBlank()) continue;
+                        sb.append(File.pathSeparator).append(new File(URI.create(part)).getAbsolutePath());
+                    }
+                    return sb.toString();
+                }
+            }
+        }
+        return cp;
     }
 }

@@ -583,6 +583,62 @@ final class TableTestPdfs {
     }
 
     /**
+     * FIX B (round 3) reproducer: one Table element with 5,000 TRs. TR#0 carries 5 TD cells,
+     * each with a ColSpan=1000 attribute (only the first carries an MCID, so the table clears
+     * the "degenerate" all-cells-empty check); TR#1..4999 each carry a single plain (no span) TD.
+     *
+     * <p>Every cell's OWN rowSpan*colSpan area is small, so cumulativeArea stays at 5,000 (TR#0's
+     * five 1000-wide cells) + 4,999 (one each for the remaining rows) = 9,999 -- under
+     * MAX_CELLS_PER_TABLE (10,000), so the existing cumulative-area guard never trips. But the
+     * CLUSTERED grid this places has 5,000 rows (one per TR) x 5,000 cols (TR#0's five
+     * 1000-wide columns), a product of 25,000,000 -- the shape buildTaggedTable's grid-product
+     * guard must reject.
+     */
+    static void taggedGridProductBomb(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                COSDictionary d = new COSDictionary();
+                d.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                text(cs, 60, 700, "X");
+                cs.endMarkedContent();
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+
+            PDStructureElement tr0 = new PDStructureElement("TR", table);
+            tr0.setPage(page);
+            table.appendKid(tr0);
+            for (int c = 0; c < 5; c++) {
+                PDStructureElement cell = new PDStructureElement("TD", tr0);
+                cell.setPage(page);
+                PDTableAttributeObject att = new PDTableAttributeObject();
+                att.setColSpan(1000);
+                cell.addAttribute(att);
+                if (c == 0) cell.getCOSObject().setInt(COSName.K, 0); // only this cell carries text
+                tr0.appendKid(cell);
+            }
+
+            for (int r = 1; r < 5_000; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                PDStructureElement cell = new PDStructureElement("TD", tr);
+                cell.setPage(page);
+                tr.appendKid(cell); // no MCID -> textless, no span attribute -> 1x1
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * {@code tableCount} independent 1x1 Table elements (own TR/TD, own MCID text), all
      * attributed to a single page. Used to prove the tagged path's per-page table cap
      * (MAX_TABLES_PER_PAGE) is enforced and {@code Result.truncated} is set once exceeded.

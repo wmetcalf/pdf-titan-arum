@@ -545,16 +545,6 @@ final class TableExtractor {
         return false;
     }
 
-    private static boolean hasRowSpan(GridPlacement g) {
-        for (int s : g.rowSpan) if (s > 1) return true;
-        return false;
-    }
-
-    private static boolean hasColSpan(GridPlacement g) {
-        for (int s : g.colSpan) if (s > 1) return true;
-        return false;
-    }
-
     /** {@code placeGrid}, charging the shared split-work budget (see {@link #MAX_SPLIT_WORK}) for
      * the O(rowCount*colCount) cost the caller is about to incur (coherence/coverage-style scans,
      * or simply the cost of having clustered this many boundaries). */
@@ -617,17 +607,18 @@ final class TableExtractor {
         GridPlacement g = placeGridBudgeted(comp, work);
         if (g.rowCount < 2 || g.colCount < 2 || !hasAnySpan(g)) return List.of(comp);
 
-        // A vertical (column) cut can only ever satisfy the row-inflation acceptance condition
-        // (see this method's doc) if some cell's rowSpan is ALREADY inflated in the merged
-        // placement -- achieving "both sides strictly fewer rows than merged" requires a foreign
-        // boundary interleaved inside some cell's own span, which is exactly what rowSpan>1 means
-        // here. Symmetrically, a horizontal cut needs some inflated colSpan. Skipping an axis
-        // with no such precondition avoids a full O(candidates x cells) search that is guaranteed
-        // to reject every candidate anyway -- the common case for a real table whose only
-        // spanning runs along one axis (e.g. a merged header row: colSpan only, never rowSpan).
-        List<List<CellRect>> viaVertical = hasRowSpan(g) ? tryCuts(comp, g.xs, true, g.rowCount, work) : null;
+        // NOTE: both axes are ALWAYS searched here -- do not add a "skip this axis if no cell has
+        // a span on it" shortcut. That heuristic is UNSOUND: two side-by-side tables A/B can share
+        // a vertical border while each extends beyond the other's y-range (so NO cell anywhere
+        // picks up rowSpan inflation, hasAnySpan is satisfied purely by B's own unrelated colSpan
+        // header), yet the vertical A|B cut is still the ONLY correct split. Pruning the vertical
+        // search there (a prior, reverted version of this method did exactly that) silently fell
+        // through to "unsplit", garbling both tables' placement AND clamping B's genuine header
+        // colSpan to 1 via buildTable's incoherence safety net -- see
+        // TableGeometryTest.splitComponentSplitsWhenOneTableHasNoRowSpanButOtherHasColSpanHeader.
+        List<List<CellRect>> viaVertical = tryCuts(comp, g.xs, true, g.rowCount, work);
         if (viaVertical != null) return viaVertical;
-        List<List<CellRect>> viaHorizontal = hasColSpan(g) ? tryCuts(comp, g.ys, false, g.colCount, work) : null;
+        List<List<CellRect>> viaHorizontal = tryCuts(comp, g.ys, false, g.colCount, work);
         if (viaHorizontal != null) return viaHorizontal;
         return List.of(comp); // no clean cut -- unsplit fallback; buildTable will clamp spans
     }

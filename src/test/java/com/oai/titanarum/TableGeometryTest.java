@@ -332,6 +332,72 @@ class TableGeometryTest {
     }
 
     @Test
+    void splitComponentSplitsWhenOneTableHasNoRowSpanButOtherHasColSpanHeader() {
+        // Reviewer's counterexample against the (now-reverted) global hasRowSpan/hasColSpan
+        // axis-skip pruning: A (y=[0,60], 2 rows @ pitch 30) and B (y=[30,120], 3 rows @ pitch 30,
+        // OVERLAPPING A's range in [30,60] with IDENTICAL boundaries there) each extend BEYOND the
+        // other's y-range (A down to 0, B up to 120) without ANY foreign boundary ever falling
+        // strictly inside another cell's own span -- so NOT ONE cell anywhere in the merged
+        // placement picks up rowSpan inflation (hasRowSpan(merged) is false), even though the
+        // vertical A|B cut is still the ONLY correct split (mergedRowCount=4 is still strictly
+        // greater than BOTH A's own rowCount=2 and B's own rowCount=3, achieved via each side's
+        // EXCLUSIVE outer extension rather than interleaving). B independently carries a genuine
+        // merged 2-col header (its own colSpan=2 cell), so the top-level hasAnySpan fast path is
+        // still entered.
+        //
+        // A pruning strategy that skips the vertical search whenever hasRowSpan(merged) is false
+        // -- as a prior, reverted version of splitComponent did -- would skip the ONLY valid cut
+        // here, falling through to "unsplit": 9 cells garbled into a bogus 4x4=16-slot grid, and
+        // (per buildTable's incoherence safety net) B's genuine header colSpan silently clamped
+        // from 2 to 1. This must instead split cleanly into exactly 2 tables.
+        List<TableExtractor.CellRect> tableANoRowSpan = new ArrayList<>();
+        for (float y : new float[]{0, 30}) {
+            for (float x : new float[]{0, 100}) {
+                tableANoRowSpan.add(cellRect(x, y, x + 100, y + 30));
+            }
+        }
+        List<TableExtractor.CellRect> tableBWithHeader = new ArrayList<>();
+        tableBWithHeader.add(cellRect(200, 30, 300, 60));
+        tableBWithHeader.add(cellRect(300, 30, 400, 60));
+        tableBWithHeader.add(cellRect(200, 60, 300, 90));
+        tableBWithHeader.add(cellRect(300, 60, 400, 90));
+        tableBWithHeader.add(cellRect(200, 90, 400, 120)); // genuine merged 2-col header
+
+        List<TableExtractor.CellRect> merged = new ArrayList<>();
+        merged.addAll(tableANoRowSpan);
+        merged.addAll(tableBWithHeader);
+        assertEquals(9, merged.size());
+
+        // Sanity: confirm the premise -- no cell anywhere in the merged placement has rowSpan>1,
+        // yet the split must still succeed.
+        assertEquals(1, TableExtractor.groupIntoTables(merged).size(),
+                "sanity: edge-adjacent A+B must merge into one component");
+
+        List<List<TableExtractor.CellRect>> split = TableExtractor.splitComponent(merged);
+        assertEquals(2, split.size(),
+                "must split into exactly two independent tables despite zero global rowSpan inflation: "
+                        + split);
+
+        List<TableExtractor.TableHit> hits = split.stream()
+                .map(part -> TableExtractor.buildTable(1, part, "lattice"))
+                .toList();
+        TableExtractor.TableHit a = hits.stream().filter(t -> t.rowCount == 2 && t.colCount == 2)
+                .findFirst().orElseThrow(() -> new AssertionError("2x2 table A not found: " + hits));
+        TableExtractor.TableHit b = hits.stream().filter(t -> t.rowCount == 3 && t.colCount == 2)
+                .findFirst().orElseThrow(() -> new AssertionError("3x2 table B not found: " + hits));
+
+        assertTrue(a.cells.stream().allMatch(c -> c.rowSpan == 1 && c.colSpan == 1),
+                "table A must have no invented spans: " + a.cells);
+
+        TableExtractor.CellHit header = b.cells.stream()
+                .filter(c -> c.colSpan == 2).findFirst()
+                .orElseThrow(() -> new AssertionError("table B's genuine header must survive as colSpan=2: " + b.cells));
+        assertEquals(1, header.rowSpan);
+        assertEquals(4, b.cells.stream().filter(c -> c.rowSpan == 1 && c.colSpan == 1).count(),
+                "table B's other 4 cells must remain plain 1x1, no clamping and no extra invented spans");
+    }
+
+    @Test
     void splitComponentDoesNotFragmentAGenuineSpannedTable() {
         // Regression guard: a real single table with a genuine spanning cell (missing internal
         // vertical in the top row, per missingInternalEdgeYieldsSpanningCell) must NOT be split --

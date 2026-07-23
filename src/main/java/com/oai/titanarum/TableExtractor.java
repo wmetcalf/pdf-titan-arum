@@ -1536,59 +1536,44 @@ final class TableExtractor {
      * valid on rotated pages, same as everywhere else in this class that compares the two paths'
      * geometry.
      *
-     * <p>Round-2 (post-review, false-suppression fix): the FIRST version of this method used a
-     * "candidate's bbox CENTROID falls inside an already-emitted tagged table's bbox" test.
-     * REPRODUCED as a silent-data-loss regression: a LEGAL sparse tagged table (one TD cell whose
-     * /K lists two MCIDs drawn far apart, e.g. a "notes" cell spanning a page's header and footer)
-     * gives that tagged table a bbox that is a glyph-bounding-box union spanning almost the WHOLE
-     * page -- a completely separate, visually distinct ruled table sitting anywhere inside that
-     * inflated rectangle then has ITS centroid fall inside the tagged bbox too, and was wrongly
-     * suppressed even though the two tables share no actual visual overlap. Centroid-containment
-     * ignores size disparity entirely.
+     * <p>Rounds 2-4 (post-review, all reverted/superseded -- see git history) tried, in turn:
+     * candidate-bbox-CENTROID-inside-tagged-bbox, then Intersection-over-Union of the two OUTER
+     * bboxes, then IoU + a tagged/lattice cell-COUNT-ratio guard, then that plus a tagged
+     * fill-ratio (cell-area-sum / own-bbox-area) plausibility gate. Every one of those is an
+     * AGGREGATE comparison -- centroid, whole-bbox geometry, cell count, cell-area-sum-vs-own-bbox
+     * -- and every one was eventually defeated by a differently-shaped tagged bbox that is not a
+     * tight fit for its own cells: a sparse 1-cell table (round 2/3), a spread-but-real N-cell
+     * table (round 4), and FINALLY (round 5, the reproducer that ended this) a tagged table whose
+     * bbox is the union of two far-apart DENSE blocks ("dense bookends, hollow middle" -- e.g. a
+     * real header block and a real footer block that are legitimately one tagged table together,
+     * such as a continued-on-next-page note): its fill ratio (~0.37), cell count, and IoU-via-
+     * containment ALL clear every prior guard's threshold, yet a genuinely distinct ruled table
+     * sitting in the EMPTY MIDDLE between the two dense blocks overlaps NEITHER tagged block and
+     * was still silently dropped. No aggregate statistic over the tagged table's cells can ever
+     * close this: the blind spot is structural, not a wrong threshold -- none of rounds 2-4 ever
+     * asks WHERE the tagged content actually is relative to the candidate.
      *
-     * <p>Fixed by {@link #bboxIoU}: Intersection-over-Union naturally accounts for that size
-     * disparity. A small, genuinely distinct lattice table sitting inside a huge sparse-tagged
-     * bbox has IoU ~= latticeArea / taggedArea -- small, so it survives (both tables kept,
-     * correct). A lattice table that BOTH paths independently find for the SAME visual table has a
-     * bbox close in both position and size to the tagged bbox -- IoU is high, so it is correctly
-     * deduped to the tagged copy. {@link #IOU_DEDUP_THRESHOLD} was chosen high enough that the two
-     * cases separate cleanly (see that constant's doc).
-     *
-     * <p>Round-3 (post-review, residual false-suppression): IoU alone still cannot distinguish
-     * "same physical table" from "distinct table that happens to fill a degenerate tagged bbox" --
-     * REPRODUCED: a LARGE distinct ruled table (e.g. a real 3x3, 9 cells) sized to occupy ~75% of
-     * the SAME kind of inflated sparse-tagged bbox as round-2's reproducer gives IoU ~= 0.75 > 0.5,
-     * so it was still wrongly suppressed even though it shares no cells with the tagged table at
-     * all. The tell that separates the two cases isn't geometry, it's STRUCTURE: the degenerate
-     * suppressor is always a sparse tagged table with very few real cells (round-2's reproducer:
-     * 1 cell), while a real ruled table it would swallow has many. A genuine same-table match has
-     * comparable cell counts on both sides (both paths found roughly the same grid). Added a
-     * second, independent guard -- {@link #cellCountsComparable} -- so a lattice table is only
-     * ever deduped against a tagged table whose OWN cell count is a plausible match for it; a
-     * 1-cell sparse tagged table can now dedup only against an equally tiny (<=2-cell) lattice
-     * table, never a large distinct one, regardless of how much of its inflated bbox that large
-     * table happens to fill.
-     *
-     * <p>Round-4 (post-review, closes the CLASS): every aggregate comparison between the two
-     * tables -- centroid, IoU, cell-count-ratio -- shares one blind spot: none of them checks
-     * whether the TAGGED table's own bbox is a plausible fit for its OWN cells. REPRODUCED: a
-     * STRUCTURALLY-REAL 9-cell tagged table (a genuine 3x3 TR/TD grid, own MCID text in every
-     * cell) whose 9 cells are legitimately SPREAD across almost the whole page still inflates its
-     * own bbox to near-page size -- {@code cellCountsComparable} no longer excludes it (9 == 9,
-     * ratio 1.0) against a distinct 9-cell ruled table filling most of that bbox (IoU still > 0.5),
-     * so round-3's guard was defeated by simply matching the tagged table's cell COUNT to the
-     * lattice table's while keeping the tagged cells spread thin. Closed by a THIRD, qualitatively
-     * different guard -- {@link #taggedTableIsPlausibleSuppressor} -- that looks at the tagged
-     * table's OWN internal geometry (its cells' summed area vs. its own bbox area) rather than
-     * comparing the two tables to each other at all: a real dense table's cells tile MOST of its
-     * own bbox (this project's own same-table control measures ~0.47), while ANY inflated/degenerate
-     * tagged bbox -- whether from one sparse cell or from many widely-scattered ones -- has its
-     * cells covering only a tiny fraction of that bbox by construction. High fill-ratio + high IoU
-     * can only mean the tagged cells genuinely tile the SAME physical region the lattice table
-     * claims -- and a distinct lattice table cannot ALSO occupy that same region (they would
-     * visually overlap on the source page), so this combination leaves no reachable silent-drop
-     * shape: a tagged table is now only eligible to act as a dedup suppressor when its own bbox
-     * isn't hollow.
+     * <p>Round 5 (DEFINITIVE): dedup on the tagged table's actual CELL FOOTPRINT, not any
+     * aggregate over its outer bbox. {@link #taggedCellFootprintCoversCandidate} sums, over every
+     * one of the tagged table's own cell rectangles, the area of that cell's intersection with the
+     * candidate lattice table's bbox, and suppresses only when that summed overlap covers a
+     * majority of the candidate's own area. This is the invariant every prior round missed: a
+     * genuinely DISTINCT table shares no cell-level footprint with the tagged table it's compared
+     * against, no matter how its OUTER bbox happens to relate to the tagged table's outer bbox --
+     * <ul>
+     *   <li>hollow-middle (round 5's own reproducer): the candidate sits in the gap between the two
+     *       dense tagged blocks -- it intersects ZERO tagged cell rectangles -- overlap 0 -- kept;</li>
+     *   <li>sparse-1-cell / spread-N-cell inflated bbox (rounds 2-4's reproducers): the candidate
+     *       can only overlap the tagged table's few small ACTUAL cells, never the inflated gaps
+     *       between them -- overlap fraction stays low -- kept;</li>
+     *   <li>a genuine same-table match: the candidate's bbox IS the same grid the tagged cells
+     *       tile, so the summed per-cell overlap covers nearly all of it -- suppressed, correctly
+     *       deduped to the tagged copy.</li>
+     * </ul>
+     * No gappy/inflated/union tagged bbox can ever suppress a table it doesn't actually cover cell
+     * by cell, closing the whole class rather than one more shape of it. The now-redundant IoU/
+     * fill-ratio/cell-count-ratio guards and their helpers were removed; this single check replaces
+     * them.
      */
     private static boolean overlapsAlreadyEmittedTaggedTable(TableHit candidate, List<TableHit> tables) {
         if (candidate.bbox == null) return false;
@@ -1596,42 +1581,57 @@ final class TableExtractor {
             if (t.page != candidate.page) continue;
             if (!"tagged".equals(t.extractionMethod)) continue;
             if (t.bbox == null) continue;
-            if (!taggedTableIsPlausibleSuppressor(t)) continue;
-            if (bboxIoU(candidate.bbox, t.bbox) > IOU_DEDUP_THRESHOLD
-                    && cellCountsComparable(t, candidate)) return true;
+            if (taggedCellFootprintCoversCandidate(t, candidate)) return true;
         }
         return false;
     }
 
-    // A real, dense table's cells tile MOST of its own bbox -- this project's own same-table
-    // control (a compact, tightly-padded 2x2) measures a real fill ratio ~= 0.47 (cell text extents
-    // never cover 100% of a ruled/padded cell's full box, but come well within a factor of 2). Any
-    // INFLATED/degenerate tagged bbox -- whether from one sparse multi-MCID cell (round-2/round-3's
-    // reproducers) or from many legitimately-real but widely-scattered cells (round-4's reproducer)
-    // -- has its actual cells covering only a sliver of that inflated area BY CONSTRUCTION (that's
-    // what "inflated" means: the bbox is far bigger than what the cells themselves occupy). 0.3
-    // sits with real margin below the same-table control's ~0.47 and with real margin above every
-    // reproduced degenerate shape (measured well under 0.01 in all three).
-    private static final float FILL_RATIO_THRESHOLD = 0.3f;
+    // A majority of the candidate's own area must be covered by the tagged table's REAL cells for
+    // suppression to fire. A genuinely distinct table (hollow-middle, sparse-suppressor gaps) never
+    // approaches this -- its overlap with the tagged table's actual cell footprint is near zero,
+    // regardless of how the two tables' OUTER bboxes relate. A genuine same-table match has its
+    // entire bbox tiled by the tagged cells (they're the same grid), so overlap approaches the
+    // candidate's full area, clearing 0.5 with room to spare.
+    private static final float CELL_FOOTPRINT_COVERAGE_THRESHOLD = 0.5f;
 
     /**
-     * True when a tagged table's own cells plausibly occupy their own claimed bbox -- i.e. this
-     * tagged table is dense enough to be trusted as a dedup suppressor at all. Guards against
-     * zero/degenerate areas (a zero-area table bbox, or a table with no cells/no cell bboxes,
-     * is NOT eligible to suppress -- the safe direction is to keep both tables, never to divide by
-     * zero or to let a totally hollow "table" claim dedup rights over something else).
+     * True when tagged table {@code t}'s own cell rectangles cover a majority of candidate lattice
+     * table {@code c}'s bbox area -- the sole test for whether {@code t} may act as a dedup
+     * suppressor of {@code c}. Tagged grid cells never overlap each other (occupancy-map-placed,
+     * one structure element per grid slot -- see {@link #buildTaggedTable}), so summing each cell's
+     * OWN intersection with {@code c.bbox} is a correct (no double-count) substitute for a proper
+     * union-of-rectangles computation.
      *
-     * <p>Cell bboxes are read directly off {@code TableHit.cells} -- the SAME rotation-aware
-     * per-cell bboxes {@link #resolveCellText} builds (FIX 1), already in the visual frame this
-     * whole comparison operates in. A cell with a null bbox (e.g. a textless placeholder cell)
-     * contributes zero area, correctly diluting the ratio rather than being skipped/ignored.
+     * <p>Cell bboxes are the SAME rotation-aware per-cell bboxes {@link #resolveCellText} builds
+     * (FIX 1), already in the visual frame this comparison operates in. A cell with a null or
+     * zero-area bbox (a textless placeholder cell, or one resolved from a different page -- see
+     * {@link #buildTaggedTable}'s {@code onTablePage} gate) contributes zero overlap, never a
+     * divide-by-zero or a spurious match. Guards {@code c.bbox}'s own area being non-positive
+     * (degenerate candidate bbox -> never eligible to be suppressed, the safe direction).
+     *
+     * <p>Requires {@code t.cells.size() >= 2} -- discovered necessary by direct measurement, not
+     * merely a leftover from the prior (round 3) cell-count guard. A tagged table with EXACTLY one
+     * cell has its own bbox built (in {@link #buildTaggedTable}) as the union of that single
+     * cell's own bbox alone -- meaning a 1-cell table's "cell footprint" and its "outer bbox" are
+     * mathematically IDENTICAL. For round 2/3's sparse reproducer (one TD cell whose /K lists two
+     * far-apart MCIDs), that single cell's own bbox is exactly the same huge, gappy rectangle its
+     * outer table bbox is -- so the per-cell-footprint test, run over exactly one cell, reduces
+     * right back to plain outer-bbox containment and WOULD wrongly re-suppress a small distinct
+     * candidate sitting inside it (verified directly: re-ran round 2/3's fixtures against the
+     * cell-footprint test with no floor and confirmed the false suppression recurred). A table
+     * that resolves to a single cell is not a distinguishable multi-cell grid at all -- there is no
+     * "footprint versus outer bbox" distinction left to check for it -- so it is never eligible to
+     * suppress anything under this test, independent of geometry.
      */
-    private static boolean taggedTableIsPlausibleSuppressor(TableHit tagged) {
-        float tableArea = bboxArea(tagged.bbox);
-        if (tableArea <= 0f || tagged.cells == null || tagged.cells.isEmpty()) return false;
-        float cellAreaSum = 0f;
-        for (CellHit c : tagged.cells) cellAreaSum += bboxArea(c.bbox);
-        return (cellAreaSum / tableArea) >= FILL_RATIO_THRESHOLD;
+    private static boolean taggedCellFootprintCoversCandidate(TableHit t, TableHit c) {
+        float candidateArea = bboxArea(c.bbox);
+        if (candidateArea <= 0f || t.cells == null || t.cells.size() < 2) return false;
+        float overlapArea = 0f;
+        for (CellHit cell : t.cells) {
+            if (cell.bbox == null) continue;
+            overlapArea += bboxIntersectionArea(c.bbox, cell.bbox);
+        }
+        return (overlapArea / candidateArea) > CELL_FOOTPRINT_COVERAGE_THRESHOLD;
     }
 
     private static float bboxArea(float[] b) {
@@ -1639,53 +1639,15 @@ final class TableExtractor {
         return Math.max(0f, b[2] - b[0]) * Math.max(0f, b[3] - b[1]);
     }
 
-    // A genuine same-table match has roughly the same real cell count on both sides (both paths
-    // resolved essentially the same grid), so 0.5 (the smaller side is at least half the larger)
-    // comfortably passes normal same-table pairs -- including the common case where one path
-    // detects a couple of extra/fewer cells than the other (e.g. a merged-header span the lattice
-    // path collapses to one cell but the tagged structure tree still lists as two TH kids) --
-    // while still rejecting a degenerate 1-2-cell sparse tagged table against a real, many-celled
-    // ruled table (a 1-cell tagged table would need the ruled table to ALSO have <=2 cells to pass).
-    private static final float CELL_COUNT_RATIO_THRESHOLD = 0.5f;
-
-    /** True when the smaller of the two tables' real cell counts ({@code cells.size()}, not the
-     * rowCount*colCount grid product -- the actual occupied cells) is at least {@link
-     * #CELL_COUNT_RATIO_THRESHOLD} of the larger. Used alongside {@link #bboxIoU} (see {@link
-     * #overlapsAlreadyEmittedTaggedTable}'s round-3 doc): IoU alone cannot tell a genuine
-     * same-table match apart from a large, distinct table that merely fills most of a degenerate
-     * (sparse, few-cell) tagged table's inflated bbox -- this guard requires the two tables' actual
-     * structure, not just their bbox geometry, to be a plausible match too. */
-    private static boolean cellCountsComparable(TableHit a, TableHit b) {
-        int ca = a.cells == null ? 0 : a.cells.size();
-        int cb = b.cells == null ? 0 : b.cells.size();
-        if (ca <= 0 || cb <= 0) return false;
-        int lo = Math.min(ca, cb), hi = Math.max(ca, cb);
-        return lo >= CELL_COUNT_RATIO_THRESHOLD * hi;
-    }
-
-    // A same-table match (found by both the tagged and lattice paths) has bboxes that are close in
-    // both position AND size -- typically IoU well above 0.7 in practice (lattice's ruling-derived
-    // extents and tagged's glyph-derived extents both approximate the same visual cell grid). A
-    // false-suppression case (a small, genuinely distinct table sitting inside a much larger,
-    // sparse-tagged bbox) instead gives IoU ~= smallArea/largeArea, which stays low unless the
-    // "distinct" table happens to cover most of the tagged bbox's own area -- an increasingly
-    // implausible coincidence, not the geometry a genuinely separate table produces. 0.5 (a
-    // majority of the union must be shared) sits comfortably between the two regimes.
-    private static final float IOU_DEDUP_THRESHOLD = 0.5f;
-
-    /** Intersection-over-Union of two [x0,y0,x1,y1] bboxes. Guards against zero-area/degenerate
-     * boxes (never divides by zero; a zero-area box never overlaps anything, IoU 0). */
-    private static float bboxIoU(float[] a, float[] b) {
+    /** Area of the intersection of two [x0,y0,x1,y1] bboxes; 0 when they don't overlap (or either
+     * is degenerate) -- never negative. */
+    private static float bboxIntersectionArea(float[] a, float[] b) {
+        if (a == null || b == null) return 0f;
         float ix0 = Math.max(a[0], b[0]), iy0 = Math.max(a[1], b[1]);
         float ix1 = Math.min(a[2], b[2]), iy1 = Math.min(a[3], b[3]);
         float iw = ix1 - ix0, ih = iy1 - iy0;
-        if (iw <= 0 || ih <= 0) return 0f; // no overlap (or degenerate) -> IoU 0, never divides by zero
-        float intersection = iw * ih;
-        float areaA = Math.max(0f, a[2] - a[0]) * Math.max(0f, a[3] - a[1]);
-        float areaB = Math.max(0f, b[2] - b[0]) * Math.max(0f, b[3] - b[1]);
-        float union = areaA + areaB - intersection;
-        if (union <= 0f) return 0f; // both boxes degenerate -> no meaningful overlap
-        return intersection / union;
+        if (iw <= 0 || ih <= 0) return 0f;
+        return iw * ih;
     }
 
     /**

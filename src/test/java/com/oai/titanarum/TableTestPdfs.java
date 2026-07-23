@@ -513,15 +513,15 @@ final class TableTestPdfs {
             int mcid = 0;
             try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
                 cs.setLineWidth(0.75f);
-                for (float y : new float[]{700, 689, 678}) line(cs, 50, y, 114, y);
-                for (float x : new float[]{50, 82, 114}) line(cs, x, 700, x, 678);
+                for (float y : new float[]{700, 694, 688}) line(cs, 50, y, 88, y);
+                for (float x : new float[]{50, 69, 88}) line(cs, x, 700, x, 688);
                 for (int r = 0; r < 2; r++) {
                     for (int c = 0; c < 2; c++) {
                         COSDictionary d = new COSDictionary();
                         d.setInt(COSName.MCID, mcid++);
                         cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
                                 PDPropertyList.create(d));
-                        text(cs, 50.5f + c * 32, 700 - 8.5f - r * 11, cells[r][c]);
+                        text(cs, 50.1f + c * 19, 700 - 5f - r * 6f, cells[r][c]);
                         cs.endMarkedContent();
                     }
                 }
@@ -749,6 +749,161 @@ final class TableTestPdfs {
                     tr.appendKid(cell);
                 }
             }
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * FIX 2 round-5 (post-review, DEFINITIVE reproducer -- "dense bookends, hollow middle"): a
+     * 2-cell tagged table whose two cells are each their OWN dense (snugly-text-wrapped) block, far
+     * apart on the page -- a real header-ish block near the top, a real footer-ish block near the
+     * bottom (e.g. a legitimately-one-table "continued on next page" note). Its OUTER bbox spans
+     * the whole gap between them, but each of its two cells' own bbox is tight and small. A
+     * separate, genuinely distinct ruled table (a merged-header-style 2x2-grid-with-3-cells --
+     * {@code buildTable} needs rowCount/colCount >= 2, so a plain 1-row 3-cell shape can't be used)
+     * sits entirely in the EMPTY MIDDLE between the two tagged blocks -- overlapping NEITHER
+     * tagged cell's own footprint at all, even though it overlaps (via containment) the tagged
+     * table's inflated OUTER bbox.
+     *
+     * <p>Defeated every prior round's guard: fill ratio (~0.37, since each of the 2 cells is
+     * genuinely dense, unlike rounds 2-4's near-zero fill ratios), cell-count-ratio (2 tagged vs. 3
+     * ruled is well within any reasonable ratio), and IoU-via-containment all clear their
+     * thresholds. Only a per-cell-footprint test (does the tagged table's ACTUAL cell geometry,
+     * not its outer bbox, cover the candidate?) correctly excludes this shape.
+     */
+    static void taggedHollowMiddleTwoDenseBlocksPlusDistinctRuledTableInGap(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                // Two DENSE multi-line tagged cells, far apart: a real paragraph-style block near
+                // the top, a real paragraph-style block near the bottom -- NOT a sparse
+                // single-glyph MCID like rounds 2-4's reproducers. Each block is dense enough on
+                // its own (8 lines, tight 12pt leading) that the OLD fill-ratio guard (round 4)
+                // measures ~0.33 here -- comfortably clearing that guard's own 0.3 threshold, unlike
+                // rounds 2-4's near-zero-density reproducers -- yet the two blocks are still far
+                // enough apart to leave a large, genuinely empty gap between them.
+                COSDictionary d0 = new COSDictionary();
+                d0.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d0));
+                for (int i = 0; i < 10; i++) text(cs, 60, 700 - i * 11, "Header dense line " + i);
+                cs.endMarkedContent();
+
+                COSDictionary d1 = new COSDictionary();
+                d1.setInt(COSName.MCID, 1);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d1));
+                for (int i = 0; i < 10; i++) text(cs, 60, 200 - i * 11, "Footer dense line " + i);
+                cs.endMarkedContent();
+
+                // Separate, genuinely distinct ruled 3-cell (merged-header-style) table entirely in
+                // the EMPTY MIDDLE between the two tagged blocks -- no structure reference of its
+                // own. Deliberately LARGE (its own bbox area alone exceeds half of the tagged
+                // table's own OUTER bbox area) and positioned WITHIN the tagged table's own
+                // x-range, so its bbox is fully CONTAINED in the tagged table's outer bbox with
+                // IoU > 0.5 (matching the reviewer's repro precisely: IoU-via-containment,
+                // cell-count-ratio, AND fill-ratio -- see this fixture's doc -- all clear their
+                // respective thresholds here). Yet it shares ZERO area with either tagged CELL's
+                // own (much smaller) bbox -- only the per-cell footprint test can tell the two
+                // apart.
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{572, 402, 232}) line(cs, 62, y, 148, y);
+                line(cs, 62, 572, 62, 232);
+                line(cs, 148, 572, 148, 232);
+                line(cs, 105, 402, 105, 232); // internal vertical only on the bottom row -> merged header
+                text(cs, 67, 557, "MID");
+                text(cs, 67, 387, "L");
+                text(cs, 110, 387, "R");
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+
+            PDStructureElement tr0 = new PDStructureElement("TR", table);
+            tr0.setPage(page);
+            table.appendKid(tr0);
+            PDStructureElement cell0 = new PDStructureElement("TD", tr0);
+            cell0.setPage(page);
+            cell0.getCOSObject().setInt(COSName.K, 0);
+            tr0.appendKid(cell0);
+
+            PDStructureElement tr1 = new PDStructureElement("TR", table);
+            tr1.setPage(page);
+            table.appendKid(tr1);
+            PDStructureElement cell1 = new PDStructureElement("TD", tr1);
+            cell1.setPage(page);
+            cell1.getCOSObject().setInt(COSName.K, 1);
+            tr1.appendKid(cell1);
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * FIX 2 round-5 sanity fixture: a tagged table (2 dense cells, own real TR/TD/MCID text) that
+     * only covers roughly the LEFT HALF of a distinct ruled table's own footprint -- a genuinely
+     * PARTIAL clip, not a hollow-middle miss (some real geometric overlap exists) and not a
+     * same-table match either (well under half the candidate's area is covered). Used to pin that
+     * {@link TableExtractor#CELL_FOOTPRINT_COVERAGE_THRESHOLD} (0.5) actually behaves as a
+     * threshold: this fixture's measured overlap ratio sits in roughly [0.2, 0.5), so the ruled
+     * table must be KEPT (not suppressed), distinguishing "some real but partial overlap" from
+     * "genuinely the same table".
+     */
+    static void taggedPartiallyOverlapsDistinctRuledTableBelowCoverageThreshold(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                // Two dense tagged cells (tight, same padding as the retuned same-table control),
+                // snugly filling roughly the LEFT column of the ruled table's own footprint below.
+                COSDictionary d0 = new COSDictionary();
+                d0.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d0));
+                text(cs, 50.1f, 645, "T1");
+                cs.endMarkedContent();
+
+                COSDictionary d1 = new COSDictionary();
+                d1.setInt(COSName.MCID, 1);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d1));
+                text(cs, 50.1f, 639, "T2");
+                cs.endMarkedContent();
+
+                // Separate, genuinely distinct ruled 2x2 grid spanning BOTH the tagged cells' own
+                // column (left) AND a second, untagged column (right) -- no structure reference of
+                // its own. The tagged cells' own footprint covers only the left column's area.
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{650, 644, 638}) line(cs, 50, y, 88, y);
+                for (float x : new float[]{50, 69, 88}) line(cs, x, 650, x, 638);
+                text(cs, 69.1f, 645, "X");
+                text(cs, 69.1f, 639, "Y");
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+
+            PDStructureElement tr0 = new PDStructureElement("TR", table);
+            tr0.setPage(page);
+            table.appendKid(tr0);
+            PDStructureElement cell0 = new PDStructureElement("TD", tr0);
+            cell0.setPage(page);
+            cell0.getCOSObject().setInt(COSName.K, 0);
+            tr0.appendKid(cell0);
+
+            PDStructureElement tr1 = new PDStructureElement("TR", table);
+            tr1.setPage(page);
+            table.appendKid(tr1);
+            PDStructureElement cell1 = new PDStructureElement("TD", tr1);
+            cell1.setPage(page);
+            cell1.getCOSObject().setInt(COSName.K, 1);
+            tr1.appendKid(cell1);
 
             doc.save(file.toFile());
         }

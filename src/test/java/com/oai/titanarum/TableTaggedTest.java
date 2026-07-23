@@ -536,6 +536,62 @@ class TableTaggedTest {
         }
     }
 
+    @Test
+    void hollowMiddleTaggedTableDoesNotSuppressDistinctRuledTableInTheGap() throws Exception {
+        // FIX 2 round-5 (post-review, DEFINITIVE) reproducer -- "dense bookends, hollow middle":
+        // every prior aggregate-comparison guard (centroid, IoU-via-outer-bbox, cell-count-ratio,
+        // tagged fill-ratio) is defeated by a 2-cell tagged table whose two cells are each their
+        // own genuinely DENSE block (a real header-ish block and a real footer-ish block, far
+        // apart on the page -- e.g. a legitimately-one-table "continued on next page" note). Its
+        // outer bbox spans the whole gap between the two blocks; a separate, genuinely distinct
+        // ruled table sitting entirely in that EMPTY MIDDLE overlaps neither tagged cell's own
+        // footprint at all. Only a per-cell-footprint test (does the tagged table's ACTUAL cell
+        // geometry, not its outer bbox, cover the candidate?) correctly excludes this shape.
+        Path pdf = tmp.resolve("hollow_middle.pdf");
+        TableTestPdfs.taggedHollowMiddleTwoDenseBlocksPlusDistinctRuledTableInGap(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(2, r.tables.size(),
+                    "a distinct ruled table sitting in the hollow middle between two dense tagged "
+                            + "blocks must NOT be dropped just because it falls inside their union bbox: " + r.tables);
+
+            TableExtractor.TableHit tagged = r.tables.stream()
+                    .filter(t -> "tagged".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("hollow-middle tagged table missing: " + r.tables));
+            assertEquals(2, tagged.cells.size(), "sanity: the tagged table really is the 2 dense blocks (header + footer)");
+            assertTrue(tagged.cells.get(0).text.startsWith("Header dense line 0"),
+                    "sanity: first cell is the dense header block: " + tagged.cells.get(0).text);
+            assertTrue(tagged.cells.get(1).text.startsWith("Footer dense line 0"),
+                    "sanity: second cell is the dense footer block: " + tagged.cells.get(1).text);
+
+            TableExtractor.TableHit lattice = r.tables.stream()
+                    .filter(t -> "lattice".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(
+                            () -> new AssertionError("the distinct ruled table in the gap must survive, not be suppressed: " + r.tables));
+            assertEquals(List.of(List.of("MID", ""), List.of("L", "R")), lattice.rows);
+        }
+    }
+
+    @Test
+    void partialCellOverlapBelowCoverageThresholdIsNotSuppressed() throws Exception {
+        // FIX 2 round-5 sanity check: pins that CELL_FOOTPRINT_COVERAGE_THRESHOLD (0.5) actually
+        // behaves as a threshold, not a rubber stamp -- a tagged table whose real cells overlap
+        // only a PARTIAL fraction (measured ~0.28, comfortably inside [0.2, 0.5)) of a distinct
+        // ruled table's own footprint must be KEPT (not suppressed): some genuine geometric overlap
+        // exists (unlike the hollow-middle case above, where overlap is exactly zero), but not
+        // enough to plausibly be the SAME table.
+        Path pdf = tmp.resolve("partial_overlap.pdf");
+        TableTestPdfs.taggedPartiallyOverlapsDistinctRuledTableBelowCoverageThreshold(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(2, r.tables.size(),
+                    "a candidate table only PARTIALLY (well under half) covered by the tagged table's "
+                            + "real cells must be kept, not treated as the same table: " + r.tables);
+            assertTrue(r.tables.stream().anyMatch(t -> "tagged".equals(t.extractionMethod)));
+            assertTrue(r.tables.stream().anyMatch(t -> "lattice".equals(t.extractionMethod)));
+        }
+    }
+
     // ---------------------------------------------------------------- FIX 4: lock-in only, no code change
 
     @Test

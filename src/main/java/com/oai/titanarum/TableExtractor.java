@@ -1553,6 +1553,21 @@ final class TableExtractor {
      * bbox close in both position and size to the tagged bbox -- IoU is high, so it is correctly
      * deduped to the tagged copy. {@link #IOU_DEDUP_THRESHOLD} was chosen high enough that the two
      * cases separate cleanly (see that constant's doc).
+     *
+     * <p>Round-3 (post-review, residual false-suppression): IoU alone still cannot distinguish
+     * "same physical table" from "distinct table that happens to fill a degenerate tagged bbox" --
+     * REPRODUCED: a LARGE distinct ruled table (e.g. a real 3x3, 9 cells) sized to occupy ~75% of
+     * the SAME kind of inflated sparse-tagged bbox as round-2's reproducer gives IoU ~= 0.75 > 0.5,
+     * so it was still wrongly suppressed even though it shares no cells with the tagged table at
+     * all. The tell that separates the two cases isn't geometry, it's STRUCTURE: the degenerate
+     * suppressor is always a sparse tagged table with very few real cells (round-2's reproducer:
+     * 1 cell), while a real ruled table it would swallow has many. A genuine same-table match has
+     * comparable cell counts on both sides (both paths found roughly the same grid). Added a
+     * second, independent guard -- {@link #cellCountsComparable} -- so a lattice table is only
+     * ever deduped against a tagged table whose OWN cell count is a plausible match for it; a
+     * 1-cell sparse tagged table can now dedup only against an equally tiny (<=2-cell) lattice
+     * table, never a large distinct one, regardless of how much of its inflated bbox that large
+     * table happens to fill.
      */
     private static boolean overlapsAlreadyEmittedTaggedTable(TableHit candidate, List<TableHit> tables) {
         if (candidate.bbox == null) return false;
@@ -1560,9 +1575,34 @@ final class TableExtractor {
             if (t.page != candidate.page) continue;
             if (!"tagged".equals(t.extractionMethod)) continue;
             if (t.bbox == null) continue;
-            if (bboxIoU(candidate.bbox, t.bbox) > IOU_DEDUP_THRESHOLD) return true;
+            if (bboxIoU(candidate.bbox, t.bbox) > IOU_DEDUP_THRESHOLD
+                    && cellCountsComparable(t, candidate)) return true;
         }
         return false;
+    }
+
+    // A genuine same-table match has roughly the same real cell count on both sides (both paths
+    // resolved essentially the same grid), so 0.5 (the smaller side is at least half the larger)
+    // comfortably passes normal same-table pairs -- including the common case where one path
+    // detects a couple of extra/fewer cells than the other (e.g. a merged-header span the lattice
+    // path collapses to one cell but the tagged structure tree still lists as two TH kids) --
+    // while still rejecting a degenerate 1-2-cell sparse tagged table against a real, many-celled
+    // ruled table (a 1-cell tagged table would need the ruled table to ALSO have <=2 cells to pass).
+    private static final float CELL_COUNT_RATIO_THRESHOLD = 0.5f;
+
+    /** True when the smaller of the two tables' real cell counts ({@code cells.size()}, not the
+     * rowCount*colCount grid product -- the actual occupied cells) is at least {@link
+     * #CELL_COUNT_RATIO_THRESHOLD} of the larger. Used alongside {@link #bboxIoU} (see {@link
+     * #overlapsAlreadyEmittedTaggedTable}'s round-3 doc): IoU alone cannot tell a genuine
+     * same-table match apart from a large, distinct table that merely fills most of a degenerate
+     * (sparse, few-cell) tagged table's inflated bbox -- this guard requires the two tables' actual
+     * structure, not just their bbox geometry, to be a plausible match too. */
+    private static boolean cellCountsComparable(TableHit a, TableHit b) {
+        int ca = a.cells == null ? 0 : a.cells.size();
+        int cb = b.cells == null ? 0 : b.cells.size();
+        if (ca <= 0 || cb <= 0) return false;
+        int lo = Math.min(ca, cb), hi = Math.max(ca, cb);
+        return lo >= CELL_COUNT_RATIO_THRESHOLD * hi;
     }
 
     // A same-table match (found by both the tagged and lattice paths) has bboxes that are close in

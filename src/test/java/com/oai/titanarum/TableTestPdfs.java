@@ -613,6 +613,73 @@ final class TableTestPdfs {
     }
 
     /**
+     * FIX 2 round-3 (post-review) reproducer: the SAME sparse tagged cell as {@link
+     * #taggedSparseTwoMcidCellPlusSeparateRuledTable} (one TD, two far-apart MCIDs "A"/"B",
+     * inflating the tagged bbox to near-page size) -- but the separate, genuinely distinct table
+     * sitting inside that inflated bbox is now a LARGE real 3x3 ruled grid (9 cells) sized to
+     * occupy roughly 75% of the tagged bbox's own area, giving IoU(latticeBbox, taggedBbox) ~= 0.75
+     * -- comfortably above the 0.5 IoU-only threshold, so round-2's IoU fix alone still wrongly
+     * suppresses this table even though it shares NO cells with the 1-cell sparse tagged table at
+     * all. Exercises the cell-count comparability guard: a 1-cell tagged table must never be able
+     * to swallow a 9-cell ruled table no matter how much of its bbox that ruled table fills.
+     */
+    static void taggedSparseTwoMcidCellPlusSeparateLargeRuledTable(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            float[] xs = {70, 203.33f, 336.67f, 470};
+            float[] ys = {650, 483.33f, 316.67f, 150}; // ys[0] = top row's top edge, descending
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                // Sparse tagged cell: two MCIDs, glyphs far apart (top-left "A", bottom-right "B"),
+                // same geometry as taggedSparseTwoMcidCellPlusSeparateRuledTable's reproducer.
+                COSDictionary d0 = new COSDictionary();
+                d0.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d0));
+                text(cs, 60, 730, "A");
+                cs.endMarkedContent();
+
+                COSDictionary d1 = new COSDictionary();
+                d1.setInt(COSName.MCID, 1);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d1));
+                text(cs, 480, 40, "B");
+                cs.endMarkedContent();
+
+                // Separate, genuinely distinct LARGE ruled 3x3 grid (9 cells) filling most of the
+                // inflated tagged bbox's area -- no structure reference of its own.
+                cs.setLineWidth(0.75f);
+                for (float y : ys) line(cs, xs[0], y, xs[3], y);
+                for (float x : xs) line(cs, x, ys[0], x, ys[3]);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        text(cs, xs[c] + 10, ys[r] - 20, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(page);
+            // /K = [0, 1] -- ONE cell, TWO MCIDs, far apart -- the sparse-cell reproducer.
+            COSArray k = new COSArray();
+            k.add(COSInteger.get(0));
+            k.add(COSInteger.get(1));
+            cell.getCOSObject().setItem(COSName.K, k);
+            tr.appendKid(cell);
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * A tagged 1x1 table (one TD, MCID 0) whose cell text ("Total") is drawn TWICE at the
      * IDENTICAL position -- FIX 4 lock-in: mirrors {@link #ruled2x2DuplicateDrawnCell}'s
      * fake-bold-via-redraw pattern but for the tagged path (glyphs resolved via

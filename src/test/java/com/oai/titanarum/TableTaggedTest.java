@@ -464,6 +464,42 @@ class TableTaggedTest {
         }
     }
 
+    @Test
+    void sparseTaggedCellDoesNotSuppressLargeDistinctRuledTableFillingMostOfItsBbox() throws Exception {
+        // FIX 2 round-3 (post-review) reproducer: IoU alone closed round-2's false suppression
+        // (a SMALL distinct ruled table inside an inflated sparse-tagged bbox), but a LARGE
+        // distinct ruled table (a real 3x3, 9 cells) sized to fill ~75% of that SAME kind of
+        // inflated bbox still gives IoU(latticeBbox, taggedBbox) > 0.5 -- IoU alone cannot tell
+        // "same physical table" apart from "distinct table that happens to fill a degenerate
+        // tagged bbox". The cell-count comparability guard closes this: the sparse tagged table
+        // has only 1 real cell, the ruled table has 9 -- far from comparable -- so the ruled table
+        // must survive no matter how much of the tagged bbox's area it fills.
+        Path pdf = tmp.resolve("sparse_tagged_large_ruled.pdf");
+        TableTestPdfs.taggedSparseTwoMcidCellPlusSeparateLargeRuledTable(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(2, r.tables.size(),
+                    "a large, genuinely distinct 9-cell ruled table must NOT be dropped just because "
+                            + "it fills most of a 1-cell sparse tagged table's inflated bbox: " + r.tables);
+
+            TableExtractor.TableHit tagged = r.tables.stream()
+                    .filter(t -> "tagged".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("sparse tagged table missing: " + r.tables));
+            assertEquals(1, tagged.cells.size(), "sanity: the sparse tagged table has only its own 1 real cell");
+            assertEquals("A\nB", tagged.cells.get(0).text, "sanity: both far-apart MCIDs resolved into the one sparse cell");
+
+            TableExtractor.TableHit lattice = r.tables.stream()
+                    .filter(t -> "lattice".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(
+                            () -> new AssertionError("the large distinct ruled table must survive, not be suppressed: " + r.tables));
+            assertEquals(9, lattice.cells.size(), "sanity: the ruled table really is a full 3x3 (9 cells)");
+            assertEquals(List.of(
+                    List.of("R1C1", "R1C2", "R1C3"),
+                    List.of("R2C1", "R2C2", "R2C3"),
+                    List.of("R3C1", "R3C2", "R3C3")), lattice.rows);
+        }
+    }
+
     // ---------------------------------------------------------------- FIX 4: lock-in only, no code change
 
     @Test

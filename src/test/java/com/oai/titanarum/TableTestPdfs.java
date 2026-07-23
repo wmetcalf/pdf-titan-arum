@@ -305,6 +305,39 @@ final class TableTestPdfs {
         }
     }
 
+    /**
+     * A single page with the plain text "AB" -- two distinct, single-char glyphs side by side.
+     * FIX 3 fixture: used to build a list holding the SAME (first) TextPosition reference twice,
+     * mimicking what positionsForRange returns for a multi-code-unit glyph (ligature/surrogate
+     * pair), without needing an embedded ligature font.
+     */
+    static void twoGlyphsAB(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                text(cs, 60, 700, "AB");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A single page with the plain text "aa" -- two distinct, separately-drawn 'a' glyphs (two
+     * separate TextPosition objects sharing the same unicode value). FIX 3 companion fixture:
+     * proves reference-identity dedup does not over-dedup genuinely distinct same-character glyphs.
+     */
+    static void twoGlyphsAA(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                text(cs, 60, 700, "aa");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
     /** No tables: a paragraph, an underlined word, and one boxed callout rectangle. */
     static void noTables(Path file) throws IOException {
         try (PDDocument doc = new PDDocument()) {
@@ -369,6 +402,183 @@ final class TableTestPdfs {
                     tr.appendKid(cell);
                 }
             }
+            doc.save(file.toFile());
+        }
+    }
+
+    /** Same as {@link #tagged2x2}, but with the page's /Rotate set to the given degrees -- used
+     * to pin FIX 1 (tagged cell/table bbox must share the lattice path's rotated visual frame). */
+    static void taggedRotated2x2(Path file, int rotationDegrees) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            String[][] cells = {{"Name", "Qty"}, {"Ada", "3"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
+                                PDPropertyList.create(d));
+                        text(cs, 60 + c * 120, 700 - r * 30, cells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
+                    cell.setPage(page);
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+            page.setRotation(rotationDegrees);
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A tagged 1x1 table (one TD, MCID 0) AND a separate, non-overlapping ruled (untagged) 2x2
+     * lattice grid on the SAME page -- FIX 2 reproducer: a page carrying a tagged table used to be
+     * entirely skipped for lattice extraction, silently dropping the second, genuinely separate
+     * ruled table. The tagged cell sits at the top of the page (y around 700); the ruled grid sits
+     * well below it (y in [400,460]) so their bboxes never overlap.
+     */
+    static void taggedPlusSeparateRuledTable(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                COSDictionary d = new COSDictionary();
+                d.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                text(cs, 60, 700, "Tagged");
+                cs.endMarkedContent();
+
+                // Separate ruled 2x2 grid, well below the tagged cell -- no structure reference.
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{460, 430, 400}) line(cs, 50, y, 250, y);
+                for (float x : new float[]{50, 150, 250}) line(cs, x, 460, x, 400);
+                text(cs, 55, 440, "L");
+                text(cs, 155, 440, "R");
+                text(cs, 55, 410, "C");
+                text(cs, 155, 410, "D");
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(page);
+            cell.getCOSObject().setInt(COSName.K, 0);
+            tr.appendKid(cell);
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A tagged table whose SOLE cell is ALSO surrounded by a drawn ruling grid at the exact same
+     * geometric extent -- FIX 2 control reproducer: the tagged and lattice paths both find the
+     * SAME visual table here (unlike {@link #taggedPlusSeparateRuledTable}'s genuinely separate
+     * pair), so it must be emitted exactly ONCE (the tagged copy), not duplicated.
+     */
+    static void taggedAndRuledSameTable(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            String[][] cells = {{"Name", "Qty"}, {"Ada", "3"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640}) line(cs, 50, y, 250, y);
+                for (float x : new float[]{50, 150, 250}) line(cs, x, 700, x, 640);
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
+                                PDPropertyList.create(d));
+                        text(cs, 55 + c * 100, 700 - 20 - r * 30, cells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
+                    cell.setPage(page);
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A tagged 1x1 table (one TD, MCID 0) whose cell text ("Total") is drawn TWICE at the
+     * IDENTICAL position -- FIX 4 lock-in: mirrors {@link #ruled2x2DuplicateDrawnCell}'s
+     * fake-bold-via-redraw pattern but for the tagged path (glyphs resolved via
+     * PDFMarkedContentExtractor, not PDFTextStripper/PDFTextStripperByArea).
+     */
+    static void taggedDuplicateDrawnCellText(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                COSDictionary d = new COSDictionary();
+                d.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                text(cs, 60, 700, "Total");
+                text(cs, 60, 700, "Total"); // identical (x,y) redraw -- fake-bold / redundant layer
+                cs.endMarkedContent();
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(page);
+            cell.getCOSObject().setInt(COSName.K, 0);
+            tr.appendKid(cell);
+
             doc.save(file.toFile());
         }
     }

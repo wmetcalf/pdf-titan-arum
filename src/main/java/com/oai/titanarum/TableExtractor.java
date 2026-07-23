@@ -1116,6 +1116,26 @@ final class TableExtractor {
         sorted.sort(java.util.Comparator.comparingDouble(TextPosition::getYDirAdj)
                 .thenComparingDouble(TextPosition::getXDirAdj));
 
+        // FIX 3 (Codex P2): PositionAwareTextStripper (PdfTitanArumApp.java)'s indexToPosition
+        // pushes the SAME TextPosition reference once per UTF-16 code unit of a multi-code-unit
+        // glyph (a ligature like "fi"/"fl"/"ffi", or a surrogate pair), so positionsForRange(...)
+        // -- and so `chars` here, on the default lattice path -- can hand this method the identical
+        // reference N times for what is really ONE glyph; appending tp.getUnicode() (the glyph's
+        // FULL string) once per duplicate reference doubles/triples the glyph's text ("fifi"
+        // instead of "fi"). Fixed by collapsing consecutive IDENTICAL references (identity `==`,
+        // never value/equals -- two DISTINCT glyphs that happen to share a character and position,
+        // e.g. two separately-drawn "a"s, must both survive) right after the (y,x) sort above:
+        // duplicate references share the exact same coordinates, so they always sort adjacent,
+        // making a single "skip if same reference as the previous kept one" pass sufficient no
+        // matter where in `chars`' original order the duplicates appeared.
+        List<TextPosition> deduped = new ArrayList<>(sorted.size());
+        TextPosition prevRef = null;
+        for (TextPosition tp : sorted) {
+            if (tp != prevRef) deduped.add(tp);
+            prevRef = tp;
+        }
+        sorted = deduped;
+
         // Chain-cluster into lines. `lineTopY` is the Y of the first (topmost, since `sorted` is
         // Y-ascending) member of the current group -- it never regresses, so later members are
         // always compared against the group's topmost baseline, not merely the previous glyph.
@@ -1383,9 +1403,8 @@ final class TableExtractor {
     static Result extract(PDDocument doc, List<Integer> pagesToProcess,
                           Map<Integer, List<TextPosition>> positionsByPage) {
         Result result = new Result();
-        Set<Integer> coveredByTagged = new HashSet<>();
         try {
-            extractTagged(doc, new HashSet<>(pagesToProcess), coveredByTagged, result);
+            extractTagged(doc, new HashSet<>(pagesToProcess), result);
         } catch (StackOverflowError e) {
             // A pathologically deep (or cyclic-looking) structure/marked-content tree can still
             // overflow inside pdfbox's own traversal even with our depth guards in place; degrade
@@ -1394,12 +1413,18 @@ final class TableExtractor {
         } catch (Exception e) {
             System.err.println("WARNING: tagged table extraction failed: " + e);
         }
+        // FIX 2 (Codex P1 / ledger M-T6-2): a page carrying a tagged table used to be entirely
+        // SKIPPED here (coveredByTagged), so a second, separate ruled-but-untagged table on that
+        // same page was silently dropped from report.json. Lattice now runs on EVERY processed
+        // page regardless of tagged coverage; {@link #renderKeptTables} dedups a lattice table
+        // against an already-emitted tagged table on the same page by bbox overlap (relies on
+        // FIX 1: tagged and lattice bboxes now share one visual frame, so the overlap test is
+        // valid on rotated pages too), so the SAME table found by both paths is still emitted once.
         for (int pageNum : pagesToProcess) {
             if (Thread.currentThread().isInterrupted()) {
                 result.truncated = true;
                 break;
             }
-            if (coveredByTagged.contains(pageNum)) continue;
             try {
                 extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result);
             } catch (RulingOverflowException e) {
@@ -1489,12 +1514,40 @@ final class TableExtractor {
             try {
                 TableHit t = buildTable(pageNum, comp, "lattice");
                 renderViews(t);
+                // FIX 2: don't double-emit a table both the tagged and lattice paths found. Tagged
+                // extraction (see extract()) always runs to completion for every page BEFORE this
+                // per-page lattice loop starts, so every tagged TableHit for THIS page is already
+                // in result.tables by the time we get here.
+                if (overlapsAlreadyEmittedTaggedTable(t, result.tables)) continue;
                 result.tables.add(t);
             } catch (RulingOverflowException e) {
                 result.truncated = true;
                 System.err.println("WARNING: table render skipped on page " + pageNum + " (grid-product cap)");
             }
         }
+    }
+
+    /**
+     * FIX 2 (Codex P1 / ledger M-T6-2): lattice extraction now runs on every processed page even
+     * when that page also has a tagged table (see {@link #extract}'s doc), so a genuinely SEPARATE
+     * ruled table is no longer silently dropped -- but a table that both paths independently find
+     * must still surface only ONCE (the tagged copy, which carries header/th info the lattice path
+     * can't). Detected here by a simple, robust overlap test: the candidate lattice table's bbox
+     * CENTROID falling inside an already-emitted tagged table's bbox on the same page. Relies on
+     * FIX 1 (tagged and lattice bboxes share one visual/rotated frame) to be valid on rotated
+     * pages, same as everywhere else in this class that compares the two paths' geometry.
+     */
+    private static boolean overlapsAlreadyEmittedTaggedTable(TableHit candidate, List<TableHit> tables) {
+        if (candidate.bbox == null) return false;
+        float cx = (candidate.bbox[0] + candidate.bbox[2]) / 2f;
+        float cy = (candidate.bbox[1] + candidate.bbox[3]) / 2f;
+        for (TableHit t : tables) {
+            if (t.page != candidate.page) continue;
+            if (!"tagged".equals(t.extractionMethod)) continue;
+            if (t.bbox == null) continue;
+            if (cx >= t.bbox[0] && cx <= t.bbox[2] && cy >= t.bbox[1] && cy <= t.bbox[3]) return true;
+        }
+        return false;
     }
 
     /**
@@ -1584,7 +1637,7 @@ final class TableExtractor {
     }
 
     private static void extractTagged(PDDocument doc, Set<Integer> pagesToProcess,
-                                      Set<Integer> coveredOut, Result result) throws IOException {
+                                      Result result) throws IOException {
         PDStructureTreeRoot root = doc.getDocumentCatalog().getStructureTreeRoot();
         if (root == null) return;
         List<PDStructureElement> tables = new ArrayList<>();
@@ -1656,7 +1709,6 @@ final class TableExtractor {
             tablesPerPage.merge(pageNum, 1, Integer::sum);
             renderViews(t);
             result.tables.add(t);
-            coveredOut.add(t.page);
         }
     }
 
@@ -1872,7 +1924,21 @@ final class TableExtractor {
         return Math.min(v, MAX_SPAN);
     }
 
-    /** Gather the cell's MCIDs (bare integer kids and MCR kids), resolve to glyphs, join text. */
+    /** Gather the cell's MCIDs (bare integer kids and MCR kids), resolve to glyphs, join text.
+     *
+     * <p>FIX 1 (Codex P2): the glyph bbox union used to be built directly from {@code
+     * tp.getXDirAdj()/getYDirAdj()/getWidthDirAdj()/getHeightDir()} with NO page-rotation
+     * transform, while the LATTICE path (see {@link #fillCellsFromPositions}/{@link
+     * RulingCollector#addRuling}) transforms both ruling and text coordinates into the visual
+     * top-left frame via {@link #applyPageRotation} before ever comparing them. On a page with
+     * /Rotate 90/180/270 this left the tagged bbox in a DIFFERENT coordinate frame than a lattice
+     * bbox on the very same page in the same report.json. Fixed by applying the SAME {@link
+     * #applyPageRotation} transform used everywhere else in this class to each glyph's own two
+     * corners (unrotated) BEFORE taking the min/max union, using the cell's OWN resolved page's
+     * rotation/cropBox -- correct regardless of frame, and exactly equal to the table's own page's
+     * rotation/cropBox whenever {@code resolvedPage} is the table's page (the only case where this
+     * bbox is actually kept -- see {@link #buildTaggedTable}'s {@code onTablePage} gate).
+     */
     private static void resolveCellText(PDStructureElement el, TaggedCell cell,
                                         Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache,
                                         Map<PDPage, Integer> pageNumbers,
@@ -1886,12 +1952,26 @@ final class TableExtractor {
         collectGlyphs(el, resolvedPage, glyphs, mcidCache, 0, pageNumbers, pagesToProcess);
         cell.text = joinText(glyphs);
         if (!glyphs.isEmpty()) {
+            int rotation = 0;
+            float unrotatedW = 0f, unrotatedH = 0f;
+            if (resolvedPage != null) {
+                rotation = resolvedPage.getRotation();
+                PDRectangle cropBox = resolvedPage.getCropBox();
+                unrotatedW = cropBox.getWidth();
+                unrotatedH = cropBox.getHeight();
+            }
             float x0 = Float.MAX_VALUE, y0 = Float.MAX_VALUE, x1 = -Float.MAX_VALUE, y1 = -Float.MAX_VALUE;
             for (TextPosition tp : glyphs) {
-                x0 = Math.min(x0, tp.getXDirAdj());
-                y0 = Math.min(y0, tp.getYDirAdj() - tp.getHeightDir());
-                x1 = Math.max(x1, tp.getXDirAdj() + tp.getWidthDirAdj());
-                y1 = Math.max(y1, tp.getYDirAdj());
+                float ux0 = tp.getXDirAdj();
+                float ux1 = tp.getXDirAdj() + tp.getWidthDirAdj();
+                float uy0 = tp.getYDirAdj() - tp.getHeightDir();
+                float uy1 = tp.getYDirAdj();
+                float[] corner1 = applyPageRotation(ux0, uy0, rotation, unrotatedW, unrotatedH);
+                float[] corner2 = applyPageRotation(ux1, uy1, rotation, unrotatedW, unrotatedH);
+                x0 = Math.min(x0, Math.min(corner1[0], corner2[0]));
+                x1 = Math.max(x1, Math.max(corner1[0], corner2[0]));
+                y0 = Math.min(y0, Math.min(corner1[1], corner2[1]));
+                y1 = Math.max(y1, Math.max(corner1[1], corner2[1]));
             }
             cell.bbox = new float[]{x0, y0, x1, y1};
         }

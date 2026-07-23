@@ -3,6 +3,8 @@ package com.oai.titanarum;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedContent;
 import org.apache.pdfbox.text.TextPosition;
 import org.junit.jupiter.api.Test;
@@ -330,6 +332,124 @@ class TableTaggedTest {
                             + "process the whole 300,000-glyph bomb: took " + elapsedMs + "ms");
             assertTrue(r.truncated,
                     "the tagged path's marked-content cap trip must set Result.truncated");
+        }
+    }
+
+    // ---------------------------------------------------------------- FIX 1: rotated tagged bbox
+
+    @Test
+    void taggedTableBboxSharesLatticeVisualFrameAcrossRotation() throws Exception {
+        // Codex P2 reproducer: resolveCellText used to build cell.bbox/table.bbox from raw
+        // tp.getXDirAdj()/getYDirAdj()/getWidthDirAdj()/getHeightDir() with NO page-rotation
+        // transform, while the LATTICE path (RulingCollector.addRuling, fillCellsFromPositions)
+        // always transforms into the visual top-left frame via applyPageRotation -- so on a
+        // /Rotate 90/180/270 page, the tagged bbox landed in a DIFFERENT frame than a lattice
+        // bbox on the same page in the same report.json.
+        //
+        // Reference-based assertion (no magic glyph-metric constants): build the SAME tagged
+        // fixture unrotated to get its "raw" bbox U, then build the rotated version and assert its
+        // bbox equals applyPageRotation's transform of U's own two corners -- exactly the relation
+        // that must hold once the tagged path shares the lattice path's rotation-aware frame.
+        Path unrotatedPdf = tmp.resolve("tagged_unrotated_ref.pdf");
+        TableTestPdfs.tagged2x2(unrotatedPdf);
+        float[] unrotatedBbox;
+        try (PDDocument doc = Loader.loadPDF(unrotatedPdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(1, r.tables.size());
+            unrotatedBbox = r.tables.get(0).bbox;
+            assertNotNull(unrotatedBbox, "sanity: the unrotated reference table must carry a bbox");
+        }
+
+        for (int rotation : new int[]{90, 180, 270}) {
+            Path pdf = tmp.resolve("tagged_rotated_" + rotation + ".pdf");
+            TableTestPdfs.taggedRotated2x2(pdf, rotation);
+            try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+                TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+                assertEquals(1, r.tables.size(), "rotation=" + rotation);
+                TableExtractor.TableHit t = r.tables.get(0);
+                assertNotNull(t.bbox, "rotation=" + rotation);
+
+                PDPage page = doc.getPage(0);
+                PDRectangle cropBox = page.getCropBox();
+                float uw = cropBox.getWidth(), uh = cropBox.getHeight();
+                float[] c0 = TableExtractor.applyPageRotation(
+                        unrotatedBbox[0], unrotatedBbox[1], rotation, uw, uh);
+                float[] c1 = TableExtractor.applyPageRotation(
+                        unrotatedBbox[2], unrotatedBbox[3], rotation, uw, uh);
+                float expX0 = Math.min(c0[0], c1[0]), expX1 = Math.max(c0[0], c1[0]);
+                float expY0 = Math.min(c0[1], c1[1]), expY1 = Math.max(c0[1], c1[1]);
+
+                assertEquals(expX0, t.bbox[0], 0.05f, "bbox[0] (x0), rotation=" + rotation);
+                assertEquals(expY0, t.bbox[1], 0.05f, "bbox[1] (y0), rotation=" + rotation);
+                assertEquals(expX1, t.bbox[2], 0.05f, "bbox[2] (x1), rotation=" + rotation);
+                assertEquals(expY1, t.bbox[3], 0.05f, "bbox[3] (y1), rotation=" + rotation);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- FIX 2: tagged no longer
+    // ---------------------------------------------------------------- suppresses whole-page lattice
+
+    @Test
+    void taggedTableDoesNotSuppressSeparateRuledTableOnSamePage() throws Exception {
+        // Codex P1 / ledger M-T6-2 reproducer: a page carrying a tagged table used to be entirely
+        // SKIPPED for lattice extraction (coveredByTagged), silently dropping a second, genuinely
+        // separate ruled (untagged) table living elsewhere on the same page. Both must now survive.
+        Path pdf = tmp.resolve("tagged_plus_ruled.pdf");
+        TableTestPdfs.taggedPlusSeparateRuledTable(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(2, r.tables.size(),
+                    "both the tagged table and the separate ruled table must survive: " + r.tables);
+
+            TableExtractor.TableHit tagged = r.tables.stream()
+                    .filter(t -> "tagged".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("tagged table missing: " + r.tables));
+            assertEquals("Tagged", tagged.cells.get(0).text);
+
+            TableExtractor.TableHit lattice = r.tables.stream()
+                    .filter(t -> "lattice".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(
+                            () -> new AssertionError("the separate ruled table must not be silently dropped: " + r.tables));
+            assertEquals(List.of(List.of("L", "R"), List.of("C", "D")), lattice.rows);
+        }
+    }
+
+    @Test
+    void tableBothTaggedAndRuledIsEmittedOnce() throws Exception {
+        // FIX 2 control: a table that BOTH paths independently find (same visual location, same
+        // cells) must surface exactly ONCE (the tagged copy, which carries header/th info), not
+        // duplicated as tagged-plus-lattice.
+        Path pdf = tmp.resolve("tagged_and_ruled_same.pdf");
+        TableTestPdfs.taggedAndRuledSameTable(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(1, r.tables.size(),
+                    "the same table found by both paths must be emitted once, not duplicated: " + r.tables);
+            assertEquals("tagged", r.tables.get(0).extractionMethod,
+                    "the tagged copy (with header info) must win the dedup");
+        }
+    }
+
+    // ---------------------------------------------------------------- FIX 4: lock-in only, no code change
+
+    @Test
+    void taggedDuplicateDrawnCellTextExtractsAsSingleCopyNotGarbled() throws Exception {
+        // FIX 4 lock-in: mirrors TableLatticeTest#duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled
+        // but for the TAGGED path (glyphs resolved via BudgetedMarkedContentExtractor /
+        // PDFMarkedContentExtractor, not PDFTextStripper/PDFTextStripperByArea). A prior fix
+        // (commit 6d5bf8e) relies on suppressDuplicateOverlappingText staying ON for the tagged
+        // path too, but only the region path had a committed test pinning it -- this closes that gap.
+        Path pdf = tmp.resolve("tagged_dup_drawn.pdf");
+        TableTestPdfs.taggedDuplicateDrawnCellText(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(1, r.tables.size());
+            TableExtractor.TableHit t = r.tables.get(0);
+            assertEquals("tagged", t.extractionMethod);
+            assertEquals("Total", t.cells.get(0).text,
+                    "a cell drawn twice at the same position via the tagged path must extract as a single "
+                            + "correct copy (\"Total\"), not garbled (\"TToottaall\") or duplicated (\"TotalTotal\")");
         }
     }
 

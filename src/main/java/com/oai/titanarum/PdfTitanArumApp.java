@@ -794,7 +794,8 @@ private boolean skipQrScan;
             if (!skipTables) {
                 java.util.Map<Integer, java.util.List<TextPosition>> posByPage = new java.util.HashMap<>();
                 for (PageTextData ptd : pageTextData) {
-                    posByPage.put(ptd.page(), ptd.stripper().positionsForRange(0, Integer.MAX_VALUE));
+                    posByPage.put(ptd.page(),
+                            dedupeConsecutiveTextPositionRefs(ptd.stripper().positionsForRange(0, Integer.MAX_VALUE)));
                 }
                 TableExtractor.Result tablesResult = TableExtractor.extract(document, pagesToProcess, posByPage);
                 report.tables.addAll(tablesResult.tables);
@@ -4988,6 +4989,31 @@ for (int pageNum : pagesToProcess) {
             }
         }
         return -1;
+    }
+
+    /**
+     * FIX 3 (Codex P2, table extraction): {@link PositionAwareTextStripper#indexToPosition} pushes
+     * the SAME {@code TextPosition} reference once per UTF-16 code unit of a multi-code-unit glyph
+     * (a ligature like "fi"/"fl"/"ffi", or a surrogate pair) -- that per-char mapping is relied on
+     * by other consumers (URL/phone detection's {@code positionsForRange(beginIndex, endIndex)}
+     * calls) and must NOT change. But {@link TableExtractor#extract} only ever needs one reference
+     * per glyph, and feeding it N duplicate references per multi-code-unit glyph both wastes its
+     * fillCellsFromPositions work budget (charged per (cell, position) pair over the WHOLE
+     * position list) and -- defense in depth alongside {@link TableExtractor#joinText}'s own
+     * identity-based dedup -- would otherwise double/triple that glyph's text if a future caller
+     * ever bypassed joinText. Collapses CONSECUTIVE identical references (identity {@code ==},
+     * never value/equals, so two distinct glyphs sharing a character are both kept) in the list
+     * built specifically for the table path; {@code positionsForRange}'s own per-char return value
+     * for every other caller is untouched.
+     */
+    private static java.util.List<TextPosition> dedupeConsecutiveTextPositionRefs(java.util.List<TextPosition> positions) {
+        java.util.List<TextPosition> out = new java.util.ArrayList<>(positions.size());
+        TextPosition prevRef = null;
+        for (TextPosition tp : positions) {
+            if (tp != prevRef) out.add(tp);
+            prevRef = tp;
+        }
+        return out;
     }
 
     private static class PositionAwareTextStripper extends PDFTextStripper {

@@ -114,4 +114,40 @@ class OpenAiAnalyzerDigestTest {
         String digestEmpty = buildDigest(reportEmpty, "none.pdf");
         assertFalse(digestEmpty.contains("=== TABLES"), "empty tables should produce no TABLES section");
     }
+
+    @Test
+    void tableMarkdownTruncationDoesNotSplitSurrogatePair() throws Exception {
+        // An astral-plane glyph (emoji, 2 UTF-16 chars) placed exactly at the per-table
+        // 800-char cap boundary must not be cut mid-pair (a lone high surrogate becomes '?'
+        // once the HTTP body is UTF-8 encoded).
+        String emoji = new String(Character.toChars(0x1F600)); // 2 chars: high+low surrogate
+        StringBuilder md = new StringBuilder();
+        while (md.length() < 799) md.append('x');            // fill to index 799
+        md.append(emoji).append("yyyy");                     // high surrogate lands at index 799
+        TableExtractor.TableHit t = new TableExtractor.TableHit();
+        t.page = 1; t.extractionMethod = "lattice"; t.rowCount = 1; t.colCount = 1;
+        t.rows = new ArrayList<>(); t.rows.add(List.of("x"));
+        t.markdown = md.toString();
+        AnalysisReport report = baseReport();
+        report.tables = new ArrayList<>();
+        report.tables.add(t);
+
+        String digest = buildDigest(report, "surrogate.pdf");
+        // The digest, once UTF-8 round-tripped (as the HTTP body would be), must contain no
+        // U+FFFD / '?' corruption from a split pair: every char is a valid scalar value.
+        byte[] utf8 = digest.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        String roundTrip = new String(utf8, java.nio.charset.StandardCharsets.UTF_8);
+        assertEquals(digest, roundTrip, "digest must survive UTF-8 round-trip with no surrogate corruption");
+        assertFalse(digest.chars().anyMatch(c -> Character.isHighSurrogate((char) c)
+                && digest.indexOf(c) == digest.length() - 1),
+                "no trailing lone high surrogate");
+        // Sanity: no unpaired surrogate anywhere.
+        for (int i = 0; i < digest.length(); i++) {
+            char c = digest.charAt(i);
+            if (Character.isHighSurrogate(c)) {
+                assertTrue(i + 1 < digest.length() && Character.isLowSurrogate(digest.charAt(i + 1)),
+                        "high surrogate at " + i + " must be followed by a low surrogate");
+            }
+        }
+    }
 }

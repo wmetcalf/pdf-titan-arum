@@ -316,8 +316,15 @@ public class OpenAiAnalyzer {
                 if (t.markdown != null) {
                     int remaining = totalCharBudget - budgetUsed;
                     int cap = Math.min(perTableCharCap, remaining);
-                    boolean truncated = t.markdown.length() > cap;
-                    String snippet = t.markdown.substring(0, Math.min(cap, t.markdown.length()));
+                    int cutLen = Math.min(cap, t.markdown.length());
+                    // Don't cut between a surrogate pair — a lone high surrogate becomes '?'
+                    // once the HTTP body is UTF-8 encoded, silently corrupting a boundary glyph.
+                    if (cutLen > 0 && cutLen < t.markdown.length()
+                            && Character.isHighSurrogate(t.markdown.charAt(cutLen - 1))) {
+                        cutLen--;
+                    }
+                    boolean truncated = t.markdown.length() > cutLen;
+                    String snippet = t.markdown.substring(0, cutLen);
                     sb.append(snippet);
                     if (truncated) sb.append("…[truncated]");
                     sb.append("\n");

@@ -529,6 +529,11 @@
 </div>
 {% endif %}
 
+{% if report is not null and report.tablesTruncated and report.tables is empty %}
+<div class="section">
+  <p style="color:#f90; font-size:11px">&#9888; table extraction hit safety caps; no tables could be emitted</p>
+</div>
+{% endif %}
 {% if report.tables is not empty %}
 <div class="section">
   <h2>Tables ({{ report.tables | length }})</h2>

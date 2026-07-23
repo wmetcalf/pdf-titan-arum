@@ -1532,22 +1532,62 @@ final class TableExtractor {
      * when that page also has a tagged table (see {@link #extract}'s doc), so a genuinely SEPARATE
      * ruled table is no longer silently dropped -- but a table that both paths independently find
      * must still surface only ONCE (the tagged copy, which carries header/th info the lattice path
-     * can't). Detected here by a simple, robust overlap test: the candidate lattice table's bbox
-     * CENTROID falling inside an already-emitted tagged table's bbox on the same page. Relies on
-     * FIX 1 (tagged and lattice bboxes share one visual/rotated frame) to be valid on rotated
-     * pages, same as everywhere else in this class that compares the two paths' geometry.
+     * can't). Relies on FIX 1 (tagged and lattice bboxes share one visual/rotated frame) to be
+     * valid on rotated pages, same as everywhere else in this class that compares the two paths'
+     * geometry.
+     *
+     * <p>Round-2 (post-review, false-suppression fix): the FIRST version of this method used a
+     * "candidate's bbox CENTROID falls inside an already-emitted tagged table's bbox" test.
+     * REPRODUCED as a silent-data-loss regression: a LEGAL sparse tagged table (one TD cell whose
+     * /K lists two MCIDs drawn far apart, e.g. a "notes" cell spanning a page's header and footer)
+     * gives that tagged table a bbox that is a glyph-bounding-box union spanning almost the WHOLE
+     * page -- a completely separate, visually distinct ruled table sitting anywhere inside that
+     * inflated rectangle then has ITS centroid fall inside the tagged bbox too, and was wrongly
+     * suppressed even though the two tables share no actual visual overlap. Centroid-containment
+     * ignores size disparity entirely.
+     *
+     * <p>Fixed by {@link #bboxIoU}: Intersection-over-Union naturally accounts for that size
+     * disparity. A small, genuinely distinct lattice table sitting inside a huge sparse-tagged
+     * bbox has IoU ~= latticeArea / taggedArea -- small, so it survives (both tables kept,
+     * correct). A lattice table that BOTH paths independently find for the SAME visual table has a
+     * bbox close in both position and size to the tagged bbox -- IoU is high, so it is correctly
+     * deduped to the tagged copy. {@link #IOU_DEDUP_THRESHOLD} was chosen high enough that the two
+     * cases separate cleanly (see that constant's doc).
      */
     private static boolean overlapsAlreadyEmittedTaggedTable(TableHit candidate, List<TableHit> tables) {
         if (candidate.bbox == null) return false;
-        float cx = (candidate.bbox[0] + candidate.bbox[2]) / 2f;
-        float cy = (candidate.bbox[1] + candidate.bbox[3]) / 2f;
         for (TableHit t : tables) {
             if (t.page != candidate.page) continue;
             if (!"tagged".equals(t.extractionMethod)) continue;
             if (t.bbox == null) continue;
-            if (cx >= t.bbox[0] && cx <= t.bbox[2] && cy >= t.bbox[1] && cy <= t.bbox[3]) return true;
+            if (bboxIoU(candidate.bbox, t.bbox) > IOU_DEDUP_THRESHOLD) return true;
         }
         return false;
+    }
+
+    // A same-table match (found by both the tagged and lattice paths) has bboxes that are close in
+    // both position AND size -- typically IoU well above 0.7 in practice (lattice's ruling-derived
+    // extents and tagged's glyph-derived extents both approximate the same visual cell grid). A
+    // false-suppression case (a small, genuinely distinct table sitting inside a much larger,
+    // sparse-tagged bbox) instead gives IoU ~= smallArea/largeArea, which stays low unless the
+    // "distinct" table happens to cover most of the tagged bbox's own area -- an increasingly
+    // implausible coincidence, not the geometry a genuinely separate table produces. 0.5 (a
+    // majority of the union must be shared) sits comfortably between the two regimes.
+    private static final float IOU_DEDUP_THRESHOLD = 0.5f;
+
+    /** Intersection-over-Union of two [x0,y0,x1,y1] bboxes. Guards against zero-area/degenerate
+     * boxes (never divides by zero; a zero-area box never overlaps anything, IoU 0). */
+    private static float bboxIoU(float[] a, float[] b) {
+        float ix0 = Math.max(a[0], b[0]), iy0 = Math.max(a[1], b[1]);
+        float ix1 = Math.min(a[2], b[2]), iy1 = Math.min(a[3], b[3]);
+        float iw = ix1 - ix0, ih = iy1 - iy0;
+        if (iw <= 0 || ih <= 0) return 0f; // no overlap (or degenerate) -> IoU 0, never divides by zero
+        float intersection = iw * ih;
+        float areaA = Math.max(0f, a[2] - a[0]) * Math.max(0f, a[3] - a[1]);
+        float areaB = Math.max(0f, b[2] - b[0]) * Math.max(0f, b[3] - b[1]);
+        float union = areaA + areaB - intersection;
+        if (union <= 0f) return 0f; // both boxes degenerate -> no meaningful overlap
+        return intersection / union;
     }
 
     /**

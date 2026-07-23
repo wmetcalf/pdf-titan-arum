@@ -1,6 +1,8 @@
 package com.oai.titanarum;
 
+import org.apache.pdfbox.cos.COSArray;
 import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSInteger;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
@@ -511,15 +513,15 @@ final class TableTestPdfs {
             int mcid = 0;
             try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
                 cs.setLineWidth(0.75f);
-                for (float y : new float[]{700, 670, 640}) line(cs, 50, y, 250, y);
-                for (float x : new float[]{50, 150, 250}) line(cs, x, 700, x, 640);
+                for (float y : new float[]{700, 689, 678}) line(cs, 50, y, 114, y);
+                for (float x : new float[]{50, 82, 114}) line(cs, x, 700, x, 678);
                 for (int r = 0; r < 2; r++) {
                     for (int c = 0; c < 2; c++) {
                         COSDictionary d = new COSDictionary();
                         d.setInt(COSName.MCID, mcid++);
                         cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
                                 PDPropertyList.create(d));
-                        text(cs, 55 + c * 100, 700 - 20 - r * 30, cells[r][c]);
+                        text(cs, 50.5f + c * 32, 700 - 8.5f - r * 11, cells[r][c]);
                         cs.endMarkedContent();
                     }
                 }
@@ -542,6 +544,70 @@ final class TableTestPdfs {
                     tr.appendKid(cell);
                 }
             }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * FIX 2 round-2 (post-review) reproducer: a LEGAL sparse tagged table -- one TD cell whose /K
+     * lists TWO MCIDs drawn far apart on the page (e.g. a "notes" cell spanning a page's header
+     * and footer, or any other legitimately sparse multi-MCID cell) -- inflates that tagged
+     * table's bbox to nearly the whole page. A completely separate, visually distinct ruled 2x2
+     * table sitting anywhere inside that inflated rectangle (but nowhere near either of the sparse
+     * cell's own glyphs) must NOT be suppressed by the tagged/lattice dedup: an earlier "lattice
+     * bbox centroid inside tagged bbox" test wrongly dropped it -- silent data loss, the exact
+     * class of bug FIX 2 exists to close, reintroduced via inflated-bbox geometry. IoU correctly
+     * keeps both tables because the ruled table's area is tiny relative to the inflated tagged
+     * bbox's area.
+     */
+    static void taggedSparseTwoMcidCellPlusSeparateRuledTable(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                // Sparse tagged cell: two MCIDs, glyphs far apart (top-left "A", bottom-right "B").
+                COSDictionary d0 = new COSDictionary();
+                d0.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d0));
+                text(cs, 60, 730, "A");
+                cs.endMarkedContent();
+
+                COSDictionary d1 = new COSDictionary();
+                d1.setInt(COSName.MCID, 1);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d1));
+                text(cs, 480, 40, "B");
+                cs.endMarkedContent();
+
+                // Separate ruled 2x2 grid, centered on the page: its CENTROID falls inside the
+                // sparse tagged cell's inflated bbox, but it shares no actual visual overlap with
+                // either the "A" or "B" glyph -- no structure reference of its own.
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{410, 380, 350}) line(cs, 250, y, 350, y);
+                for (float x : new float[]{250, 300, 350}) line(cs, x, 410, x, 350);
+                text(cs, 255, 390, "L");
+                text(cs, 305, 390, "R");
+                text(cs, 255, 360, "C");
+                text(cs, 305, 360, "D");
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(page);
+            // /K = [0, 1] -- ONE cell, TWO MCIDs, far apart -- the sparse-cell reproducer.
+            COSArray k = new COSArray();
+            k.add(COSInteger.get(0));
+            k.add(COSInteger.get(1));
+            cell.getCOSObject().setItem(COSName.K, k);
+            tr.appendKid(cell);
+
             doc.save(file.toFile());
         }
     }

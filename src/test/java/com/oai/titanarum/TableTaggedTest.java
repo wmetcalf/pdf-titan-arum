@@ -431,6 +431,39 @@ class TableTaggedTest {
         }
     }
 
+    @Test
+    void sparseTaggedCellInflatedBboxDoesNotSuppressDistinctRuledTable() throws Exception {
+        // FIX 2 round-2 (post-review) reproducer: the FIRST version of the dedup used "lattice
+        // bbox centroid inside tagged bbox", which false-suppressed this exact shape -- a LEGAL
+        // sparse tagged table (one TD cell whose /K lists two MCIDs drawn far apart, e.g. a
+        // "notes" cell spanning a page's header and footer) inflates that tagged table's bbox to
+        // nearly the whole page; a completely separate, visually distinct ruled 2x2 table sitting
+        // anywhere inside that inflated rectangle (but nowhere near either sparse glyph) had its
+        // centroid fall inside the tagged bbox and was silently dropped -- the exact
+        // silent-data-loss class FIX 2 exists to close, reintroduced via geometry. IoU fixes this:
+        // the ruled table's area is tiny relative to the inflated tagged bbox's area, so
+        // IoU ~= 0.02, far under the dedup threshold -- both tables must survive.
+        Path pdf = tmp.resolve("sparse_tagged_inflated_bbox.pdf");
+        TableTestPdfs.taggedSparseTwoMcidCellPlusSeparateRuledTable(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(2, r.tables.size(),
+                    "the distinct ruled table must NOT be dropped just because its centroid falls "
+                            + "inside a sparse tagged cell's inflated bbox: " + r.tables);
+
+            TableExtractor.TableHit tagged = r.tables.stream()
+                    .filter(t -> "tagged".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("sparse tagged table missing: " + r.tables));
+            assertEquals("A\nB", tagged.cells.get(0).text, "sanity: both far-apart MCIDs resolved into the one sparse cell");
+
+            TableExtractor.TableHit lattice = r.tables.stream()
+                    .filter(t -> "lattice".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(
+                            () -> new AssertionError("the distinct ruled table must survive, not be suppressed: " + r.tables));
+            assertEquals(List.of(List.of("L", "R"), List.of("C", "D")), lattice.rows);
+        }
+    }
+
     // ---------------------------------------------------------------- FIX 4: lock-in only, no code change
 
     @Test

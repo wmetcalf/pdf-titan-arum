@@ -8,6 +8,7 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkedContentReference;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureElement;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureTreeRoot;
 import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDPropertyList;
@@ -1476,6 +1477,113 @@ final class TableTestPdfs {
                 }
             }
 
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * PR re-review P2 (recall) reproducer: a tagged 2x2 table (same cell layout/content as {@link
+     * #tagged2x2}) whose Table/TR/TD structure elements carry NO /Pg ANYWHERE -- not on the
+     * element itself, not on any ancestor -- so {@link TableExtractor#resolveElementPage}'s
+     * element+ancestor walk resolves null for every cell. Instead, each TD/TH's marked content is
+     * referenced via its own {@link PDMarkedContentReference} KID (not a bare Integer/COSInteger
+     * MCID, as every other tagged fixture in this file uses), and that MCR itself carries /Pg =
+     * the page -- a third, equally legal (ISO 32000) way to associate marked content with a page.
+     * Used to prove {@link TableExtractor#firstCellPage} (via its MCR fallback) no longer silently
+     * rejects a table using only this structure before glyph resolution ever runs.
+     */
+    static void taggedMcrOnlyPage(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            String[][] cells = {{"Name", "Qty"}, {"Ada", "3"}};
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int r = 0; r < 2; r++) {
+                    for (int c = 0; c < 2; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName(r == 0 ? "TH" : "TD"),
+                                PDPropertyList.create(d));
+                        text(cs, 60 + c * 120, 700 - r * 30, cells[r][c]);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            // Deliberately NO table.setPage(...) -- the table's page must be resolved SOLELY via
+            // each cell's own MCR child's /Pg, never via element/ancestor /Pg.
+            PDStructureElement table = new PDStructureElement("Table", root);
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < 2; r++) {
+                // No tr.setPage(...) either.
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                table.appendKid(tr);
+                for (int c = 0; c < 2; c++) {
+                    // No cell.setPage(...).
+                    PDStructureElement cell = new PDStructureElement(r == 0 ? "TH" : "TD", tr);
+                    if (r == 1 && c == 0) {
+                        PDTableAttributeObject att = new PDTableAttributeObject();
+                        att.setColSpan(1);
+                        cell.addAttribute(att);
+                    }
+                    PDMarkedContentReference mcr = new PDMarkedContentReference();
+                    mcr.setPage(page); // the ONLY /Pg reference anywhere in this structure subtree
+                    mcr.setMCID(mcid++);
+                    cell.appendKid(mcr);
+                    tr.appendKid(cell);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * PR re-review P2 (DoS) reproducer: {@code tableCount} independent Table elements, EACH
+     * referencing the SAME single shared "TR" structure element (built once, appended as a kid of
+     * every Table below -- the identical DAG fan-in technique {@code
+     * TableStructureTreeDagTest}'s diamond fixture uses, just breadth-first across many parents
+     * instead of a depth chain). The shared TR itself carries {@code trChildCount} plain TD kids
+     * (no MCID/marked content on any of them -- this fixture is rejected by the document-wide
+     * structure-work budget long before glyph resolution would ever be attempted, so no page
+     * content stream is needed either). The shared TR's own /Pg is set once (inherited by every TD
+     * via {@link TableExtractor}'s ancestor-/Pg walk), so every table's cheap early page-lookup
+     * (firstCellPage) still succeeds quickly, matching a realistic hostile document rather than one
+     * trivially rejected on page-scope before the expensive structural walk even runs.
+     *
+     * <p>{@link TableExtractor#collectByType}'s FIX 1 DAG memoization only dedups node visits
+     * WITHIN one call (a fresh identity-visited set every call) -- it does NOT dedup ACROSS the
+     * {@code tableCount} separate {@code collectByType(tableEl, "TR", ...)} calls {@code
+     * extractTagged} makes, one per Table element, so the shared TR subtree's {@code
+     * (1 + trChildCount)} nodes are revisited in full for EVERY table: {@code tableCount x
+     * (1 + trChildCount)} total node visits before any per-table cap ever gates anything.
+     */
+    static void taggedManyTablesShareOneHugeTrSubtree(Path file, int tableCount, int trChildCount)
+            throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+
+            PDStructureElement sharedTr = new PDStructureElement("TR", root);
+            sharedTr.setPage(page); // inherited by every TD below via the ancestor /Pg walk
+            for (int c = 0; c < trChildCount; c++) {
+                PDStructureElement td = new PDStructureElement("TD", sharedTr);
+                sharedTr.appendKid(td);
+            }
+
+            for (int i = 0; i < tableCount; i++) {
+                PDStructureElement table = new PDStructureElement("Table", root);
+                table.setPage(page);
+                root.appendKid(table);
+                table.appendKid(sharedTr); // the SAME TR object, shared across every table
+            }
             doc.save(file.toFile());
         }
     }

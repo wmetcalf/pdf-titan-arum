@@ -236,6 +236,34 @@ class TableTaggedTest {
     }
 
     @Test
+    void mcrOnlyPageFallbackStillExtractsTable() throws Exception {
+        // PR re-review P2 (recall) reproducer: /Pg is set NOWHERE in the Table/TR/TD structure
+        // subtree -- instead, each cell's marked content is referenced via a
+        // PDMarkedContentReference KID whose OWN /Pg declares the page (a third, equally legal
+        // ISO 32000 way to associate content with a page, distinct from element /Pg and ancestor
+        // /Pg inheritance). Before this fix, firstCellPage()'s cheap early gate -- which only
+        // consulted element+ancestor /Pg via resolveElementPage -- resolved null for every cell,
+        // silently dropping the whole table before collectGlyphs (which already handles
+        // mcr.getPage() correctly) ever ran. 0 tables pre-fix; the table, with correct cell text,
+        // post-fix.
+        Path pdf = tmp.resolve("mcr_only_page.pdf");
+        TableTestPdfs.taggedMcrOnlyPage(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(1, r.tables.size(),
+                    "a table whose page is declared ONLY via its cells' MCR children must not be "
+                            + "silently dropped: " + r.tables);
+            TableExtractor.TableHit t = r.tables.get(0);
+            assertEquals("tagged", t.extractionMethod);
+            assertEquals(1, t.page, "table's page resolved via the MCR-only fallback");
+            assertEquals(2, t.rowCount);
+            assertEquals(2, t.colCount);
+            assertEquals(List.of(List.of("Name", "Qty"), List.of("Ada", "3")), t.rows,
+                    "cell text must be resolved correctly through the MCR-only page path");
+        }
+    }
+
+    @Test
     void crossPageTaggedTableExcludesOtherPagesBbox() throws Exception {
         Path pdf = tmp.resolve("crosspage.pdf");
         TableTestPdfs.taggedCrossPage(pdf);
@@ -650,6 +678,38 @@ class TableTaggedTest {
             assertEquals("Total", t.cells.get(0).text,
                     "a cell drawn twice at the same position via the tagged path must extract as a single "
                             + "correct copy (\"Total\"), not garbled (\"TToottaall\") or duplicated (\"TotalTotal\")");
+        }
+    }
+
+    @Test
+    void manyTablesSharingOneHugeTrSubtreeIsBoundedByDocumentWideStructureWork() throws Exception {
+        // PR re-review P2 (DoS) reproducer: collectByType's FIX 1 DAG memoization only dedups
+        // node visits WITHIN one call (a fresh identity-visited set per call) -- it does NOT dedup
+        // ACROSS the once-per-Table-element calls extractTagged makes to find each table's own
+        // "TR" descendants. A hostile structure DAG with many Table elements all referencing the
+        // SAME large shared TR subtree forces that shared subtree to be walked in FULL, from
+        // scratch, once per referencing Table element.
+        //
+        // 2,000 tables x (1 shared TR + 3,000 TD kids) = 6,002,000 total node visits if fully
+        // walked -- comfortably past MAX_STRUCTURE_WORK (5,000,000), so the document-wide budget
+        // must trip well before the loop completes naturally, bounding both wall-clock (this
+        // assertion is a generous sanity backstop, not the primary check) and setting
+        // Result.truncated -- WITHOUT ever needing the review's full ~100,000,000-visit adversarial
+        // scale to prove the bound holds.
+        Path pdf = tmp.resolve("shared_tr_subtree_bomb.pdf");
+        int tableCount = 2_000;
+        int trChildCount = 3_000;
+        TableTestPdfs.taggedManyTablesShareOneHugeTrSubtree(pdf, tableCount, trChildCount);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            long start = System.nanoTime();
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+            assertTrue(r.truncated,
+                    "the document-wide structure-traversal work cap trip must set Result.truncated");
+            assertTrue(elapsedMs < 15_000,
+                    "must be bounded by the work budget, not walk anywhere near the full "
+                            + (tableCount * (long) (trChildCount + 1)) + "-node blowup: took " + elapsedMs + "ms");
         }
     }
 

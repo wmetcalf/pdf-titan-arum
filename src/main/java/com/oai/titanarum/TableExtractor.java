@@ -205,6 +205,35 @@ final class TableExtractor {
     // recursing further -- a plausible-if-imperfect placement, never a crash.
     static final int MAX_SPLIT_DEPTH = 64;
 
+    // PR re-review P2 (DoS): collectByType's FIX 1 identity-memoization only dedups node visits
+    // WITHIN one call -- a fresh IdentityHashMap-backed visited set is created per call (see that
+    // method's doc). extractTagged calls collectByType ONCE PER Table element found (the "Table"
+    // search's own results) to gather that table's own "TR" descendants -- so a hostile structure
+    // DAG with many Table elements all referencing the SAME large shared TR subtree (each
+    // reachable via >1 parent, exactly the DAG-fan-in shape FIX 1 already handles WITHIN a call)
+    // forces that shared subtree to be walked in FULL, from scratch, once per referencing Table
+    // element: ~10,000 tables x a ~10,000-node shared subtree ~= 100,000,000 total node visits
+    // before MAX_TABLES_PER_PAGE/MAX_CELLS_PER_TABLE ever get a chance to gate anything (those
+    // caps only apply to ACCEPTED tables, long after this traversal cost is already paid).
+    //
+    // Fix: a document-wide work counter, threaded BY REFERENCE (not reset between tables) through
+    // every collectByType call made by one extractTagged run -- the top-level "Table" search AND
+    // every per-table "TR" search alike -- charged once per PDStructureElement node examined,
+    // throwing RulingOverflowException once the cumulative total exceeds this budget (caught by
+    // extract()'s existing per-stage catch, same as every other geometry/glyph cap in this class).
+    //
+    // Sized from the SAME per-call cap already in force (collectByType's own out.size()>10_000
+    // bail-out) times a generously large but still bounded table count: a single legitimate table
+    // can reach up to MAX_CELLS_PER_TABLE (10,000) TD/TH cells, so one table's own "TR" walk can
+    // legitimately cost up to ~10,000 node visits; 500 such large tables in one document (a
+    // generous ceiling -- MAX_TABLES_PER_PAGE alone is 50, so this covers 10 pages' worth of
+    // maximally-sized tables with room to spare) is 5,000,000 -- comfortably above any real
+    // document's total structural cost, while an adversarial shape (thousands of tables sharing
+    // one huge subtree) trips this after only a handful of tables' worth of repeated work, failing
+    // fast and deterministically well under the 15s hard-halt watchdog rather than after ~100M
+    // visits.
+    static final long MAX_STRUCTURE_WORK = 5_000_000;
+
     private TableExtractor() {}
 
     // ---------------------------------------------------------------- result model
@@ -970,6 +999,12 @@ final class TableExtractor {
          * caps that guard actual output size (MAX_RULINGS_PER_PAGE, findCells' caps)
          * already bound the expensive parts of the pipeline. We stay "overflowed" -
          * ignoring further points - until the next paint op or endPath resets state.
+         *
+         * <p>PR re-review P2: each point is a {@code float[3]} of {@code {x, y, isCurveEndpoint}}
+         * -- {@code isCurveEndpoint} (1f/0f) is set ONLY by {@link #curveTo} (see that method's
+         * doc) and read by {@link #addRulingsForSubpath} to suppress emitting a straight ruling
+         * for the segment INTO a curve's endpoint, while still keeping the point itself in the
+         * path for continuity (a subsequent lineTo from it must still connect correctly).
          */
         private void addPoint(float[] p) {
             if (overflowed) return;
@@ -1000,43 +1035,68 @@ final class TableExtractor {
         @Override public void moveTo(float x, float y) {
             if (overflowed) return;
             finalizeCurrentSubpath();
-            addPoint(new float[]{x, y});
+            addPoint(new float[]{x, y, 0f});
         }
 
         @Override public void lineTo(float x, float y) {
             if (overflowed) return;
-            addPoint(new float[]{x, y});
+            addPoint(new float[]{x, y, 0f});
         }
 
+        /**
+         * PR re-review P2 (correctness -- false positives): the endpoint is kept in the path for
+         * CONTINUITY (a subsequent lineTo from here must still connect correctly), but is flagged
+         * ({@code isCurveEndpoint = 1f}) so {@link #addRulingsForSubpath} does NOT treat the
+         * segment from the curve's start point INTO this endpoint as a straight ruling. Before
+         * this fix, {@code strokePath}/{@code fillAndStrokePath} blindly connected every pair of
+         * CONSECUTIVE buffered points with {@code addRuling}, regardless of whether pdfbox got
+         * from one to the other via a straight lineTo or a Bezier curveTo -- so any curved artwork
+         * (rounded rects, decorative curves) whose curve endpoint happened to land axis-aligned
+         * with its own start point (a common case: rounded-rect corners return to the same x or y
+         * as the straight edge that led into them) injected a bogus straight-line ruling along the
+         * curve's chord, corrupting lattice table detection with phantom borders/intersections.
+         */
         @Override public void curveTo(float x1, float y1, float x2, float y2, float x3, float y3) {
             if (overflowed) return;
-            addPoint(new float[]{x3, y3}); // curves are not rulings; keep the endpoint for continuity
+            addPoint(new float[]{x3, y3, 1f}); // curves are not rulings; keep the endpoint for continuity
         }
 
         @Override public void appendRectangle(Point2D p0, Point2D p1, Point2D p2, Point2D p3) {
             if (overflowed) return;
             finalizeCurrentSubpath();
-            addPoint(new float[]{(float) p0.getX(), (float) p0.getY()});
-            addPoint(new float[]{(float) p1.getX(), (float) p1.getY()});
-            addPoint(new float[]{(float) p2.getX(), (float) p2.getY()});
-            addPoint(new float[]{(float) p3.getX(), (float) p3.getY()});
-            addPoint(new float[]{(float) p0.getX(), (float) p0.getY()});
+            addPoint(new float[]{(float) p0.getX(), (float) p0.getY(), 0f});
+            addPoint(new float[]{(float) p1.getX(), (float) p1.getY(), 0f});
+            addPoint(new float[]{(float) p2.getX(), (float) p2.getY(), 0f});
+            addPoint(new float[]{(float) p3.getX(), (float) p3.getY(), 0f});
+            addPoint(new float[]{(float) p0.getX(), (float) p0.getY(), 0f});
         }
 
         @Override public void closePath() {
             if (overflowed || current.isEmpty()) return;
             float[] first = current.get(0);
-            addPoint(new float[]{first[0], first[1]});
+            addPoint(new float[]{first[0], first[1], 0f}); // closing edge is a straight line, not a curve
+        }
+
+        /** True when {@code p} (a buffered path point, see {@link #addPoint}) arrived via {@link
+         * #curveTo} -- the segment ENDING at such a point must not be emitted as a straight ruling
+         * by {@link #addRulingsForSubpath} (see that curveTo override's doc for the full FIX). */
+        private static boolean isCurveEndpoint(float[] p) { return p[2] != 0f; }
+
+        /** Shared by {@link #strokePath} and {@link #fillAndStrokePath}: connects consecutive
+         * buffered points of one subpath with {@link #addRuling}, EXCEPT a segment whose
+         * destination point is a curve endpoint (see {@link #curveTo}) -- that segment traces a
+         * Bezier curve, not a drawn straight edge, so it must never be reported as a ruling. */
+        private void addRulingsForSubpath(List<float[]> sp) {
+            for (int i = 1; i < sp.size(); i++) {
+                float[] a = sp.get(i - 1), b = sp.get(i);
+                if (isCurveEndpoint(b)) continue;
+                addRuling(a[0], a[1], b[0], b[1]);
+            }
         }
 
         @Override public void strokePath() {
             finalizeCurrentSubpath();
-            for (List<float[]> sp : subpaths) {
-                for (int i = 1; i < sp.size(); i++) {
-                    float[] a = sp.get(i - 1), b = sp.get(i);
-                    addRuling(a[0], a[1], b[0], b[1]);
-                }
-            }
+            for (List<float[]> sp : subpaths) addRulingsForSubpath(sp);
             resetPath();
         }
 
@@ -1050,10 +1110,7 @@ final class TableExtractor {
             finalizeCurrentSubpath();
             for (List<float[]> sp : subpaths) {
                 // Stroke edges AND consider the thin-fill case, per subpath.
-                for (int i = 1; i < sp.size(); i++) {
-                    float[] a = sp.get(i - 1), b = sp.get(i);
-                    addRuling(a[0], a[1], b[0], b[1]);
-                }
+                addRulingsForSubpath(sp);
                 emitThinFillAsRuling(sp);
             }
             resetPath();
@@ -1418,6 +1475,14 @@ final class TableExtractor {
             // overflow inside pdfbox's own traversal even with our depth guards in place; degrade
             // to "skip tagged, lattice still runs" rather than killing the worker thread.
             System.err.println("WARNING: tagged table extraction overflowed the stack (skipped): " + e);
+        } catch (RulingOverflowException e) {
+            // PR re-review P2 (DoS): extractTagged's document-wide structure-traversal work
+            // budget (see MAX_STRUCTURE_WORK) tripped -- a hostile structure DAG forced far more
+            // total collectByType node visits than any legitimate document could. Every tagged
+            // table already accepted into result.tables before the trip is kept; tagged
+            // extraction simply stops here (lattice still runs for every page below).
+            result.truncated = true;
+            System.err.println("WARNING: tagged table extraction truncated (structure-traversal work cap): " + e);
         } catch (Exception e) {
             System.err.println("WARNING: tagged table extraction failed: " + e);
         }
@@ -1770,10 +1835,16 @@ final class TableExtractor {
                                       Result result) throws IOException {
         PDStructureTreeRoot root = doc.getDocumentCatalog().getStructureTreeRoot();
         if (root == null) return;
+        // PR re-review P2 (DoS): a SINGLE work counter, shared BY REFERENCE across every
+        // collectByType call this extractTagged run makes (the "Table" search below AND every
+        // per-table "TR" search further down) -- see MAX_STRUCTURE_WORK's doc. Never reset
+        // between tables: the budget is document-wide for this one run, closing the DAG-fan-in
+        // DoS where many Table elements all reference the same large shared TR subtree.
+        long[] structureWork = {0};
         List<PDStructureElement> tables = new ArrayList<>();
         // No stop set here: nested Table elements must surface as their OWN entries in `tables`
         // (fix for the flattening bug below), so recursion continues past a "Table" match too.
-        collectByType(root, "Table", tables, 0, Set.of());
+        collectByType(root, "Table", tables, 0, Set.of(), structureWork, MAX_STRUCTURE_WORK);
         if (tables.isEmpty()) return;
 
         // page -> (mcid -> glyphs), computed lazily, one content pass per page
@@ -1799,7 +1870,7 @@ final class TableExtractor {
                 break;
             }
             List<PDStructureElement> trs = new ArrayList<>();
-            collectByType(tableEl, "TR", trs, 0, STOP_AT_TABLE);
+            collectByType(tableEl, "TR", trs, 0, STOP_AT_TABLE, structureWork, MAX_STRUCTURE_WORK);
             if (trs.isEmpty()) continue;                     // degenerate -> lattice may still run
 
             // Determine the table's page EARLY and cheaply -- PDStructureElement.getPage() only
@@ -1843,8 +1914,8 @@ final class TableExtractor {
     }
 
     /** Cheap page lookup with NO content-stream access: first TD/TH (in row/cell order) whose
-     * /Pg resolves via {@link #resolveElementPage}. Used both to gate a table against
-     * pagesToProcess before any MCID work, and (by construction, same row/cell order as
+     * /Pg resolves via {@link #resolveElementPageWithMcrFallback}. Used both to gate a table
+     * against pagesToProcess before any MCID work, and (by construction, same row/cell order as
      * buildTaggedTable) to pick the table's own page. */
     private static PDPage firstCellPage(List<PDStructureElement> trs) {
         for (PDStructureElement tr : trs) {
@@ -1852,7 +1923,7 @@ final class TableExtractor {
                 if (kid instanceof PDStructureElement el) {
                     String st = el.getStandardStructureType();
                     if ("TD".equals(st) || "TH".equals(st)) {
-                        PDPage page = resolveElementPage(el);
+                        PDPage page = resolveElementPageWithMcrFallback(el);
                         if (page != null) return page;
                     }
                 }
@@ -1889,6 +1960,38 @@ final class TableExtractor {
         return null;
     }
 
+    /**
+     * PR re-review P2 (recall): {@link #resolveElementPage} only consults the element's OWN /Pg
+     * plus ancestor /Pg (element + TR + Table, per ISO 32000's common inheritance pattern) -- but
+     * a TD/TH's page can ALSO be declared SOLELY via one of its {@link PDMarkedContentReference}
+     * kids' own /Pg, with no /Pg anywhere on the element or any ancestor at all (a third, equally
+     * legal way ISO 32000 lets marked content be associated with a page). {@link #collectGlyphs}
+     * (further down this class) already resolves glyphs correctly through exactly this path
+     * ({@code mcr.getPage()}) -- but that only runs AFTER {@link #firstCellPage}'s early, cheap
+     * page-gate in {@code extractTagged}, so a table using ONLY this structure was silently
+     * rejected before glyph resolution ever ran.
+     *
+     * <p>Falls back to a SHALLOW scan of {@code el}'s own direct kids for a {@link
+     * PDMarkedContentReference} (matching exactly the depth {@link #collectGlyphs} itself uses to
+     * find one -- no recursion into nested structure elements here), returning the first non-null
+     * {@code mcr.getPage()} found. Never resolves glyphs itself -- this stays as cheap as the
+     * ancestor walk above it (one dictionary-reference read per kid, no content-stream access, no
+     * MCID resolution) -- so callers can still gate the returned page against pagesToProcess
+     * BEFORE any glyph work, exactly as {@link #resolveElementPage} already requires; this must
+     * not reintroduce the out-of-scope-page-walk DoS the pagesToProcess gating previously fixed.
+     */
+    private static PDPage resolveElementPageWithMcrFallback(PDStructureElement el) {
+        PDPage page = resolveElementPage(el);
+        if (page != null) return page;
+        for (Object kid : el.getKids()) {
+            if (kid instanceof PDMarkedContentReference mcr) {
+                PDPage mcrPage = mcr.getPage();
+                if (mcrPage != null) return mcrPage;
+            }
+        }
+        return null;
+    }
+
     /** DFS for structure elements of a standard type; depth-capped against cyclic/hostile trees.
      * Does not descend past any element whose standard type is in {@code stopTypes} (still adds
      * it first if it matches {@code type} itself) -- used to keep a nested Table's TR/TD from
@@ -1902,25 +2005,54 @@ final class TableExtractor {
      * IDENTITY-keyed (COS object identity, not structural equals/hashCode) visited-set through the
      * recursion so a child already reached via one parent is skipped, not re-walked, via another --
      * converting exponential fan-in blowup into linear-in-distinct-nodes. Package-private (this
-     * entry point, not the recursive helper) so tests can drive a synthetic diamond DAG directly. */
+     * entry point, not the recursive helper) so tests can drive a synthetic diamond DAG directly.
+     *
+     * <p>Unlimited-budget convenience overload: equivalent to calling the 7-arg overload below
+     * with a fresh, throwaway work counter and {@code Long.MAX_VALUE} as the budget. Used by every
+     * caller that does not need the document-wide, cross-call DoS bound (see {@link
+     * #MAX_STRUCTURE_WORK}) -- i.e. everything except {@code extractTagged} itself. */
     static void collectByType(PDStructureNode node, String type,
                               List<PDStructureElement> out, int depth, Set<String> stopTypes) {
-        collectByType(node, type, out, depth, stopTypes, Collections.newSetFromMap(new IdentityHashMap<>()));
+        collectByType(node, type, out, depth, stopTypes, new long[]{0}, Long.MAX_VALUE);
+    }
+
+    /**
+     * PR re-review P2 (DoS): overload taking a work counter/budget threaded THROUGH to every
+     * recursive call -- see {@link #MAX_STRUCTURE_WORK}'s doc. {@code extractTagged} passes the
+     * SAME {@code long[] work} array (by reference, never reset) to both its top-level "Table"
+     * search and every subsequent per-table "TR" search, so the cumulative node-visit cost of one
+     * whole extractTagged run is bounded document-wide, not merely per-call. A FRESH
+     * IDENTITY-keyed visited set is still created for THIS call (preserving FIX 1's DAG-memoization
+     * semantics within one call -- a diamond fan-in within a single Table element's own subtree is
+     * still visited once, not exponentially); only the work budget is shared across calls, never
+     * the visited set (which would incorrectly suppress a shared subtree's SECOND, THIRD, ... Table
+     * owner from ever seeing its own rows at all).
+     */
+    static void collectByType(PDStructureNode node, String type, List<PDStructureElement> out,
+                              int depth, Set<String> stopTypes, long[] work, long budget) {
+        collectByType(node, type, out, depth, stopTypes,
+                Collections.newSetFromMap(new IdentityHashMap<>()), work, budget);
     }
 
     private static void collectByType(PDStructureNode node, String type, List<PDStructureElement> out,
-                                      int depth, Set<String> stopTypes, Set<COSBase> visited) {
+                                      int depth, Set<String> stopTypes, Set<COSBase> visited,
+                                      long[] work, long budget) {
         if (depth > 64) return;
         for (Object kid : node.getKids()) {
             if (out.size() > 10_000) return; // bail mid-loop once the cap is hit, not just on entry
             if (!(kid instanceof PDStructureElement el)) continue;
+            // Charged BEFORE the DAG-memoization check below: memoization only dedups WITHIN this
+            // one call's own visited set, so a node reached again via a DIFFERENT Table element's
+            // OWN (fresh-visited-set) call must still count against the shared, document-wide
+            // budget -- that repeated-across-calls cost is exactly what MAX_STRUCTURE_WORK bounds.
+            if (++work[0] > budget) throw new RulingOverflowException();
             COSBase cos = el.getCOSObject();
             if (cos != null && !visited.add(cos)) continue; // DAG fan-in: already reached via another parent
             structureNodesVisited++;
             String st = el.getStandardStructureType();
             if (type.equals(st)) out.add(el);
             if (stopTypes.contains(st)) continue; // nested Table (or other stop boundary): don't descend
-            collectByType(el, type, out, depth + 1, stopTypes, visited);
+            collectByType(el, type, out, depth + 1, stopTypes, visited, work, budget);
         }
     }
 
@@ -2073,11 +2205,14 @@ final class TableExtractor {
                                         Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache,
                                         Map<PDPage, Integer> pageNumbers,
                                         Set<Integer> pagesToProcess) throws IOException {
-        // Ancestor-fallback resolution (FIX 7): the TD/TH itself may carry no /Pg at all when it
-        // is inherited from an enclosing TR/Table, per ISO 32000. Seeding collectGlyphs with this
-        // resolved page (rather than the bare el.getPage()) is what lets glyphsFor's own
-        // pagesToProcess gate work correctly for such a cell.
-        PDPage resolvedPage = resolveElementPage(el);
+        // Ancestor-fallback resolution (FIX 7), PLUS the MCR-kid fallback (PR re-review P2, see
+        // resolveElementPageWithMcrFallback's doc): the TD/TH itself may carry no /Pg at all when
+        // it is inherited from an enclosing TR/Table, per ISO 32000, or when its page is instead
+        // declared solely via one of its own PDMarkedContentReference kids. Seeding collectGlyphs
+        // with this resolved page (rather than the bare el.getPage()) is what lets glyphsFor's own
+        // pagesToProcess gate work correctly for such a cell, and what lets THIS cell's own
+        // bbox/page (used by buildTaggedTable's onTablePage gate) resolve correctly too.
+        PDPage resolvedPage = resolveElementPageWithMcrFallback(el);
         List<TextPosition> glyphs = new ArrayList<>();
         collectGlyphs(el, resolvedPage, glyphs, mcidCache, 0, pageNumbers, pagesToProcess);
         cell.text = joinText(glyphs);

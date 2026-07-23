@@ -152,6 +152,50 @@ class RulingCollectorTest {
     }
 
     @Test
+    void curveEndpointDoesNotEmitPhantomStraightRuling() throws Exception {
+        // PR re-review P2 (correctness -- false positives) reproducer: strokePath used to blindly
+        // connect every pair of CONSECUTIVE buffered path points with addRuling, regardless of
+        // whether pdfbox reached the second point via a straight lineTo or a Bezier curveTo. A
+        // curve's own endpoint is kept in the path for continuity (so a SUBSEQUENT lineTo from it
+        // still connects correctly), so a curve whose start and end happen to share a y (or x)
+        // coordinate -- a common shape, e.g. a rounded-rect corner returning to the straight edge's
+        // own baseline -- injected a bogus straight-line "ruling" along the curve's chord, even
+        // though nothing straight was ever drawn there.
+        Path pdf = tmp.resolve("curve.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(1f);
+                // Genuine straight rulings elsewhere on the page (a small ruled 2x2 grid) -- proves
+                // ordinary lineTo rulings still survive this fix.
+                for (float y : new float[]{700, 670, 640}) TableTestPdfs.line(cs, 50, y, 150, y);
+                for (float x : new float[]{50, 100, 150}) TableTestPdfs.line(cs, x, 700, x, 640);
+
+                // A Bezier curve, well away from the grid above, whose endpoint (500, 700) is
+                // axis-aligned (same y) with its own start point (400, 700) -- the straight chord
+                // between them must NOT be reported as a ruling.
+                cs.moveTo(400, 700);
+                cs.curveTo(430, 760, 470, 760, 500, 700);
+                cs.stroke();
+            }
+            doc.save(pdf.toFile());
+        }
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            List<TableExtractor.Ruling> rulings = TableExtractor.collectRulings(doc.getPage(0));
+
+            assertTrue(rulings.stream().noneMatch(r -> r.horizontal()
+                            && Math.abs(r.x1 - 400) <= 2 && Math.abs(r.x2 - 500) <= 2),
+                    "the curve's start-to-end chord must not be emitted as a straight ruling: " + rulings);
+
+            long horiz = rulings.stream().filter(TableExtractor.Ruling::horizontal).count();
+            long vert = rulings.stream().filter(TableExtractor.Ruling::vertical).count();
+            assertEquals(3, horiz, "the genuine 2x2 grid's horizontal rulings must still be collected");
+            assertEquals(3, vert, "the genuine 2x2 grid's vertical rulings must still be collected");
+        }
+    }
+
+    @Test
     void capThrowsOnRulingBomb() throws Exception {
         Path pdf = tmp.resolve("bomb.pdf");
         try (PDDocument doc = new PDDocument()) {

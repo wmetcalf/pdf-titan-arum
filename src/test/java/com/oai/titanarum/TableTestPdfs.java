@@ -32,6 +32,23 @@ final class TableTestPdfs {
         cs.stroke();
     }
 
+    /**
+     * PR re-review, round 2: the SAME visual straight line as {@link #line}, but authored via the
+     * {@code c} (curveTo) operator with BOTH control points collinear with the endpoints (placed
+     * at the 1/3 and 2/3 points along the segment) -- a common vector-editor-export
+     * (Illustrator/Inkscape) and report-generator authoring pattern for what is, geometrically, a
+     * perfectly straight line. Used to prove {@code RulingCollector}'s curve-vs-ruling decision is
+     * GEOMETRIC (collinear controls -> straight -> collected), not merely keyed on which
+     * content-stream operator produced the segment.
+     */
+    static void curveLine(PDPageContentStream cs, float x1, float y1, float x2, float y2) throws IOException {
+        cs.moveTo(x1, y1);
+        float cx1 = x1 + (x2 - x1) / 3f, cy1 = y1 + (y2 - y1) / 3f;
+        float cx2 = x1 + 2 * (x2 - x1) / 3f, cy2 = y1 + 2 * (y2 - y1) / 3f;
+        cs.curveTo(cx1, cy1, cx2, cy2, x2, y2);
+        cs.stroke();
+    }
+
     static void text(PDPageContentStream cs, float x, float y, String s) throws IOException {
         cs.beginText();
         cs.setFont(HELV, 10);
@@ -86,6 +103,31 @@ final class TableTestPdfs {
                 cs.setLineWidth(0.75f);
                 for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
                 for (float x : new float[]{50, 150, 250, 350}) line(cs, x, 700, x, 610);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * PR re-review, round 2 reproducer: the SAME 3x3 ruled grid as {@link #ruled3x3} (same
+     * geometry, same cell text), except every border is drawn via {@link #curveLine} (the {@code
+     * c} operator with collinear controls) instead of {@link #line} ({@code m}/{@code l}). Proves
+     * a genuinely straight lattice table authored entirely through the curve operator is still
+     * detected end-to-end -- not merely that one isolated ruling survives.
+     */
+    static void ruled3x3ViaCollinearCurves(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) curveLine(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) curveLine(cs, x, 700, x, 610);
                 for (int r = 0; r < 3; r++) {
                     for (int c = 0; c < 3; c++) {
                         text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));

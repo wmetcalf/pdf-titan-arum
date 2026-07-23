@@ -330,6 +330,13 @@ final class TableExtractor {
     static final float EPS = 1f;            // intersection tolerance (pt)
     static final float MIN_RULING_LEN = 8f; // shorter segments are decoration
     static final float THIN_FILL_MAX = 3f;  // filled rects thinner than this are lines
+    // PR re-review (round 2): perpendicular-distance-from-chord tolerance RulingCollector.curveTo
+    // uses to decide whether a cubic Bezier is GEOMETRICALLY a straight line (both control points
+    // within this distance of the line through the curve's own start/end points) rather than
+    // suppressing every curveTo-authored segment purely because of which content-stream operator
+    // produced it -- see curveTo's own doc for the full rationale. A fraction of a point, matching
+    // this file's other sub-point geometry tolerances (SNAP/EPS above).
+    static final float CURVE_STRAIGHT_EPS = 0.5f;
     // A hair above the intersection-point count of a MAX_CELLS_PER_TABLE-sized grid
     // (101x101 points ~ 10k cells); MAX_RULINGS_PER_PAGE alone (5k horiz x 5k vert) still
     // allows a 25M-point cross product, so findCells enforces this cap independently.
@@ -1001,10 +1008,12 @@ final class TableExtractor {
          * ignoring further points - until the next paint op or endPath resets state.
          *
          * <p>PR re-review P2: each point is a {@code float[3]} of {@code {x, y, isCurveEndpoint}}
-         * -- {@code isCurveEndpoint} (1f/0f) is set ONLY by {@link #curveTo} (see that method's
-         * doc) and read by {@link #addRulingsForSubpath} to suppress emitting a straight ruling
-         * for the segment INTO a curve's endpoint, while still keeping the point itself in the
-         * path for continuity (a subsequent lineTo from it must still connect correctly).
+         * -- {@code isCurveEndpoint} (1f/0f) is set ONLY by {@link #curveTo}, and ONLY when that
+         * curve is GEOMETRICALLY curved, not merely curveTo-authored (see that method's doc and
+         * {@link #isEffectivelyStraight}), and read by {@link #addRulingsForSubpath} to suppress
+         * emitting a straight ruling for the segment INTO a genuinely-curved endpoint, while still
+         * keeping the point itself in the path for continuity (a subsequent lineTo from it must
+         * still connect correctly).
          */
         private void addPoint(float[] p) {
             if (overflowed) return;
@@ -1044,21 +1053,60 @@ final class TableExtractor {
         }
 
         /**
-         * PR re-review P2 (correctness -- false positives): the endpoint is kept in the path for
-         * CONTINUITY (a subsequent lineTo from here must still connect correctly), but is flagged
-         * ({@code isCurveEndpoint = 1f}) so {@link #addRulingsForSubpath} does NOT treat the
+         * PR re-review P2 (correctness -- false positives), round 1: the endpoint is kept in the
+         * path for CONTINUITY (a subsequent lineTo from here must still connect correctly), but
+         * (round 1) was unconditionally flagged so {@link #addRulingsForSubpath} never treated the
          * segment from the curve's start point INTO this endpoint as a straight ruling. Before
-         * this fix, {@code strokePath}/{@code fillAndStrokePath} blindly connected every pair of
+         * that fix, {@code strokePath}/{@code fillAndStrokePath} blindly connected every pair of
          * CONSECUTIVE buffered points with {@code addRuling}, regardless of whether pdfbox got
          * from one to the other via a straight lineTo or a Bezier curveTo -- so any curved artwork
          * (rounded rects, decorative curves) whose curve endpoint happened to land axis-aligned
          * with its own start point (a common case: rounded-rect corners return to the same x or y
          * as the straight edge that led into them) injected a bogus straight-line ruling along the
          * curve's chord, corrupting lattice table detection with phantom borders/intersections.
+         *
+         * <p>PR re-review, round 2 (recall regression found in round 1): keying suppression on
+         * WHICH OPERATOR pdfbox dispatched (curveTo vs lineTo), rather than on actual geometry, is
+         * itself wrong the other way -- a genuinely STRAIGHT line authored via the {@code c}
+         * (curve) operator with control points collinear with its own endpoints (common from
+         * vector-editor exports -- Illustrator/Inkscape -- and some report generators) was being
+         * silently dropped as a ruling, a real false negative (missed table borders) on
+         * non-hostile documents. A cubic Bezier is an AFFINE combination of its 4 control points
+         * (the Bernstein coefficients always sum to 1) at every {@code t}, so when all 4 points
+         * are collinear the entire curve renders exactly on that one line, start to end --
+         * geometrically indistinguishable from a straight lineTo, regardless of where the two
+         * control points fall along it. {@link #isEffectivelyStraight} tests exactly that
+         * (perpendicular distance of each control point from the P0-&gt;P3 chord, within {@link
+         * #CURVE_STRAIGHT_EPS}); only a curve that FAILS this test (a control point genuinely off
+         * the chord) gets flagged as a curve endpoint. This closes BOTH directions at once: a
+         * genuinely curved Bezier still never contributes a phantom chord ruling, and a
+         * collinear-control straight line authored via {@code c} is treated exactly like a lineTo.
          */
         @Override public void curveTo(float x1, float y1, float x2, float y2, float x3, float y3) {
             if (overflowed) return;
-            addPoint(new float[]{x3, y3, 1f}); // curves are not rulings; keep the endpoint for continuity
+            Point2D.Float p0 = getCurrentPoint();
+            boolean straight = isEffectivelyStraight(p0.x, p0.y, x1, y1, x2, y2, x3, y3);
+            addPoint(new float[]{x3, y3, straight ? 0f : 1f}); // keep the endpoint for continuity either way
+        }
+
+        /**
+         * True when the cubic Bezier from {@code (x0,y0)} (control points {@code (x1,y1)}/{@code
+         * (x2,y2)}, endpoint {@code (x3,y3)}) is geometrically indistinguishable from the straight
+         * chord {@code (x0,y0)->(x3,y3)}: both control points lie within {@link
+         * #CURVE_STRAIGHT_EPS} of the infinite line through the chord (perpendicular distance,
+         * i.e. the 2D cross product of the chord vector and the control-point offset, normalized
+         * by chord length). A degenerate (near-zero-length) chord has no meaningful line to test
+         * collinearity against -- per {@link #curveTo}'s caller, treated as NOT straight (there is
+         * no chord to draw as a ruling either way, so this only affects the flag, not correctness).
+         */
+        private static boolean isEffectivelyStraight(float x0, float y0, float x1, float y1,
+                                                      float x2, float y2, float x3, float y3) {
+            float dx = x3 - x0, dy = y3 - y0;
+            float chordLen = (float) Math.hypot(dx, dy);
+            if (chordLen < 1e-4f) return false; // degenerate chord: no line to test against
+            float d1 = Math.abs(dx * (y1 - y0) - dy * (x1 - x0)) / chordLen;
+            float d2 = Math.abs(dx * (y2 - y0) - dy * (x2 - x0)) / chordLen;
+            return d1 <= CURVE_STRAIGHT_EPS && d2 <= CURVE_STRAIGHT_EPS;
         }
 
         @Override public void appendRectangle(Point2D p0, Point2D p1, Point2D p2, Point2D p3) {

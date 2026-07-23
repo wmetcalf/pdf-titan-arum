@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -192,6 +193,95 @@ class RulingCollectorTest {
             long vert = rulings.stream().filter(TableExtractor.Ruling::vertical).count();
             assertEquals(3, horiz, "the genuine 2x2 grid's horizontal rulings must still be collected");
             assertEquals(3, vert, "the genuine 2x2 grid's vertical rulings must still be collected");
+        }
+    }
+
+    @Test
+    void straightLineViaCurveOperatorWithCollinearControlsIsCollectedAsRuling() throws Exception {
+        // PR re-review, round 2 (recall regression in round 1's fix): round 1 suppressed EVERY
+        // curveTo-authored segment purely because of which operator produced it -- but a genuinely
+        // STRAIGHT line drawn via the `c` operator with control points collinear with its own
+        // endpoints (a common vector-editor-export -- Illustrator/Inkscape -- and report-generator
+        // pattern) is geometrically indistinguishable from a lineTo-drawn line and must still be
+        // collected as a ruling.
+        Path pdf = tmp.resolve("straight-via-curve.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(1f);
+                TableTestPdfs.curveLine(cs, 50, 700, 250, 700); // horizontal, drawn via `c`
+                TableTestPdfs.curveLine(cs, 50, 700, 50, 600);  // vertical, drawn via `c`
+            }
+            doc.save(pdf.toFile());
+        }
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            List<TableExtractor.Ruling> rulings = TableExtractor.collectRulings(doc.getPage(0));
+            assertTrue(rulings.stream().anyMatch(r -> r.horizontal()
+                            && Math.abs(r.x1 - 50) <= 2 && Math.abs(r.x2 - 250) <= 2),
+                    "a straight horizontal line authored via the c operator with collinear "
+                            + "controls must still be collected as a ruling: " + rulings);
+            assertTrue(rulings.stream().anyMatch(r -> r.vertical()
+                            && Math.abs(r.y1 - 92) <= 2 && Math.abs(r.y2 - 192) <= 2),
+                    "a straight vertical line authored via the c operator with collinear "
+                            + "controls must still be collected as a ruling: " + rulings);
+        }
+    }
+
+    @Test
+    void curvedBezierEndpointStillSuppressedAlongsideCollinearStraightCurves() throws Exception {
+        // Companion sanity check for the round-2 fix: in ONE page, a genuinely curved Bezier
+        // (control points well off the chord) and a straight line authored via curveTo with
+        // collinear controls must be told apart correctly -- the curved one's chord must NOT be a
+        // ruling, the collinear one's chord MUST be, even though both are dispatched through the
+        // exact same curveTo override.
+        Path pdf = tmp.resolve("mixed-curve.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(1f);
+                // Genuinely curved: control points bulge well off the P0->P3 chord.
+                cs.moveTo(400, 700);
+                cs.curveTo(430, 760, 470, 760, 500, 700);
+                cs.stroke();
+                // Straight-via-curve: collinear controls.
+                TableTestPdfs.curveLine(cs, 50, 500, 250, 500);
+            }
+            doc.save(pdf.toFile());
+        }
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            List<TableExtractor.Ruling> rulings = TableExtractor.collectRulings(doc.getPage(0));
+            assertTrue(rulings.stream().noneMatch(r -> r.horizontal()
+                            && Math.abs(r.x1 - 400) <= 2 && Math.abs(r.x2 - 500) <= 2),
+                    "the genuinely curved Bezier's chord must still not be a ruling: " + rulings);
+            assertTrue(rulings.stream().anyMatch(r -> r.horizontal()
+                            && Math.abs(r.x1 - 50) <= 2 && Math.abs(r.x2 - 250) <= 2),
+                    "the collinear-control straight line must still be a ruling: " + rulings);
+        }
+    }
+
+    @Test
+    void fullLatticeTableDrawnEntirelyViaCollinearControlCurvesIsStillDetected() throws Exception {
+        // "Ideally assert a full lattice table..." -- end-to-end companion: a genuine 3x3 ruled
+        // grid whose every border is authored via the c operator (collinear controls) must still
+        // extract as a full 9-cell lattice table, exactly like the lineTo-drawn equivalent.
+        Path pdf = tmp.resolve("ruled3x3_via_curves.pdf");
+        TableTestPdfs.ruled3x3ViaCollinearCurves(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(1, r.tables.size(),
+                    "a genuinely straight ruled grid authored entirely via curveTo must still be "
+                            + "detected as one lattice table: " + r.tables);
+            TableExtractor.TableHit t = r.tables.get(0);
+            assertEquals("lattice", t.extractionMethod);
+            assertEquals(3, t.rowCount);
+            assertEquals(3, t.colCount);
+            assertEquals(9, t.cells.size());
+            assertEquals(List.of(
+                    List.of("R1C1", "R1C2", "R1C3"),
+                    List.of("R2C1", "R2C2", "R2C3"),
+                    List.of("R3C1", "R3C2", "R3C3")), t.rows);
         }
     }
 

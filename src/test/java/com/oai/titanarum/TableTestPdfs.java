@@ -156,6 +156,35 @@ final class TableTestPdfs {
         }
     }
 
+    /**
+     * A ruled 2x2 grid (verticals at x=50/150/250, horizontals at y=700/670/640) whose (0,0) cell
+     * has its text ("Total") drawn TWICE at the IDENTICAL (x,y) position -- a common non-hostile
+     * PDF-generator pattern (fake-bold-via-redraw, redundant text layers) rather than an
+     * adversarial one. The other three cells each hold a distinct single-drawn label so the
+     * fixture can pin that ONLY the duplicated cell is affected. Used to reproduce the f095959
+     * regression: with duplicate-overlapping-text suppression disabled, {@code
+     * setSortByPosition(true)}'s sort interleaves the two identically-positioned "Total" runs
+     * character-by-character ("TToottaall") instead of collapsing them to the single correct
+     * copy PDFTextStripperByArea's default suppression produces.
+     */
+    static void ruled2x2DuplicateDrawnCell(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640}) line(cs, 50, y, 250, y);
+                for (float x : new float[]{50, 150, 250}) line(cs, x, 700, x, 640);
+                text(cs, 55, 680, "Total");
+                text(cs, 55, 680, "Total"); // identical (x,y) redraw -- fake-bold / redundant layer
+                text(cs, 155, 680, "B");
+                text(cs, 55, 650, "C");
+                text(cs, 155, 650, "D");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
     /** Same content as {@link #ruled3x3}, but with the page's /Rotate set to the given degrees. */
     static void rotatedRuled3x3(Path file, int rotationDegrees) throws IOException {
         try (PDDocument doc = new PDDocument()) {

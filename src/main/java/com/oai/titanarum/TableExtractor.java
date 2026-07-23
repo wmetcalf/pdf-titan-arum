@@ -130,32 +130,68 @@ final class TableExtractor {
     // work, so the actual cost incurred before bailing out is always <= MAX_REGION_WORK, not
     // glyphs x cells.
     //
-    // round-4 follow-up (this fix): 200,000,000 was calibrated assuming every charged work-unit
-    // costs about the same regardless of whether the glyph actually falls inside a region ("~0.2-2s
-    // at typical containment-check speeds"). That holds for a glyph that matches NO region --
-    // PDFTextStripperByArea.processTextPosition's own {@code rect.contains(...)} check is cheap and
-    // uniform -- but is FALSE for a glyph that DOES match: PDFTextStripperByArea calls {@code
-    // super.processTextPosition(text)} (the base PDFTextStripper's real per-glyph bookkeeping) once
-    // per MATCHING region, and (with setSortByPosition(true), needed for rotated-page correctness --
-    // see fillCellsByRegion's own doc) suppressDuplicateOverlappingText defaulting on meant every
-    // matched glyph also paid a TreeMap/TreeSet dedup check. REPRODUCED: ~100 kept cells whose
-    // registered regions geometrically OVERLAP one another (so most glyphs of a large run match
-    // MANY of them, multiplying the number of super.processTextPosition calls per glyph well beyond
-    // 1) with ~2,000,000 matching glyphs -- exactly the same (glyphs x cells) work-unit count this
-    // cap already bounds -- took 20-33s at the OLD 200,000,000 budget, comfortably past the 15s
-    // hard-halt window. fillCellsByRegion now calls {@code setSuppressDuplicateOverlappingText(false)}
-    // (cell text doesn't need cross-page duplicate suppression), which helped (32.8s -> ~20.5s on
-    // the same repro) but was NOT sufficient on its own -- the base class's per-match bookkeeping
-    // (ArrayList append + article-division bookkeeping in processTextPosition, called once per
-    // MATCHED region) is still real, non-uniform, per-glyph cost. So this budget is ALSO lowered,
-    // to 20,000,000 (10x): measured directly against the fixed code (setSuppressDuplicateOverlappingText
-    // off, setSortByPosition still on) on the same fully-overlapping-regions worst case, swept across
-    // cell counts from 2 to 2,000 with the glyph count sized to land the call right at this budget,
-    // the worst observed wall-clock was ~2.9s (cells=15) -- comfortably under both this doc's ~3s
-    // target and the 15s hard-halt window, vs. 20+s at the old budget for the equivalent shape. A
-    // legitimate page's real (glyphs x cells) product remains a tiny fraction of even this lowered
-    // budget (few cells, few thousand glyphs), so ordinary tables are unaffected.
-    static final long MAX_REGION_WORK = 20_000_000;
+    // round-4 follow-up (SUPERSEDED, see round-5 below): 200,000,000 was calibrated assuming every
+    // charged work-unit costs about the same regardless of whether the glyph actually falls inside
+    // a region ("~0.2-2s at typical containment-check speeds"). That holds for a glyph that matches
+    // NO region -- PDFTextStripperByArea.processTextPosition's own {@code rect.contains(...)} check
+    // is cheap and uniform -- but is FALSE for a glyph that DOES match: PDFTextStripperByArea calls
+    // {@code super.processTextPosition(text)} (the base PDFTextStripper's real per-glyph
+    // bookkeeping) once per MATCHING region, and a shape where many registered cell regions
+    // geometrically OVERLAP (so one glyph matches many of them at once) multiplies that per-glyph
+    // cost well beyond what the flat "glyphs x cells" work formula assumes. REPRODUCED: ~100 kept
+    // cells whose registered regions geometrically OVERLAP one another with ~2,000,000 matching
+    // glyphs took 20-33s at the OLD 200,000,000 budget, comfortably past the 15s hard-halt window.
+    // round 4's fix disabled {@code setSuppressDuplicateOverlappingText} on this instance to make
+    // that per-match bookkeeping cheaper, and lowered this budget to 20,000,000 to compensate --
+    // but that traded CORRECTNESS for CPU: cell text that is drawn TWICE at the identical (x,y)
+    // (fake-bold-via-redraw, redundant text layers -- a common NON-hostile PDF-generator pattern,
+    // not just a hostile one) came back GARBLED ("TToottaall" instead of "Total") once suppression
+    // was off, because {@code setSortByPosition(true)} (needed for cell-text ordering / rotation)
+    // sorts the two identically-positioned runs into an interleaved character stream with nothing
+    // left to collapse them back together. See {@code
+    // TableLatticeTest#duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled} for the reproducer.
+    //
+    // round-5 (THIS fix): correctness wins. {@code setSuppressDuplicateOverlappingText(false)} is
+    // REMOVED -- fillCellsByRegion now runs with PDFTextStripperByArea's default (suppression ON),
+    // producing correct text for the duplicate-draw case above. The matched-glyph DoS this budget
+    // exists for is instead bounded by the work budget ALONE, recalibrated for the (now more
+    // expensive per match, thanks to the restored TreeMap/TreeSet dedup bookkeeping)
+    // suppression-ON cost.
+    //
+    // Measured directly against the fixed code (suppression back ON, setSortByPosition still ON),
+    // driving the PRODUCTION fillCellsByRegion (via the package-private (glyphBudget, workBudget)
+    // overload, glyphBudget pinned at the production MAX_REGION_GLYPHS) with the same
+    // fully-overlapping-cell-regions DoS shape as the round-4 repro (2,000,000 matching glyphs,
+    // real PDFBox-measured TextPositions from a real PDF, not synthetic ones), swept across cell
+    // counts {2, 10, 100, 1000, 5000 (= MAX_REGION_CELLS)} x candidate budgets, taking the WORST of
+    // several repeated runs per point to damp JIT/GC noise. The worst case at every budget tested
+    // fell at LOW cell counts (cells=10, not cells=2 or cells=5000) -- for cells=2 the real 2,000,000
+    // glyph feed itself becomes the binding constraint once budget/cellCount exceeds it (so higher
+    // budgets stop making cells=2 any slower), while cells=10 is exactly where "glyphs x cells" first
+    // reaches multi-million-work territory before the (fixed) glyph feed runs out, maximizing the
+    // number of expensive matched-and-forwarded glyphs actually processed before the throw:
+    //   budget=20,000,000 (old, unchanged from round 4): worst ~4.3s (cells=10)  -- ABOVE the ~3s
+    //     target with suppression back on, confirming suppression-ON is materially more expensive
+    //     per match than round 4's suppression-OFF calibration assumed.
+    //   budget=15,000,000: worst ~3.0-3.2s (cells=10) -- borderline/inconsistent across repeats.
+    //   budget=14,000,000: worst ~2.9-3.1s (cells=10) -- still borderline under repeated sampling.
+    //   budget=13,000,000: worst ~2.5-2.7s (cells=10), consistent across 8+ repeats -- comfortably
+    //     under the ~3s target with margin for measurement noise.
+    //   budget=12,000,000: worst ~2.4-2.5s (cells=10).
+    // 13,000,000 is chosen: the largest of the tested candidates whose measured worst case stays
+    // reliably under ~3s (not just on a lucky run), comfortably under the 15s hard-halt window even
+    // with normal environment variance. A legitimate page's real (glyphs x cells) product remains a
+    // tiny fraction of even this lowered budget (few cells, few thousand glyphs), so ordinary tables
+    // are unaffected -- see regionWorkBudgetNotTrippedByLegitSmallTable.
+    //
+    // Trade-off (ACCEPTED): a lower budget truncates a dense LEGITIMATE --skip-text-urls page sooner
+    // (Result.truncated = true, that page's tables simply missing their region-filled text) than the
+    // old 20,000,000 would have. This is the deliberate, documented cost of closing the matched-glyph
+    // DoS without re-introducing the duplicate-draw text-correctness regression: this fallback only
+    // runs in opt-in --skip-text-urls mode, and a capacity cap that degrades visibly (truncated) is a
+    // strictly better failure mode than one that silently garbles cell text or risks the hard-halt
+    // watchdog killing the whole job.
+    static final long MAX_REGION_WORK = 13_000_000;
     // FIX 4: caps splitComponent/tryCuts' OWN recursion depth (distinct from MAX_SPLIT_WORK,
     // which bounds total work but not stack depth), mirroring the depth>64 convention used by
     // every other recursive walk in this class (collectByType/collectGlyphs/resolveElementPage).
@@ -1210,12 +1246,20 @@ final class TableExtractor {
      * registered regions geometrically overlap (so a single glyph matches many of them at once)
      * multiplies that per-glyph cost well beyond what the flat "glyphs x cells" work formula assumes,
      * which is what let a ~100-cell / ~2,000,000-matching-glyph page take 20-33s despite the work
-     * counter itself topping out at exactly {@code MAX_REGION_WORK}. {@link #fillCellsByRegion} now
-     * disables duplicate-overlapping-text suppression on this instance (cell text extraction has no
-     * need for it), and {@link #MAX_REGION_WORK} itself is lowered so that the remaining per-match
-     * cost -- which this class cannot make exactly uniform with the non-match cost, only cheaper --
-     * still keeps the worst case well under the hard-halt window even when every charged work-unit
-     * happens to be a real match.
+     * counter itself topping out at exactly {@code MAX_REGION_WORK}.
+     *
+     * <p>round-5 follow-up (THIS fix -- see {@link #MAX_REGION_WORK}'s doc for the full
+     * re-calibration): round 4's response to the above was to disable
+     * duplicate-overlapping-text suppression on this instance to make the per-match cost cheaper.
+     * That traded away CORRECTNESS: a cell whose text is drawn twice at the identical position (a
+     * common non-hostile fake-bold-via-redraw / redundant-text-layer generator pattern, not just a
+     * hostile one) came back character-interleaved-garbled once suppression was off, because {@code
+     * setSortByPosition(true)} sorts the two identically-positioned runs together with nothing left
+     * to collapse them back into one copy. Suppression is restored to its default (ON) here --
+     * fixing that correctness regression -- and {@link #MAX_REGION_WORK} is instead recalibrated
+     * (lowered) to keep the matched-glyph DoS bounded under the NOW-more-expensive (suppression-ON)
+     * per-match cost, so the work budget alone -- not a cheaper-but-wrong per-glyph path -- is what
+     * closes this DoS.
      */
     private static final class RegionStripper extends PDFTextStripperByArea {
         private final long glyphBudget;
@@ -1261,13 +1305,27 @@ final class TableExtractor {
      * "R\n3C\n1"). Verified empirically: identical region, same characters matched, only this
      * flag differs between the broken and clean output.
      *
-     * <p>round-4: {@code setSuppressDuplicateOverlappingText(false)} -- see {@link
-     * #MAX_REGION_WORK}'s and {@link RegionStripper}'s docs for the full matched-glyph DoS this
-     * closes. Cell-text extraction has no need for cross-call duplicate-overlapping-text
-     * suppression (each region is read back independently via {@link
-     * PDFTextStripperByArea#getTextForRegion}, not merged into one running document-wide
-     * transcript), so disabling it costs nothing correctness-wise while removing a real per-matched-
-     * glyph TreeMap/TreeSet cost that the work budget's calibration didn't account for.
+     * <p>round-4 (REVERTED by round-5, see below): a prior version of this method called {@code
+     * area.setSuppressDuplicateOverlappingText(false)} here, reasoning that cell-text extraction
+     * has no need for cross-call duplicate-overlapping-text suppression (each region is read back
+     * independently via {@link PDFTextStripperByArea#getTextForRegion}, not merged into one running
+     * document-wide transcript) -- so disabling it should cost nothing correctness-wise while
+     * removing a real per-matched-glyph TreeMap/TreeSet cost the work budget's calibration hadn't
+     * accounted for. That reasoning MISSED a real correctness case: a cell whose text is drawn
+     * TWICE at the IDENTICAL (x, y) position (fake-bold-via-redraw / redundant text layers -- a
+     * common NON-hostile PDF-generator pattern) relies on {@code
+     * suppressDuplicateOverlappingText}'s dedup to collapse the two runs back into one copy; with
+     * it off, {@code setSortByPosition(true)} above instead sorts the two identically-positioned
+     * runs into an interleaved character stream ("TToottaall" instead of "Total") -- REPRODUCED by
+     * {@code TableLatticeTest#duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled}.
+     *
+     * <p>round-5 (THIS fix): correctness wins. Suppression is left at its {@code
+     * PDFTextStripperByArea} default (ON) -- the {@code setSuppressDuplicateOverlappingText(false)}
+     * call above is REMOVED. The matched-glyph DoS round 4 was closing is instead bounded by {@link
+     * #MAX_REGION_WORK} alone, recalibrated (lowered) against the real, now-restored suppression-ON
+     * per-match cost -- see that constant's doc for the full measurement sweep and the accepted
+     * capacity trade-off (a lower budget truncates a dense legitimate page sooner, but never garbles
+     * text and never risks the hard-halt watchdog).
      */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
         fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_REGION_WORK);
@@ -1301,7 +1359,6 @@ final class TableExtractor {
 
         RegionStripper area = new RegionStripper(glyphBudget, workBudget);
         area.setSortByPosition(true);
-        area.setSuppressDuplicateOverlappingText(false);
         for (int ti = 0; ti < tables.size(); ti++) {
             List<CellRect> comp = tables.get(ti);
             for (int ci = 0; ci < comp.size(); ci++) {

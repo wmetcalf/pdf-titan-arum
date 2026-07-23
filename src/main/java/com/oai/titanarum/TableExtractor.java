@@ -1358,10 +1358,45 @@ final class TableExtractor {
             fillCellsByRegion(kept, page, result);
         }
 
+        renderKeptTables(pageNum, kept, result);
+    }
+
+    /**
+     * Build + render each kept lattice component into a {@link TableHit} and append it to {@code
+     * result.tables}, isolating one component's render failure from its siblings. Package-private
+     * (split out of {@link #extractLatticePage}, mirroring {@link #selectKeptTables}'s own split)
+     * so tests can drive it directly with a synthetic component list, without needing PDF/ruling
+     * geometry.
+     *
+     * <p>round-3 follow-up (post-FIX-B): buildTable/renderViews must be isolated PER TABLE here,
+     * mirroring {@link #selectKeptTables}'s own FIX-3 pattern. renderViews' defense-in-depth
+     * grid-product guard (added by FIX B) can throw {@link RulingOverflowException} for a
+     * component that already cleared selectKeptTables' cell-count ({@link #MAX_CELLS_PER_TABLE})
+     * and split-work ({@link #MAX_SPLIT_WORK}) gates -- a sparse/pathological shape whose
+     * clustered rowCount*colCount product still exceeds MAX_CELLS_PER_TABLE even though neither
+     * of THOSE gates caught it (REPRODUCED: kept.size()=2, one legit 2x2 component + one
+     * pathological ~200-cell diagonal clustering into a 200x200 grid; without this per-table
+     * catch, only 1 of the 2 tables reached result.tables -- a legit table ordered AFTER the
+     * pathological one in {@code kept} was silently lost too, with only a generic
+     * Result.truncated=true). Skip just the offending table (flagging truncated) and keep
+     * rendering the rest, the same isolation selectKeptTables already applies to splitComponent's
+     * own RulingOverflowException.
+     *
+     * <p>No catch(StackOverflowError) here (unlike selectKeptTables' splitComponent isolation):
+     * buildTable/renderViews do not recurse -- placeGrid/isCoherentPlacement/renderViews are all
+     * flat loops over the already-clustered grid -- so there is no analogous deep-recursion
+     * source to guard against in this loop.
+     */
+    static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result) {
         for (List<CellRect> comp : kept) {
-            TableHit t = buildTable(pageNum, comp, "lattice");
-            renderViews(t);
-            result.tables.add(t);
+            try {
+                TableHit t = buildTable(pageNum, comp, "lattice");
+                renderViews(t);
+                result.tables.add(t);
+            } catch (RulingOverflowException e) {
+                result.truncated = true;
+                System.err.println("WARNING: table render skipped on page " + pageNum + " (grid-product cap)");
+            }
         }
     }
 
@@ -1504,6 +1539,13 @@ final class TableExtractor {
             if (t == null) continue;                          // degenerate, or cap-rejected (result.truncated
                                                                // already set inside buildTaggedTable) -- lattice
                                                                // may still run for a degenerate page
+            // No per-table try/catch needed here (unlike extractLatticePage's render loop, see its
+            // own comment on that fix): buildTaggedTable's own grid-product guard (FIX B) already
+            // rejects an oversized grid by RETURNING NULL (handled by the `t == null` continue
+            // above), not by throwing -- so renderViews' defense-in-depth RulingOverflowException
+            // guard can never trip for a `t` that reaches this point (t.rowCount*t.colCount was
+            // already checked against the SAME MAX_CELLS_PER_TABLE bound, using the SAME
+            // rowCount/colCount values, before buildTaggedTable ever returned this TableHit).
             tablesPerPage.merge(pageNum, 1, Integer::sum);
             renderViews(t);
             result.tables.add(t);

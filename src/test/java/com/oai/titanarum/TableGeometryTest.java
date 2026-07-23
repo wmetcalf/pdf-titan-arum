@@ -586,6 +586,68 @@ class TableGeometryTest {
         assertFalse(result.truncated);
     }
 
+    // --------------------------------------------------- round-3 follow-up: render loop isolation
+
+    /**
+     * ~200 CellRects placed diagonally (cell i spans {@code [i*10, i*10+10]} on BOTH axes):
+     * clusters into a 200x200 grid (product 40,000 &gt; MAX_CELLS_PER_TABLE=10,000) while {@code
+     * comp.size()}=200 stays far under MAX_CELLS_PER_TABLE and rowCount*colCount (40,000) stays
+     * far under MAX_SPLIT_WORK (20,000,000) -- this clears BOTH of selectKeptTables' own gates
+     * (cell-count, split-work) cleanly (every cell's row/colSpan is exactly 1, so splitComponent's
+     * hasAnySpan fast-path returns immediately without a costly search); only renderViews'
+     * defense-in-depth grid-product guard (FIX B) catches it.
+     */
+    private static List<TableExtractor.CellRect> diagonalGridProductBomb() {
+        int n = 200;
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            cells.add(cellRect(i * 10f, i * 10f, i * 10f + 10f, i * 10f + 10f));
+        }
+        return cells;
+    }
+
+    @Test
+    void renderKeptTablesIsolatesGridProductCapFromOthers() {
+        // round-3 follow-up reproducer: renderViews' defense-in-depth grid-product guard (FIX B)
+        // can throw RulingOverflowException from what was, pre-fix, an UNGUARDED per-table render
+        // loop inside extractLatticePage (buildTable -> renderViews -> result.tables.add) --
+        // unlike selectKeptTables' own splitComponent isolation (FIX 3) above, that loop had no
+        // per-table try/catch, so the exception unwound the WHOLE loop, silently dropping every
+        // table ordered AFTER the offending one too (REPRODUCED: kept.size()=2, one pathological
+        // ~200-cell diagonal ordered FIRST + one legit 3x3 table ordered AFTER it -> 0 tables
+        // survived, the legit one lost as pure collateral damage, with only a generic
+        // Result.truncated=true). The fixed renderKeptTables must isolate the failure to just the
+        // offending component and keep rendering its siblings.
+        List<List<TableExtractor.CellRect>> kept = new ArrayList<>();
+        kept.add(diagonalGridProductBomb());
+        kept.add(plain3x3Grid());
+
+        TableExtractor.Result result = new TableExtractor.Result();
+        TableExtractor.renderKeptTables(1, kept, result);
+
+        assertEquals(1, result.tables.size(),
+                "the legit 3x3 table (ordered AFTER the grid-product-cap-tripping component) must survive: "
+                        + result.tables);
+        TableExtractor.TableHit t = result.tables.get(0);
+        assertEquals(3, t.rowCount);
+        assertEquals(3, t.colCount);
+        assertTrue(result.truncated, "the grid-product-cap-rejected table must set Result.truncated");
+    }
+
+    @Test
+    void renderKeptTablesStillWorksWithNoAdversarialComponent() {
+        // Regression guard: the ordinary (no adversarial component) case must behave exactly as
+        // before -- all good components rendered, nothing truncated.
+        List<List<TableExtractor.CellRect>> kept = new ArrayList<>();
+        for (int t = 0; t < 3; t++) kept.add(plain3x3Grid());
+
+        TableExtractor.Result result = new TableExtractor.Result();
+        TableExtractor.renderKeptTables(1, kept, result);
+
+        assertEquals(3, result.tables.size());
+        assertFalse(result.truncated);
+    }
+
     // --------------------------------------------------------- FIX 4: splitComponent depth cap
 
     /**

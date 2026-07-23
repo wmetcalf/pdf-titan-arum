@@ -414,7 +414,7 @@ def _summary_fields(report: dict) -> dict[str, Any]:
     # counts of high-signal arrays (cheap triage)
     for arr in ("urls", "javascript", "launchActions", "actions", "embeddedFiles",
                 "jsIndicators", "structuralAnomalies", "streamLengthAnomalies",
-                "metadataSpoofingIndicators", "formFields"):
+                "metadataSpoofingIndicators", "formFields", "tables"):
         n = len(report.get(arr, []) or [])
         if n:
             fields[f"n_{_snake(arr)}"] = n

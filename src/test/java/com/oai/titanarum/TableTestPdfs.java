@@ -114,6 +114,40 @@ final class TableTestPdfs {
     }
 
     /**
+     * PR re-review P1 reproducer: the SAME 3x3 ruled grid/cell text as {@link #ruled3x3}, plus a
+     * single {@link org.apache.pdfbox.pdmodel.interactive.pagenavigation.PDThreadBead} (set via
+     * {@link PDPage#setThreadBeads}, i.e. a real {@code /B} thread-bead array on the page) whose
+     * rectangle is {@code beadRect}. Article threads are a legal PDF structure an attacker can
+     * include on any page; {@code PDFTextStripper} (base class of
+     * {@code TableExtractor.PositionCollectingStripper}) defaults {@code shouldSeparateByBeads}
+     * to TRUE and, when true, routes any glyph whose (x,y) falls inside a bead's rectangle into
+     * an article slot OTHER than index 0 -- exercising that routing is the entire point of this
+     * fixture.
+     */
+    static void ruled3x3WithBead(Path file, PDRectangle beadRect) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) line(cs, x, 700, x, 610);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+            }
+            org.apache.pdfbox.pdmodel.interactive.pagenavigation.PDThreadBead bead =
+                    new org.apache.pdfbox.pdmodel.interactive.pagenavigation.PDThreadBead();
+            bead.setRectangle(beadRect);
+            bead.setPage(page);
+            page.setThreadBeads(java.util.List.of(bead));
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * PR re-review, round 2 reproducer: the SAME 3x3 ruled grid as {@link #ruled3x3} (same
      * geometry, same cell text), except every border is drawn via {@link #curveLine} (the {@code
      * c} operator with collinear controls) instead of {@link #line} ({@code m}/{@code l}). Proves

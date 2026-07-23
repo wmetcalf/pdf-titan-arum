@@ -1411,6 +1411,20 @@ final class TableExtractor {
         PositionCollectingStripper(long glyphBudget, int rotation, float unrotatedW, float unrotatedH,
                                     float bx0, float by0, float bx1, float by1) throws IOException {
             super();
+            // PR re-review P1: PDFTextStripper's constructor initializes shouldSeparateByBeads
+            // to TRUE (confirmed by bytecode: iconst_1; putfield shouldSeparateByBeads) -- the
+            // opposite of what an earlier version of this class's doc claimed. Left at the base
+            // class's default, a page whose /B thread-bead array covers this region's glyphs
+            // would have the base class route those glyphs into article slots OTHER than index
+            // 0: collected() (which only reads charactersByArticle.get(0)) would silently omit
+            // them (dropped cell text), AND the glyph-budget check below -- which also only
+            // inspects charactersByArticle.get(0).size() -- would never see them accumulate,
+            // letting bead-contained glyphs grow WITHOUT BOUND in the other slots and bypassing
+            // MAX_REGION_GLYPHS entirely (heap-exhaustion DoS). Disabling bead separation here
+            // routes every glyph into the single article (index 0) regardless of /B, closing
+            // both the correctness gap and the cap bypass at once; we have no use for
+            // article-thread ordering when we're just bucketing cell text by position anyway.
+            setShouldSeparateByBeads(false);
             this.glyphBudget = glyphBudget;
             this.rotation = rotation;
             this.unrotatedW = unrotatedW;
@@ -1419,9 +1433,13 @@ final class TableExtractor {
         }
 
         /** The positions retained so far -- valid to call any time, including after {@code
-         * processPage} returns normally OR throws {@link RulingOverflowException}. {@code
-         * shouldSeparateByBeads} defaults to false, so the base class only ever populates a single
-         * article (index 0). */
+         * processPage} returns normally OR throws {@link RulingOverflowException}. The
+         * constructor explicitly calls {@code setShouldSeparateByBeads(false)} (the base {@code
+         * PDFTextStripper} constructor actually defaults it to TRUE), so the base class only ever
+         * populates a single article (index 0) regardless of any {@code /B} thread-bead array on
+         * the page -- otherwise bead-contained glyphs would land in a different article slot,
+         * be silently missing from {@code collected()}, and never be counted by the glyph-budget
+         * check in {@link #processTextPosition}. */
         List<TextPosition> collected() {
             return charactersByArticle.isEmpty() ? List.of() : charactersByArticle.get(0);
         }

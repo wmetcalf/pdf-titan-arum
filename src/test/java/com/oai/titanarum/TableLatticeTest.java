@@ -440,6 +440,70 @@ class TableLatticeTest {
     }
 
     @Test
+    void fillCellsByRegionCollectsBeadContainedCellText() throws Exception {
+        // PR re-review P1 (correctness): PositionCollectingStripper (the --skip-text-urls
+        // region-fill fallback) never called setShouldSeparateByBeads(false). PDFTextStripper's
+        // own constructor defaults shouldSeparateByBeads to TRUE (confirmed by bytecode --
+        // NOT false, despite what an earlier version of this class's doc claimed), so on a page
+        // carrying a legal PDThreadBead article-thread structure, the base class routes any
+        // glyph whose (x,y) falls inside the bead's rectangle into an article slot OTHER than
+        // index 0 -- but collected() only ever reads charactersByArticle.get(0), silently
+        // dropping that cell's text. This fixture's bead rectangle covers exactly cell (row 2,
+        // col 2) -- x in [150,250], y in [640,670], matching "R2C2"'s own cell bounds -- so only
+        // that cell's glyphs are diverted; every other cell's text stays in article 0 either way,
+        // isolating the dropped cell precisely.
+        Path pdf = tmp.resolve("beadcell.pdf");
+        TableTestPdfs.ruled3x3WithBead(pdf, new PDRectangle(150, 640, 100, 30));
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertFalse(r.truncated);
+            assertEquals(1, r.tables.size(),
+                    "sanity: an article-thread bead must not otherwise disturb table detection: " + r.tables);
+            TableExtractor.TableHit t = r.tables.get(0);
+            assertEquals(List.of(
+                    List.of("R1C1", "R1C2", "R1C3"),
+                    List.of("R2C1", "R2C2", "R2C3"),
+                    List.of("R3C1", "R3C2", "R3C3")), t.rows,
+                    "bead-contained cell text (\"R2C2\", inside the PDThreadBead's rectangle) "
+                            + "must not be dropped: " + t.rows);
+        }
+    }
+
+    @Test
+    void fillCellsByRegionGlyphBudgetCountsBeadContainedGlyphs() throws Exception {
+        // PR re-review P1 (DoS / cap-bypass companion to the correctness test above):
+        // PositionCollectingStripper.processTextPosition's glyph-budget check tests ONLY
+        // charactersByArticle.get(0).size() against glyphBudget. Pre-fix, with a bead rectangle
+        // covering the WHOLE page, EVERY real glyph on this fixture is routed into an article
+        // slot OTHER than 0 -- article 0 stays permanently empty, so "0 >= glyphBudget" never
+        // holds no matter how small glyphBudget is pinned: MAX_REGION_GLYPHS is silently
+        // bypassed and the RETAINED (article-!=0) glyphs would grow WITHOUT BOUND on a real
+        // hostile page. Pinning glyphBudget to 3 (via the package-private explicit-budget
+        // overload, mirroring fillCellsByRegionGlyphWorkIsBudgeted above) against this fixture's
+        // dozen-odd real glyphs makes the bypass deterministic without needing a real
+        // multi-million-glyph fixture.
+        Path pdf = tmp.resolve("beadbudget.pdf");
+        TableTestPdfs.ruled3x3WithBead(pdf, PDRectangle.LETTER); // bead covers the entire page
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            PDPage page = doc.getPage(0);
+            List<TableExtractor.CellRect> comp = new ArrayList<>();
+            for (int i = 0; i < 5; i++) {
+                TableExtractor.CellRect c = new TableExtractor.CellRect();
+                c.x0 = 0; c.y0 = 0; c.x1 = 400; c.y1 = 800; // overlaps every real glyph
+                comp.add(c);
+            }
+            List<List<TableExtractor.CellRect>> tables = List.of(comp);
+            TableExtractor.Result result = new TableExtractor.Result();
+            assertThrows(TableExtractor.RulingOverflowException.class,
+                    () -> TableExtractor.fillCellsByRegion(tables, page, result, 3L),
+                    "a glyph count exceeding MAX_REGION_GLYPHS (here pinned to 3) must throw even "
+                            + "when every real glyph on the page falls inside a PDThreadBead's "
+                            + "rectangle -- the cap must count bead-contained glyphs instead of "
+                            + "letting them silently accumulate, uncapped, in an article slot != 0");
+        }
+    }
+
+    @Test
     void regionGlyphBombIsBoundedNotBufferedOrOOMed() throws Exception {
         // round-3 regression reproducer, adapted for round 6: a small-on-disk, one-page PDF (a
         // single Flate-compressed (AAAA...) Tj) carrying 6,000,000 glyphs, run through the

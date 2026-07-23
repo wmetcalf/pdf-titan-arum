@@ -374,6 +374,68 @@ final class TableTestPdfs {
     }
 
     /**
+     * PR review P1 (CRITICAL) reproducer: a page with ONE legit 1-cell tagged table (Table -> TR ->
+     * TD, MCID 0, text "OK") PLUS a huge run of {@code bombGlyphCount} repeated, structure-
+     * UNREFERENCED glyphs elsewhere in the SAME content stream -- no BDC/EMC wrapper, no MCID, never
+     * pointed at by any kid of the structure tree. Written as a single raw (Flate-compressed, like
+     * {@link #manyGlyphsOnePage}) content stream so the bomb's on-disk size stays tiny regardless of
+     * {@code bombGlyphCount}.
+     *
+     * <p>extractTagged's pagesToProcess/firstCellPage gating only filters a table by PAGE NUMBER
+     * before glyphsFor ever runs -- it does not (and, short of walking the content stream first,
+     * cannot cheaply) bound how much OTHER marked content an in-scope page carries. Once the legit
+     * TD's own MCID-0 lookup triggers glyphsFor's one-per-page {@code
+     * PDFMarkedContentExtractor.processPage(page)} walk, that walk processes the ENTIRE page content
+     * stream in one pass -- including this structure-unreferenced bomb -- regardless of MCID
+     * boundaries.
+     */
+    static void taggedWithUnreferencedGlyphBomb(Path file, int bombGlyphCount) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            org.apache.pdfbox.pdmodel.PDResources resources = new org.apache.pdfbox.pdmodel.PDResources();
+            resources.put(COSName.getPDFName("F1"), HELV);
+            page.setResources(resources);
+
+            org.apache.pdfbox.cos.COSStream cosStream = doc.getDocument().createCOSStream();
+            try (java.io.OutputStream os = cosStream.createOutputStream(COSName.FLATE_DECODE)) {
+                // Legit 1-cell tagged table content: MCID 0, the ONLY marked content referenced by
+                // the structure tree below.
+                os.write("/TD << /MCID 0 >> BDC BT /F1 12 Tf 60 700 Td (OK) Tj ET EMC "
+                        .getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+                // Structure-unreferenced glyph bomb: no BDC/EMC wrapper, no MCID, never pointed at
+                // by the structure tree at all -- yet still walked by the same processPage() call.
+                os.write("BT /F1 12 Tf 60 650 Td (".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+                byte[] chunk = new byte[1 << 16];
+                java.util.Arrays.fill(chunk, (byte) 'A');
+                int remaining = bombGlyphCount;
+                while (remaining > 0) {
+                    int n = Math.min(chunk.length, remaining);
+                    os.write(chunk, 0, n);
+                    remaining -= n;
+                }
+                os.write(") Tj ET".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+            }
+            page.getCOSObject().setItem(COSName.CONTENTS, cosStream);
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(page);
+            cell.getCOSObject().setInt(COSName.K, 0); // kid = bare MCID 0 -- the ONLY structure reference
+            tr.appendKid(cell);
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * A tagged 1x1 table (one TD, MCID 0) whose text is wrapped in {@code nestDepth} nested,
      * untagged "Span" BDC/EMC marked-content blocks in the content stream -- exercising
      * flattenMarkedContent's recursive walk over a deeply nested {@code PDMarkedContent} tree

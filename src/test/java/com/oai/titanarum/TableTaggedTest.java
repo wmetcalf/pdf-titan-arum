@@ -292,6 +292,48 @@ class TableTaggedTest {
     }
 
     @Test
+    void taggedMarkedContentGlyphBombIsBoundedNotQuadratic() throws Exception {
+        // PR review P1 (CRITICAL, confirmed by an independent probe) reproducer: glyphsFor's
+        // `PDFMarkedContentExtractor ex = new PDFMarkedContentExtractor(); ex.processPage(page);`
+        // had NO glyph cap, NO work budget, and NO interrupt check -- the only unbounded stage left
+        // in this class. PDFMarkedContentExtractor's own processTextPosition (suppression ON, the
+        // default) buckets every glyph by its unicode character and linearly scans that bucket
+        // before appending -- O(bucket size) per glyph, O(n^2) total for N glyphs sharing one
+        // repeated character.
+        //
+        // The fixture below places ONE legit 1-cell tagged table (Table -> TR -> TD, MCID 0) plus a
+        // huge run of repeated, structure-UNREFERENCED glyphs elsewhere in the SAME content stream.
+        // extractTagged's pagesToProcess/firstCellPage gating only filters a table by PAGE NUMBER
+        // before glyphsFor ever runs -- it does not bound how much OTHER marked content an
+        // in-scope page carries -- so the legit table's own MCID-0 lookup still triggers a full
+        // walk of the whole page, including the unreferenced bomb.
+        //
+        // 300,000 repeated glyphs is far past MAX_TAGGED_WORK's measured worst-case crossover
+        // (~24,500 glyphs for a single repeated character, ~226,000 for the worst realistic
+        // multi-character shape -- see that constant's doc), so BudgetedMarkedContentExtractor's
+        // work budget must trip well before the bomb is fully consumed, bounding wall-clock
+        // deterministically rather than racing the 15s hard-halt watchdog. Before this fix: N=100,000
+        // took ~14.7s and N=300,000 scales quadratically well past a minute (measured directly
+        // against unbounded PDFMarkedContentExtractor while calibrating this fix) -- this assertion
+        // is on the DETERMINISTIC cap/truncated outcome, not a wall-time race, so it stays robust
+        // regardless of machine speed.
+        Path pdf = tmp.resolve("taggedbomb.pdf");
+        int bombGlyphCount = 300_000;
+        TableTestPdfs.taggedWithUnreferencedGlyphBomb(pdf, bombGlyphCount);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            long start = System.nanoTime();
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+            assertTrue(elapsedMs < 5_000,
+                    "the marked-content glyph/work cap must bound this deterministically, not "
+                            + "process the whole 300,000-glyph bomb: took " + elapsedMs + "ms");
+            assertTrue(r.truncated,
+                    "the tagged path's marked-content cap trip must set Result.truncated");
+        }
+    }
+
+    @Test
     void nestedTaggedTableDoesNotLeakIntoOuter() throws Exception {
         Path pdf = tmp.resolve("nested.pdf");
         TableTestPdfs.taggedNested(pdf);

@@ -127,6 +127,72 @@ final class TableExtractor {
     // TableLatticeTest#regionGlyphBombIsBoundedNotBufferedOrOOMed}'s updated doc for the actual
     // child-JVM heap this round's fixture needed).
     static final int MAX_REGION_GLYPHS = 2_000_000;
+    // PR review P1 (CRITICAL, reproduced end-to-end): glyphsFor's `PDFMarkedContentExtractor ex =
+    // new PDFMarkedContentExtractor(); ex.processPage(page);` had NO glyph cap, NO work budget, and
+    // NO interrupt check -- the ONLY unbounded stage left in this class. Worse than a linear memory
+    // bomb: PDFMarkedContentExtractor.processTextPosition, with suppressDuplicateOverlappingText ON
+    // (the default -- see MAX_TAGGED_WORK's doc for why it must STAY on), buckets every glyph into a
+    // Map<character-string, List<TextPosition>> keyed SOLELY by the glyph's unicode character (not
+    // by position) and does a full LINEAR SCAN of that bucket on every glyph before appending to it
+    // -- an O(bucket size) inner scan per glyph, so N glyphs sharing one repeated character cost
+    // O(N) work N times over = O(N^2) total, on top of the unbounded memory every retained glyph
+    // already costs. REPRODUCED (this fix's own measurement, real PDFMarkedContentExtractor,
+    // -Xmx4g, single repeated character): N=50,000 -> 3.3s; N=100,000 -> 14.7s; N=150,000 -> 34.2s
+    // (quadratic; matches the PR review's own independently-measured N=100,000/15.16s and
+    // N=300,000/169.7s figures). A page with ~2,000,000 such glyphs (the same order of magnitude
+    // the region path's MAX_REGION_GLYPHS already bounds to a sub-second throw) would run for
+    // roughly an hour single-core here, past the 15s hard-halt watchdog that then kills the whole
+    // worker JVM via Runtime.halt(3) instead of a graceful truncate.
+    //
+    // FIX: {@link BudgetedMarkedContentExtractor} wraps glyphsFor's PDFMarkedContentExtractor call,
+    // overriding processTextPosition to enforce BOTH bounds below BEFORE delegating to super,
+    // mirroring the region path's PositionCollectingStripper (memory cap) + MAX_TEXTFILL_WORK-style
+    // (CPU cap) pairing, adapted to marked-content extraction's different cost shape:
+    //
+    // MEMORY -- MAX_TAGGED_GLYPHS: caps the TextPositions retained from one page's marked-content
+    // pass. Kept as a DISTINCT constant from MAX_REGION_GLYPHS (same value, same "how many
+    // TextPositions can this page safely retain" semantics) rather than reused outright, because
+    // the tagged path's extractor is memoized ONE PER PAGE across every MCID lookup on that page
+    // (a different cache lifecycle than the region path's one-shot-per-page-fill use) -- keeping it
+    // a separate named constant lets either be retuned independently without an unrelated coupling.
+    static final int MAX_TAGGED_GLYPHS = 2_000_000;
+    // CPU bound for glyphsFor (see MAX_TAGGED_GLYPHS immediately above for the memory side of this
+    // same fix). PDFMarkedContentExtractor DOES expose a public setSuppressDuplicateOverlappingText
+    // (false) setter that would remove the O(n^2) scan entirely -- but this project already tried
+    // exactly that trade for the closely analogous region-fill path (commit f095959) and REVERTED
+    // it (commit 6d5bf8e) once it was shown to garble genuinely duplicate-drawn cell text
+    // (fake-bold-via-redraw / redundant text layers -- a common NON-hostile PDF-generator pattern,
+    // not just a hostile one): with suppression off, two identically-positioned character runs
+    // interleave into garbage ("TToottaall" instead of "Total") instead of collapsing to one
+    // correct copy. PDFMarkedContentExtractor's dedup is the SAME bucketed-by-character,
+    // linear-scanned mechanism (just against a plain List instead of PDFTextStripperByArea's
+    // TreeMap/TreeSet), so disabling it here would reintroduce the identical correctness
+    // regression for tagged cell text. Suppression is left ON (the default); instead, {@link
+    // BudgetedMarkedContentExtractor} tracks its OWN Map<String, Long> of per-character counts,
+    // mirroring the base class's real bucket key (text.getUnicode()) exactly, and charges `work` by
+    // the CURRENT count for that glyph's character before forwarding it to super. Summed over every
+    // glyph, this equals Sum_c(n_c*(n_c-1)/2) -- the EXACT total the base class's own O(bucket)
+    // scan performs -- so this budget bounds the TRUE aggregate cost regardless of how an attacker
+    // distributes repeats across one or many characters. (A coarser "charge by total glyph count"
+    // formula was considered and rejected: it would also throttle a legitimate page with thousands
+    // of DIVERSE characters and no actual hot bucket, purely because of its raw glyph count.)
+    //
+    // Calibrated by direct measurement (this fix, -Xmx4g, real PDFMarkedContentExtractor wrapped by
+    // BudgetedMarkedContentExtractor): a single repeated character (the mathematically worst
+    // concentration for a fixed glyph count) trips this budget at ~24,500 glyphs in ~0.4s. The
+    // worst REALISTIC shape found -- 91 distinct characters (the practical ceiling for one
+    // single-byte/WinAnsiEncoding-style font -- PDF string-literal syntax reserves 3 of the 94
+    // printable-ASCII codes), cycled so every character's own bucket still grows large -- trips it
+    // at ~226,000 glyphs in ~1.4s: worse than the single-character case (more DISTINCT retained
+    // TextPosition/bookkeeping objects accumulate before the same aggregate dedup-scan cost is
+    // reached) but still comfortably under this doc's ~3s target and the 15s hard-halt watchdog,
+    // with real headroom left for a more exotic (e.g. embedded multi-byte CID font) attack to do
+    // somewhat worse. MAX_TAGGED_GLYPHS remains an independent backstop for the opposite shape
+    // (extreme character DIVERSITY keeping every bucket -- and so this work budget -- cheap, but
+    // total glyph COUNT unbounded): baseline per-glyph cost with dedup entirely disabled (i.e.
+    // zero-cost bucket scans) measured at ~150ms for 2,000,000 glyphs, so the glyph cap alone stays
+    // fast even if an attacker defeats this work budget via extreme diversity.
+    static final long MAX_TAGGED_WORK = 300_000_000;
     // FIX 4: caps splitComponent/tryCuts' OWN recursion depth (distinct from MAX_SPLIT_WORK,
     // which bounds total work but not stack depth), mirroring the depth>64 convention used by
     // every other recursive walk in this class (collectByType/collectGlyphs/resolveElementPage).
@@ -1566,17 +1632,27 @@ final class TableExtractor {
                 continue; // per-page cap already met -- drop further tables for this page
             }
 
-            TableHit t = buildTaggedTable(trs, earlyPage, pageNum, mcidCache, pageNumbers, pagesToProcess, result);
+            // PR review P1 fix: buildTaggedTable's own grid-product guard (FIX B) rejects an
+            // oversized grid by RETURNING NULL (handled by the `t == null` continue below), not by
+            // throwing -- but resolveCellText/collectGlyphs/glyphsFor CAN now throw
+            // RulingOverflowException (MAX_TAGGED_GLYPHS / MAX_TAGGED_WORK, see those constants'
+            // docs) when this table's own cells' marked content is hostile. Isolate that failure to
+            // just THIS table element -- flag truncated and move on to the next one -- mirroring
+            // selectKeptTables'/renderKeptTables' own per-component isolation on the lattice path,
+            // rather than letting one hostile table element's cap trip unwind this whole loop and
+            // silently drop every other (possibly perfectly legitimate) tagged table already found.
+            TableHit t;
+            try {
+                t = buildTaggedTable(trs, earlyPage, pageNum, mcidCache, pageNumbers, pagesToProcess, result);
+            } catch (RulingOverflowException e) {
+                result.truncated = true;
+                System.err.println("WARNING: tagged table skipped on page " + pageNum
+                        + " (marked-content glyph/work cap)");
+                continue;
+            }
             if (t == null) continue;                          // degenerate, or cap-rejected (result.truncated
                                                                // already set inside buildTaggedTable) -- lattice
                                                                // may still run for a degenerate page
-            // No per-table try/catch needed here (unlike extractLatticePage's render loop, see its
-            // own comment on that fix): buildTaggedTable's own grid-product guard (FIX B) already
-            // rejects an oversized grid by RETURNING NULL (handled by the `t == null` continue
-            // above), not by throwing -- so renderViews' defense-in-depth RulingOverflowException
-            // guard can never trip for a `t` that reaches this point (t.rowCount*t.colCount was
-            // already checked against the SAME MAX_CELLS_PER_TABLE bound, using the SAME
-            // rowCount/colCount values, before buildTaggedTable ever returned this TableHit).
             tablesPerPage.merge(pageNum, 1, Integer::sum);
             renderViews(t);
             result.tables.add(t);
@@ -1864,6 +1940,46 @@ final class TableExtractor {
         }
     }
 
+    /**
+     * Budgeted subclass of {@link PDFMarkedContentExtractor} used by {@link #glyphsFor} to close
+     * the PR review P1 DoS -- see {@link #MAX_TAGGED_GLYPHS}/{@link #MAX_TAGGED_WORK}'s docs for
+     * the full writeup of the O(n^2) this bounds and why the fix is a work-charge rather than
+     * {@code setSuppressDuplicateOverlappingText(false)}.
+     *
+     * <p>Overrides {@code processTextPosition(TextPosition)} -- the same low-level hook {@link
+     * PositionCollectingStripper} overrides on the region path, for the identical reason: it runs
+     * BEFORE any of the base class's own per-glyph bookkeeping (the expensive O(bucket) dedup
+     * scan, and the {@code currentMarkedContents.peek().addText(text)} retention), so both bounds
+     * below are enforced before that cost is paid for the OFFENDING glyph, not after.
+     */
+    private static final class BudgetedMarkedContentExtractor extends PDFMarkedContentExtractor {
+        private final long glyphBudget;
+        private final long workBudget;
+        private long retained = 0;
+        private long work = 0;
+        // Per-character retained count, mirroring the base class's OWN characterListMapping
+        // bucket key (text.getUnicode()) exactly -- see MAX_TAGGED_WORK's doc for why this must
+        // track the REAL bucket sizes, not merely the total glyph count.
+        private final Map<String, Long> charCounts = new HashMap<>();
+
+        BudgetedMarkedContentExtractor(long glyphBudget, long workBudget) {
+            this.glyphBudget = glyphBudget;
+            this.workBudget = workBudget;
+        }
+
+        @Override
+        protected void processTextPosition(TextPosition text) {
+            if (retained >= glyphBudget) throw new RulingOverflowException(); // MEMORY cap
+            String ch = text.getUnicode();
+            long bucket = charCounts.getOrDefault(ch, 0L);
+            work += bucket; // cost of the O(bucket) scan super.processTextPosition is about to do
+            if (work > workBudget) throw new RulingOverflowException(); // CPU cap
+            charCounts.put(ch, bucket + 1);
+            retained++;
+            super.processTextPosition(text); // base class's own dedup (kept ON) applies from here
+        }
+    }
+
     private static List<TextPosition> glyphsFor(PDPage page, int mcid,
                                                 Map<PDPage, Map<Integer, List<TextPosition>>> cache,
                                                 Map<PDPage, Integer> pageNumbers,
@@ -1877,9 +1993,21 @@ final class TableExtractor {
         if (byMcid == null) {
             byMcid = new HashMap<>();
             taggedProcessPageCalls++;
-            PDFMarkedContentExtractor ex = new PDFMarkedContentExtractor();
-            ex.processPage(page);
-            for (PDMarkedContent mc : ex.getMarkedContents()) flattenMarkedContent(mc, byMcid, 0);
+            BudgetedMarkedContentExtractor ex =
+                    new BudgetedMarkedContentExtractor(MAX_TAGGED_GLYPHS, MAX_TAGGED_WORK);
+            try {
+                ex.processPage(page);
+                for (PDMarkedContent mc : ex.getMarkedContents()) flattenMarkedContent(mc, byMcid, 0);
+            } catch (RulingOverflowException e) {
+                // Cache the (empty) result so a hostile page's cap trip is paid ONCE per page, not
+                // once per cell/table that shares it -- every other cell/table resolving against
+                // this SAME page will hit this cached empty map and just get "no glyphs found"
+                // rather than re-walking (and re-failing against) the content stream. Still
+                // propagate so the FIRST caller (buildTaggedTable, via extractTagged's per-table
+                // catch) can flag Result.truncated for the table whose resolution triggered this.
+                cache.put(page, byMcid);
+                throw e;
+            }
             cache.put(page, byMcid);
         }
         return byMcid.getOrDefault(mcid, List.of());

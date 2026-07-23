@@ -295,6 +295,44 @@ public class OpenAiAnalyzer {
             }
         }
 
+        // Tables — table-borne payloads (fake wire/routing/fee grids) must be visible to the AI.
+        // Bounded: a hostile PDF can carry up to 50 tables/page across many pages, so we cap both
+        // the number of tables emitted and the total chars spent on them.
+        if (report.tables != null && !report.tables.isEmpty()) {
+            final int maxTables = 5;
+            final int perTableCharCap = 800;
+            final int totalCharBudget = 4000;
+            sb.append("\n=== TABLES (").append(report.tables.size()).append(") ===\n");
+            int emitted = 0;
+            int budgetUsed = 0;
+            boolean omitted = false;
+            for (var t : report.tables) {
+                if (emitted >= maxTables || budgetUsed >= totalCharBudget) {
+                    omitted = true;
+                    break;
+                }
+                sb.append("  [table on page ").append(t.page).append(", method ").append(t.extractionMethod)
+                  .append(", ").append(t.rowCount).append("x").append(t.colCount).append("]\n");
+                if (t.markdown != null) {
+                    int remaining = totalCharBudget - budgetUsed;
+                    int cap = Math.min(perTableCharCap, remaining);
+                    boolean truncated = t.markdown.length() > cap;
+                    String snippet = t.markdown.substring(0, Math.min(cap, t.markdown.length()));
+                    sb.append(snippet);
+                    if (truncated) sb.append("…[truncated]");
+                    sb.append("\n");
+                    budgetUsed += snippet.length();
+                }
+                emitted++;
+            }
+            if (omitted || emitted < report.tables.size()) {
+                sb.append("  ... and ").append(report.tables.size() - emitted).append(" more tables (omitted for length)\n");
+            }
+            if (Boolean.TRUE.equals(report.tablesTruncated)) {
+                sb.append("  (table extraction hit safety caps; list may be incomplete)\n");
+            }
+        }
+
         // JavaScript
         if (report.javascript != null && !report.javascript.isEmpty()) {
             sb.append("\n=== JAVASCRIPT (").append(report.javascript.size()).append(" scripts) ===\n");

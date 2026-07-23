@@ -185,6 +185,48 @@ final class TableTestPdfs {
         }
     }
 
+    /**
+     * Two independently-ruled 2x2 tables whose cell geometry genuinely OVERLAPS: table A is a 2x2
+     * grid (x in {50,250,450}, y in {600,650,700}), and table B is a SEPARATE, smaller 2x2 grid
+     * (x in {100,150,200}, y in {660,675,690}) nested entirely inside A's own (row0,col0) cell
+     * (x[50,250] y[650,700]), with enough margin that none of B's ruling coordinates fall on any
+     * of A's (and vice versa) -- so {@code intersects()} never fires between A's and B's rulings
+     * (verified: A's own gridlines never enter B's coordinate range on either axis, and B's
+     * gridlines never enter A's), and {@code groupIntoTables} keeps them as two separate
+     * components rather than merging them. A single glyph ("X") is drawn at a point that falls
+     * inside BOTH table A's (row0,col0) cell AND table B's (row0,col0) cell -- the round-6
+     * reproducer for the confirmed correctness bug where a glyph inside more than one overlapping
+     * cell region used to be silently retained by only ONE of them.
+     */
+    static void nestedOverlappingTables(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                // Table A: 2x2 grid, x in {50,250,450}, y in {600,650,700}.
+                for (float y : new float[]{600, 650, 700}) line(cs, 50, y, 450, y);
+                for (float x : new float[]{50, 250, 450}) line(cs, x, 600, x, 700);
+                text(cs, 260, 660, "A01");
+                text(cs, 60, 610, "A10");
+                text(cs, 260, 610, "A11");
+                // Table B: nested 2x2 grid entirely inside A's (row0,col0) cell = x[50,250]
+                // y[650,700], at x in {100,150,200}, y in {660,675,690} -- chosen so neither
+                // table's ruling coordinates fall inside the other's coordinate range on either
+                // axis, so their rulings never cross.
+                for (float y : new float[]{660, 675, 690}) line(cs, 100, y, 200, y);
+                for (float x : new float[]{100, 150, 200}) line(cs, x, 660, x, 690);
+                text(cs, 160, 680, "B01");
+                text(cs, 105, 663, "B10");
+                text(cs, 160, 663, "B11");
+                // The shared glyph: inside BOTH A's (row0,col0) cell (x[50,250] y[650,700]) AND
+                // B's (row0,col0) cell (x[100,150] y[675,690]).
+                text(cs, 105, 680, "X");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
     /** Same content as {@link #ruled3x3}, but with the page's /Rotate set to the given degrees. */
     static void rotatedRuled3x3(Path file, int rotationDegrees) throws IOException {
         try (PDDocument doc = new PDDocument()) {

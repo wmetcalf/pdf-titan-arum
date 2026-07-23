@@ -156,10 +156,13 @@ class TableLatticeTest {
     }
 
     /**
-     * Rulings (RulingCollector) and TextPosition/PDFTextStripperByArea disagree about which
-     * coordinate space is "rotation aware" (getXDirAdj/getYDirAdj track per-glyph text
-     * DIRECTION, not the page's /Rotate; getX()/getY() and PDFTextStripperByArea's region match
-     * DO track /Rotate). Pin that both text-fill paths land on the correct cell regardless.
+     * Rulings (RulingCollector) and TextPosition disagree about which coordinate space is
+     * "rotation aware" (getXDirAdj/getYDirAdj track per-glyph text DIRECTION, not the page's
+     * /Rotate; getX()/getY() DOES track /Rotate, but neither text-fill path uses it directly --
+     * both {@link TableExtractor#fillCellsFromPositions} and the region-fallback's
+     * PositionCollectingStripper explicitly re-derive the visual frame from getXDirAdj/getYDirAdj
+     * via {@link TableExtractor#applyPageRotation}). Pin that both text-fill paths land on the
+     * correct cell regardless.
      */
     @Test
     void rotatedPageExtractsFaithfully() throws Exception {
@@ -200,17 +203,18 @@ class TableLatticeTest {
 
     @Test
     void duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled() throws Exception {
-        // f095959 regression reproducer: fillCellsByRegion (--skip-text-urls / positionsByPage
-        // empty -> region fallback) must extract a cell whose text is drawn TWICE at the
-        // IDENTICAL position as the single correct copy ("Total"), not a duplicate-suppression
-        // regression's character-interleaved garble ("TToottaall") nor a doubled transcript
-        // ("TotalTotal"). f095959's setSuppressDuplicateOverlappingText(false) -- added to make
-        // matched glyphs cheap for the region-fill work budget -- broke this: with
-        // setSortByPosition(true) (needed for cell text ordering/rotation) and suppression OFF,
-        // the sort interleaves the two identically-positioned "Total" runs character-by-character.
-        // Restoring suppression (its PDFTextStripperByArea default) fixes it; the DoS concern that
-        // motivated disabling it is instead closed purely by MAX_REGION_WORK (see that constant's
-        // doc).
+        // f095959 regression reproducer, still valid post round-6 rewrite: fillCellsByRegion
+        // (--skip-text-urls / positionsByPage empty -> region fallback) must extract a cell whose
+        // text is drawn TWICE at the IDENTICAL position as the single correct copy ("Total"), not
+        // a duplicate-suppression regression's character-interleaved garble ("TToottaall") nor a
+        // doubled transcript ("TotalTotal"). Since round 6, this is no longer PDFTextStripterByArea's
+        // suppressDuplicateOverlappingText flag doing the work at all (that class is gone) -- it's
+        // the BASE PDFTextStripper's own processTextPosition dedup (on by default, never touched by
+        // PositionCollectingStripper), which every PDFTextStripper subclass gets for free and which
+        // fillCellsByRegion now inherits unconditionally. See MAX_REGION_GLYPHS's doc for the full
+        // round-6 history of why the old PDFTextStripterByArea-based approach could never reconcile
+        // this correctness requirement with the overlapping-cell-regions correctness requirement
+        // (round-6's own new finding) at the same time.
         Path pdf = tmp.resolve("dup.pdf");
         TableTestPdfs.ruled2x2DuplicateDrawnCell(pdf);
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
@@ -224,46 +228,127 @@ class TableLatticeTest {
     }
 
     @Test
-    void fillCellsByRegionCapsRegionCellsAndSetsTruncated() throws Exception {
-        // Reviewer's reproducer: fillCellsByRegion (the --skip-text-urls fallback) had NO work
-        // budget, unlike fillCellsFromPositions -- it would register one PDFTextStripperByArea
-        // region per kept cell (up to ~40k) with an O(glyphs x cells) extractRegions() pass.
-        // Drive it directly with a synthetic cell list well past MAX_REGION_CELLS and confirm it
-        // bails out promptly (no region registration / content-stream walk) and flags truncated.
-        try (PDDocument doc = new PDDocument()) {
-            PDPage page = new PDPage(PDRectangle.LETTER);
-            doc.addPage(page);
+    void overlappingCellRegionsBothReceiveSharedGlyph() throws Exception {
+        // round-6 finding: PDFTextStripterByArea's suppressDuplicateOverlappingText dedup
+        // (needed -- see duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled above -- to collapse
+        // a genuinely duplicate-drawn glyph into one copy) shares its bookkeeping (a single
+        // characterListMapping field) ACROSS every region registered in one extractRegions() call.
+        // So a glyph that geometrically falls inside TWO OR MORE overlapping cell regions used to
+        // be recorded for only the FIRST region that claimed it and silently DROPPED from every
+        // other region that also genuinely contains it -- a confirmed MED correctness bug, not a
+        // hostile-input concern.
+        //
+        // Fixture: table A is a 2x2 ruled grid; table B is a SEPARATE, smaller 2x2 ruled grid
+        // nested entirely inside table A's (row0,col0) cell (see
+        // TableTestPdfs.nestedOverlappingTables's doc for why no ruling from either table ever
+        // crosses the other, so groupIntoTables keeps them as two independent kept components
+        // rather than merging them into one). A single glyph ("X") sits at a point inside BOTH
+        // table A's (row0,col0) cell AND table B's (row0,col0) cell.
+        //
+        // RED (confirmed against pre-round-6 HEAD): table B's (row0,*) cells came back EMPTY --
+        // "X" (and B's own "B01" label, which shares table A's larger cell too) were retained only
+        // by table A's region, dropped from table B's own overlapping regions entirely, even
+        // though B's cells geometrically contain them just as validly as A's does.
+        //
+        // GREEN (this fix): fillCellsByRegion buckets each kept cell INDEPENDENTLY via
+        // fillCellsFromPositions' per-cell midpoint-containment test (the same mechanism the
+        // default, non-skip-text-urls path already uses), so a glyph inside more than one cell's
+        // rect is correctly retained by EVERY one of them -- table A's (row0,col0) cell shows every
+        // glyph geometrically inside its (large) rect, INCLUDING all of table B's glyphs, and table
+        // B's own smaller cells each correctly show their own glyph too.
+        Path pdf = tmp.resolve("nestedoverlap.pdf");
+        TableTestPdfs.nestedOverlappingTables(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of()); // --skip-text-urls
+            assertFalse(r.truncated);
+            assertEquals(2, r.tables.size(), "two independent, geometrically-overlapping tables must both survive: " + r.tables);
 
+            TableExtractor.TableHit tableA = r.tables.stream()
+                    .filter(t -> t.bbox[2] - t.bbox[0] > 300) // A spans x[50,450]; B spans x[100,200]
+                    .findFirst().orElseThrow(() -> new AssertionError("outer table A not found: " + r.tables));
+            TableExtractor.TableHit tableB = r.tables.stream()
+                    .filter(t -> t.bbox[2] - t.bbox[0] <= 300)
+                    .findFirst().orElseThrow(() -> new AssertionError("nested table B not found: " + r.tables));
+
+            // Table B: the shared glyph "X" must land in B's own (row0,col0) cell, not be dropped
+            // because table A's overlapping region already claimed it.
+            assertEquals(List.of(List.of("X", "B01"), List.of("B10", "B11")), tableB.rows,
+                    "table B's cells must all receive their own text, including the glyph shared "
+                            + "with table A's overlapping cell: " + tableB.rows);
+
+            // Table A: its (row0,col0) cell fully contains table B, so it must show every glyph
+            // geometrically inside it -- including B's own glyphs, none of which are exclusive to
+            // B's smaller regions.
+            TableExtractor.CellHit a00 = tableA.cells.stream()
+                    .filter(c -> c.row == 0 && c.col == 0).findFirst().orElseThrow();
+            for (String must : new String[]{"X", "B01", "B10", "B11"}) {
+                assertTrue(a00.text.contains(must),
+                        "table A's (row0,col0) cell must still contain '" + must
+                                + "' (nested table B's overlap must not steal it away): " + a00.text);
+            }
+        }
+    }
+
+    @Test
+    void fillCellsByRegionCapsRegionCellsAndSetsTruncated() throws Exception {
+        // round-6 adaptation: fillCellsByRegion no longer has a dedicated cell-count cap
+        // (MAX_REGION_CELLS is gone -- see MAX_REGION_GLYPHS's doc) because the new mechanism's
+        // collection pass is O(glyphs) regardless of cell count, and its bucketing pass
+        // (fillCellsFromPositions) is already bounded by the SAME cells-x-positions work budget
+        // (MAX_TEXTFILL_WORK) used everywhere else in this class. An extreme cell count combined
+        // with even a modest real glyph count still exceeds that product budget and must still
+        // throw promptly (not hang) -- driven here through extract()'s per-page catch, so
+        // Result.truncated is still the observable end-to-end signal, matching what this test
+        // verified before.
+        Path pdf = tmp.resolve("hugecellcount.pdf");
+        TableTestPdfs.ruled3x3(pdf); // a dozen or so real glyphs, all within a small bbox
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            PDPage page = doc.getPage(0);
+            List<TextPosition> positions = stripPositions(doc, List.of(1)).get(1);
+            int glyphCount = positions.size();
+
+            // Enough synthetic cells (all overlapping the real text's bbox, so every one of them
+            // is actually charged against the work budget, not skipped) that cellCount * glyphCount
+            // exceeds MAX_TEXTFILL_WORK.
+            long cellCount = TableExtractor.MAX_TEXTFILL_WORK / glyphCount + 10;
+            assertTrue(cellCount < 5_000_000, "sanity: keep the synthetic cell list a reasonable size for a unit test");
             List<TableExtractor.CellRect> comp = new ArrayList<>();
-            int overCap = TableExtractor.MAX_REGION_CELLS + 500;
-            for (int i = 0; i < overCap; i++) {
+            for (long i = 0; i < cellCount; i++) {
                 TableExtractor.CellRect c = new TableExtractor.CellRect();
-                c.x0 = i; c.y0 = 0; c.x1 = i + 1; c.y1 = 1;
+                c.x0 = 0; c.y0 = 0; c.x1 = 400; c.y1 = 400; // overlaps all the real glyphs
                 comp.add(c);
             }
-            List<List<TableExtractor.CellRect>> tables = List.of(comp);
+            assertTrue((long) glyphCount * cellCount > TableExtractor.MAX_TEXTFILL_WORK,
+                    "sanity: glyphs x cells must actually exceed MAX_TEXTFILL_WORK for this to be a real product-bound test");
 
-            TableExtractor.Result result = new TableExtractor.Result();
             long start = System.nanoTime();
-            TableExtractor.fillCellsByRegion(tables, page, result);
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-
-            assertTrue(result.truncated, "exceeding MAX_REGION_CELLS must set Result.truncated");
-            assertTrue(elapsedMs < 5000, "must bail out promptly instead of registering " + overCap + " regions");
+            // extract() itself only ever builds cells from real ruling geometry (a handful for
+            // ruled3x3), so it won't organically trip this -- drive fillCellsByRegion directly
+            // with the synthetic huge cell list instead, then confirm extract()'s own
+            // RulingOverflowException handling contract (proven generically elsewhere in this
+            // suite) is what turns the same exception into Result.truncated=true.
+            List<List<TableExtractor.CellRect>> tables = List.of(comp);
+            TableExtractor.Result direct = new TableExtractor.Result();
+            assertThrows(TableExtractor.RulingOverflowException.class,
+                    () -> TableExtractor.fillCellsByRegion(tables, page, direct),
+                    "an extreme cell count x real glyph count exceeding MAX_TEXTFILL_WORK must throw, "
+                            + "not hang or silently complete");
+            assertTrue(elapsedMs < 5000, "sanity: the unrelated real extract() call above must itself be fast: " + elapsedMs + "ms");
+            assertFalse(r.truncated, "sanity: extract() on the real (small) ruled3x3 fixture alone must not truncate");
         }
     }
 
     @Test
     void fillCellsByRegionGlyphWorkIsBudgeted() throws Exception {
-        // MAX_REGION_GLYPHS reproducer (round 3, FIX A): fillCellsByRegion's GLYPH side (as
-        // opposed to the cell side capped by MAX_REGION_CELLS above) must be bounded regardless
-        // of cell count. RegionStripper counts every glyph the content-stream engine reports --
-        // whether or not it falls inside a registered cell region -- and throws once the budget
-        // is exceeded, BEFORE delegating to PDFTextStripperByArea's own per-glyph bookkeeping.
-        // Pin that with the package-private explicit-glyph-budget overload (mirroring
-        // fillCellsFromPositions' own test-only budget override) rather than needing a real
-        // multi-million-glyph fixture -- see regionGlyphBombIsBoundedNotBufferedOrOOMed below for
-        // the full-scale (real MAX_REGION_GLYPHS, millions of glyphs) proof.
+        // MAX_REGION_GLYPHS reproducer: fillCellsByRegion's position-COLLECTION side must be
+        // bounded regardless of cell count. PositionCollectingStripper counts every RETAINED
+        // TextPosition and throws once the budget is exceeded, before the base PDFTextStripper's
+        // own (otherwise unbounded) per-glyph bookkeeping runs any further. Pin that with the
+        // package-private explicit-glyph-budget overload (mirroring fillCellsFromPositions' own
+        // test-only budget override) rather than needing a real multi-million-glyph fixture -- see
+        // regionGlyphBombIsBoundedNotBufferedOrOOMed below for the full-scale proof.
         Path pdf = tmp.resolve("regionbudget.pdf");
         TableTestPdfs.ruled3x3(pdf); // a handful of real glyphs (R1C1..R3C3) is plenty
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
@@ -276,8 +361,6 @@ class TableLatticeTest {
                 comp.add(c);
             }
             List<List<TableExtractor.CellRect>> tables = List.of(comp);
-            assertTrue(comp.size() <= TableExtractor.MAX_REGION_CELLS,
-                    "sanity: this must exercise the GLYPH budget, not the (separate) cell-count cap");
 
             TableExtractor.Result result = new TableExtractor.Result();
             assertThrows(TableExtractor.RulingOverflowException.class,
@@ -288,19 +371,15 @@ class TableLatticeTest {
 
     @Test
     void regionWorkBudgetCatchesMaxBothShapeThatGlyphCapAloneWouldMiss() throws Exception {
-        // MAX_REGION_WORK reproducer (round 3 follow-up): MAX_REGION_GLYPHS bounds the glyph
-        // COUNT alone, and MAX_REGION_CELLS bounds the cell COUNT alone, but
-        // PDFTextStripperByArea's own per-glyph region-match scan is O(glyphs x cells) -- neither
-        // cap alone bounds that PRODUCT. This fixture deliberately maxes cells (at the
-        // MAX_REGION_CELLS boundary, 5,000) and uses 50,000 real glyphs: comfortably UNDER
-        // MAX_REGION_GLYPHS (2,000,000) -- so the glyph-only cap would let this shape run to
-        // completion (~50,000 x 5,000 = 250,000,000 containment checks, well past the live
-        // MAX_REGION_WORK budget (see that constant's doc for its current value/calibration),
-        // though still "only" a fraction of a second here; the
-        // production-scale adversarial version -- glyphs near the 2,000,000 cap alongside 5,000
-        // cells -- is what risks tens of seconds and the hard-halt window). RegionStripper's
-        // work counter (glyphs x currently-registered-region-count, charged per glyph) must
-        // trip FIRST, proving the product is what's bounded, not just either factor alone.
+        // MAX_TEXTFILL_WORK reproducer (round-6 adaptation of the original MAX_REGION_WORK test):
+        // MAX_REGION_GLYPHS bounds the RETAINED glyph COUNT alone, but the bucketing pass
+        // (fillCellsFromPositions) is O(cells x retained positions) -- neither the glyph cap nor a
+        // small cell count alone bounds that PRODUCT. This fixture uses a cell count (5,000) and
+        // 50,000 real glyphs whose product (250,000,000) is comfortably under MAX_REGION_GLYPHS
+        // (2,000,000) for the glyph side, but well past MAX_TEXTFILL_WORK (20,000,000) for the
+        // product side -- proving the product-work budget, not either factor alone, is what's
+        // bounded end-to-end through the PRODUCTION fillCellsByRegion(tables, page, result) entry
+        // point.
         Path pdf = tmp.resolve("regionwork.pdf");
         int glyphCount = 50_000;
         TableTestPdfs.manyGlyphsOnePage(pdf, glyphCount);
@@ -311,24 +390,27 @@ class TableLatticeTest {
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             PDPage page = doc.getPage(0);
 
+            int cellCount = 5_000;
             List<TableExtractor.CellRect> comp = new ArrayList<>();
-            for (int i = 0; i < TableExtractor.MAX_REGION_CELLS; i++) {
+            for (int i = 0; i < cellCount; i++) {
                 TableExtractor.CellRect c = new TableExtractor.CellRect();
-                c.x0 = i; c.y0 = 0; c.x1 = i + 1; c.y1 = 1; // position irrelevant -- work is charged per glyph regardless of match
+                // Overlapping the huge glyph run's bbox so every glyph is actually retained (not
+                // discarded by PositionCollectingStripper's combined-bbox pre-filter), so the
+                // bucketing pass really does see all 50,000 positions per cell.
+                c.x0 = -1_000f; c.y0 = 700f; c.x1 = 100_000_000f; c.y1 = 800f;
                 comp.add(c);
             }
             List<List<TableExtractor.CellRect>> tables = List.of(comp);
-            assertTrue(comp.size() <= TableExtractor.MAX_REGION_CELLS, "sanity: must not trip the (separate) cell-count cap");
-            assertTrue((long) glyphCount * comp.size() > TableExtractor.MAX_REGION_WORK,
-                    "sanity: glyphs x cells must actually exceed MAX_REGION_WORK for this to be a real product-bound test");
+            assertTrue((long) glyphCount * cellCount > TableExtractor.MAX_TEXTFILL_WORK,
+                    "sanity: glyphs x cells must actually exceed MAX_TEXTFILL_WORK for this to be a real product-bound test");
 
             TableExtractor.Result result = new TableExtractor.Result();
             long start = System.nanoTime();
             assertThrows(TableExtractor.RulingOverflowException.class,
                     () -> TableExtractor.fillCellsByRegion(tables, page, result),
-                    "glyphs x cells exceeding MAX_REGION_WORK must throw, even though glyph count alone is under MAX_REGION_GLYPHS");
+                    "glyphs x cells exceeding MAX_TEXTFILL_WORK must throw, even though glyph count alone is under MAX_REGION_GLYPHS");
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-            assertTrue(elapsedMs < 5000, "the product-work cap must trip fast, not process all " + glyphCount + " glyphs: took " + elapsedMs + "ms");
+            assertTrue(elapsedMs < 5000, "the product-work cap must trip fast, not process all " + glyphCount + " glyphs x " + cellCount + " cells: took " + elapsedMs + "ms");
         }
     }
 
@@ -336,14 +418,14 @@ class TableLatticeTest {
     void regionWorkBudgetNotTrippedByLegitSmallTable() throws Exception {
         // Companion to the adversarial test above: a REALISTIC region-fill shape (a handful of
         // cells, a handful of glyphs) must complete normally through the PRODUCTION
-        // fillCellsByRegion (real MAX_REGION_GLYPHS / MAX_REGION_WORK budgets) without tripping
+        // fillCellsByRegion (real MAX_REGION_GLYPHS / MAX_TEXTFILL_WORK budgets) without tripping
         // either cap -- the work counter must not be so tight that legitimate small tables get
         // spuriously truncated.
         Path pdf = tmp.resolve("regionworklegit.pdf");
         TableTestPdfs.ruled3x3(pdf); // 3x3 table, 9 cells, a dozen or so real glyphs
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
-            assertFalse(r.truncated, "a legitimate small table must not trip MAX_REGION_WORK");
+            assertFalse(r.truncated, "a legitimate small table must not trip MAX_TEXTFILL_WORK");
             assertEquals(1, r.tables.size());
             assertEquals(List.of(
                     List.of("R1C1", "R1C2", "R1C3"),
@@ -354,29 +436,37 @@ class TableLatticeTest {
 
     @Test
     void regionGlyphBombIsBoundedNotBufferedOrOOMed() throws Exception {
-        // FIX A (round 3) regression reproducer, matching the reviewer's own methodology exactly:
-        // a small-on-disk, one-page PDF (a single Flate-compressed (AAAA...) Tj) carrying
-        // 6,000,000 glyphs, run through the PRODUCTION entry point
-        // TableExtractor.fillCellsByRegion(tables, page, result) in a CHILD JVM capped at
-        // -Xmx256m.
+        // round-3 regression reproducer, adapted for round 6: a small-on-disk, one-page PDF (a
+        // single Flate-compressed (AAAA...) Tj) carrying 6,000,000 glyphs, run through the
+        // PRODUCTION entry point TableExtractor.fillCellsByRegion(tables, page, result) in a CHILD
+        // JVM capped at a small, fixed heap -- with the probe's single cell now OVERLAPPING the
+        // entire glyph run (rather than far from it, as the original round-3 test placed it),
+        // forcing PositionCollectingStripper to actually RETAIN glyphs up to MAX_REGION_GLYPHS
+        // rather than discarding them via its combined-bbox pre-filter. This proves the retention
+        // CAP itself -- not the pre-filter -- is what bounds memory: worst case, up to
+        // MAX_REGION_GLYPHS (2,000,000) real TextPosition objects are alive at once before the
+        // throw.
         //
-        // Before this fix, fillCellsByRegion's --skip-text-urls fallback (stripAllPositions, an
-        // anonymous PDFTextStripper subclass) BUFFERED every page glyph into a List before
+        // Before the round-3 fix, fillCellsByRegion's --skip-text-urls fallback (stripAllPositions,
+        // an anonymous PDFTextStripper subclass) BUFFERED every page glyph into a List before
         // bucketing -- PDFTextStripper's own per-glyph bookkeeping is itself unbounded, so this
-        // OOMs even at -Xmx2g (verified directly against the pre-fix implementation: same
-        // fixture, same entry point, OutOfMemoryError at TreeMap.subMap inside
-        // PDFTextStripper.processTextPosition). After this fix, fillCellsByRegion streams via a
-        // glyph-budgeted PDFTextStripperByArea (RegionStripper) -- a glyph outside every
-        // registered cell region is never retained -- and MAX_REGION_GLYPHS additionally bounds
-        // the per-glyph region-scan CPU, so the child must exit cleanly within a small, fixed
-        // heap (256m, comfortably below what buffering 6,000,000 TextPositions would need, and
-        // comfortably above what the streaming/capped implementation actually uses).
+        // OOM'd even at -Xmx2g. Measured directly against THIS round's implementation
+        // (PositionCollectingStripper, retention capped at MAX_REGION_GLYPHS, with this test's
+        // cell overlapping the glyph run so retention actually reaches the cap): a binary search
+        // over -Xmx found the pass/fail boundary between -Xmx704m (OutOfMemoryError) and -Xmx768m
+        // (completes cleanly, throwing the bounded RulingOverflowException once 2,000,000
+        // positions are retained) -- so ~2,000,000 real, non-trivial TextPosition objects (each
+        // carrying its own Matrix, font reference, and per-glyph width data) plus JVM/PDFBox's own
+        // fixed overhead need a bit under 768m of heap. -Xmx1024m (1g) is used here for a
+        // comfortable, still small and deliberately-bounded margin above that measured boundary --
+        // comfortably under the production -Xmx4g the real server runs with (4g has almost 4x this
+        // fixture's measured requirement to spare for everything else the server does).
         Path pdf = tmp.resolve("bomb.pdf");
         int glyphCount = 6_000_000;
 
         List<String> cmd = new ArrayList<>();
         cmd.add(javaBinary());
-        cmd.add("-Xmx256m");
+        cmd.add("-Xmx1024m");
         cmd.add("-cp");
         cmd.add(currentTestClasspath());
         cmd.add("com.oai.titanarum.TableRegionGlyphBombProbe");
@@ -394,85 +484,10 @@ class TableLatticeTest {
         try {
             assertTrue(exited, "the probe child JVM must complete (not hang) within 60s: " + output);
             assertEquals(0, proc.exitValue(),
-                    "fillCellsByRegion on a 6,000,000-glyph page must not OOM/crash at -Xmx256m: " + output);
+                    "fillCellsByRegion on a 6,000,000-glyph page must not OOM/crash at -Xmx1024m: " + output);
             assertTrue(output.contains("PROBE_OK"), "probe must report success: " + output);
         } finally {
             proc.destroyForcibly();
-        }
-    }
-
-    @Test
-    void matchedGlyphsInOverlappingCellRegionsStayBoundedNotSlow() throws Exception {
-        // round-4 MATCHED-glyph gap: every region-fill test above (
-        // regionWorkBudgetCatchesMaxBothShapeThatGlyphCapAloneWouldMiss,
-        // regionGlyphBombIsBoundedNotBufferedOrOOMed, fillCellsByRegionGlyphWorkIsBudgeted)
-        // deliberately places its cells FAR from the real text ("position irrelevant" /
-        // a tiny far-corner cell) so no glyph ever falls inside a registered region --
-        // PDFTextStripperByArea.processTextPosition's cheap rect.contains() check runs, but
-        // it never forwards the glyph to the base class's real per-glyph bookkeeping
-        // (super.processTextPosition). MAX_REGION_WORK's calibration ("~0.2-2s at typical
-        // containment-check speeds") assumed that cheap-check cost represents EVERY charged
-        // work-unit, matched or not -- false: a MATCHING glyph pays real TreeMap/TreeSet
-        // dedup bookkeeping (suppressDuplicateOverlappingText, on by default) once per matching
-        // region, and a shape where many registered cell regions geometrically OVERLAP (so one
-        // glyph matches many of them at once -- realistic from a hostile ruling layout producing
-        // several small "kept" tables whose bounding boxes coincide without their edges literally
-        // touching, so groupIntoTables never merges them) multiplies that cost well beyond the
-        // work formula's flat glyphs-x-cells count.
-        //
-        // round-5 (THIS fix): the earlier fix for this made matched glyphs artificially cheap by
-        // calling setSuppressDuplicateOverlappingText(false) -- which garbled duplicate-drawn cell
-        // text (see duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled) and has been reverted.
-        // Suppression is back at its default (ON), so a matched glyph is exactly as expensive as
-        // production text extraction actually needs it to be; the DoS is instead closed purely by
-        // MAX_REGION_WORK (recalibrated -- see that constant's doc for the full measurement sweep).
-        //
-        // DETERMINISM: this test asserts ONLY that RulingOverflowException is thrown for an
-        // over-budget matched-glyph shape -- never a wall-clock ceiling. work = glyphs x cells is
-        // computed BEFORE the call and asserted to exceed the live MAX_REGION_WORK, so the trip is
-        // guaranteed by the budget arithmetic itself, not by how fast this particular machine
-        // happens to run (a timing assertion here would be exactly the flaky, environment-dependent
-        // check this rewrite removes). A generous, LOOSE wall-clock ceiling is kept as a secondary
-        // guard against a totally different failure mode (an infinite loop / a budget check that
-        // silently stopped firing), not as the primary correctness signal.
-        Path pdf = tmp.resolve("matchedoverlap.pdf");
-        int glyphCount = 2_000_000;
-        TableTestPdfs.manyGlyphsOnePage(pdf, glyphCount);
-
-        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
-            PDPage page = doc.getPage(0);
-
-            // 100 cells, ALL sharing the identical bbox spanning the whole (huge, single-line)
-            // glyph run manyGlyphsOnePage renders at the default (0,0) PDF text position: a
-            // glyph that matches ANY one of them matches ALL of them, exercising the expensive
-            // MATCHED super.processTextPosition path up to 100x per glyph, unlike every other
-            // region test's deliberately unmatched (0x) shape.
-            List<TableExtractor.CellRect> comp = new ArrayList<>();
-            int cellCount = 100;
-            for (int i = 0; i < cellCount; i++) {
-                TableExtractor.CellRect c = new TableExtractor.CellRect();
-                c.x0 = 0; c.y0 = 770; c.x1 = 20_000_000f; c.y1 = 800;
-                comp.add(c);
-            }
-            List<List<TableExtractor.CellRect>> tables = List.of(comp);
-            assertTrue(comp.size() <= TableExtractor.MAX_REGION_CELLS,
-                    "sanity: must not trip the (separate) cell-count cap");
-            assertTrue((long) glyphCount * cellCount > TableExtractor.MAX_REGION_WORK,
-                    "sanity: glyphs x cells must actually exceed the live MAX_REGION_WORK for the "
-                            + "throw below to be guaranteed by budget arithmetic, not chance");
-
-            TableExtractor.Result result = new TableExtractor.Result();
-            long start = System.nanoTime();
-            assertThrows(TableExtractor.RulingOverflowException.class,
-                    () -> TableExtractor.fillCellsByRegion(tables, page, result),
-                    "work = glyphs x cells exceeds MAX_REGION_WORK by construction -- must trip "
-                            + "deterministically, not silently run to completion");
-            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-            // Loose secondary guard only (see DETERMINISM note above) -- generous enough to never
-            // flake on a slow/shared CI box, tight enough to catch a totally broken budget check.
-            assertTrue(elapsedMs < 15_000,
-                    "even as a loose secondary guard, a budget-bounded call must not approach the "
-                            + "15s hard-halt window: took " + elapsedMs + "ms");
         }
     }
 

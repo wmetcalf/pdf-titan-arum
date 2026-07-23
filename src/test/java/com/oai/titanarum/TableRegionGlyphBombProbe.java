@@ -30,11 +30,12 @@ public final class TableRegionGlyphBombProbe {
 
         try (PDDocument doc = Loader.loadPDF(pdfPath.toFile())) {
             PDPage page = doc.getPage(0);
-            // One small cell, far from the default (0,0)-ish text-render position: exercises the
-            // real streaming region-strip pass (non-empty `tables`) while keeping matched-glyph
-            // retention at ~zero, proving memory stays flat regardless of the glyph count.
+            // A huge cell OVERLAPPING the entire glyph run (rather than far from it): this forces
+            // PositionCollectingStripper to actually RETAIN glyphs (up to MAX_REGION_GLYPHS) rather
+            // than discarding them via its combined-bbox pre-filter, proving the retention cap
+            // itself -- not the pre-filter -- is what bounds memory here.
             TableExtractor.CellRect cell = new TableExtractor.CellRect();
-            cell.x0 = 600; cell.y0 = 780; cell.x1 = 601; cell.y1 = 781;
+            cell.x0 = -1_000f; cell.y0 = 700f; cell.x1 = 100_000_000f; cell.y1 = 800f;
             List<List<TableExtractor.CellRect>> tables = List.of(List.of(cell));
             TableExtractor.Result result = new TableExtractor.Result();
             try {

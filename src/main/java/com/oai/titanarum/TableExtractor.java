@@ -19,7 +19,7 @@ import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedConte
 import org.apache.pdfbox.pdmodel.documentinterchange.taggedpdf.PDTableAttributeObject;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
 import org.apache.pdfbox.text.PDFMarkedContentExtractor;
-import org.apache.pdfbox.text.PDFTextStripperByArea;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
 
 import java.awt.geom.Point2D;
@@ -79,119 +79,54 @@ final class TableExtractor {
     // grid at that size completes in low hundreds of thousands of pair checks, comfortably under
     // 1% of this budget). Counts each touches() pair evaluation across the whole call.
     static final long MAX_GROUPING_WORK = 60_000_000;
-    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the CELL side: a
-    // hostile page whose kept-cell count (across every table combined) exceeds this cap must not
-    // register any PDFTextStripperByArea regions / walk the content stream at all; flag truncated
-    // and bail out promptly instead. See MAX_REGION_GLYPHS below for the companion GLYPH-side cap.
+    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the MEMORY side.
     //
-    // round-3 history: a prior round (FIX 2, ledger r9-region) replaced this method's original
-    // PDFTextStripperByArea-based region strip with an anonymous PDFTextStripper subclass
-    // (stripAllPositions) that BUFFERED every page glyph into a List before bucketing, to close
-    // an O(glyphs x cells) CPU concern on the glyph side (extractRegions() had no work budget at
-    // all). That rewrite introduced its own regression: PDFTextStripper's base-class per-glyph
-    // bookkeeping is unbounded, so a hostile page with millions of glyphs OOM'd building that
-    // list BEFORE any cell-side or work-side budget could bound anything (REPRODUCED: a
-    // 12,483-byte one-page PDF with 6,000,000 glyphs threw OutOfMemoryError at -Xmx2g via
-    // fillCellsByRegion, vs. ~3MB/562ms for the streaming PDFTextStripperByArea approach on the
-    // same file). This round reverts to the original streaming PDFTextStripperByArea approach
-    // (see RegionStripper) -- O(1)-ish memory, since a glyph outside every registered region
-    // never reaches the base class's per-glyph bookkeeping at all -- while ALSO closing the
-    // original CPU concern that motivated FIX 2, via MAX_REGION_GLYPHS (a hard glyph-count cap
-    // RegionStripper enforces BEFORE delegating to the base class), so neither regression can
-    // recur. This also restores the original region-overlap cell-assignment semantics (a glyph
-    // is in a cell when PDFTextStripperByArea's own /Rotate-aware rect.contains(getX(),getY())
-    // says so), rather than the FIX 2 rewrite's midpoint-containment reimplementation.
-    static final int MAX_REGION_CELLS = 5_000;
-    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the GLYPH side:
-    // RegionStripper (see below) counts every TextPosition the content-stream engine reports --
-    // regardless of whether it falls inside any registered cell region -- and throws once this
-    // cap is exceeded, BEFORE delegating to PDFTextStripperByArea's own (unbounded-per-glyph)
-    // bookkeeping. This is what closes the original FIX 2 CPU concern (O(glyphs x cells), no
-    // bound on glyphs) without reintroducing FIX 2's own buffer-the-whole-page memory regression:
-    // memory stays bounded because (a) unmatched glyphs are never retained past the containment
-    // check, and (b) even a pathological all-cells-overlap-every-glyph shape can retain at most
-    // MAX_REGION_GLYPHS matched positions total. 2,000,000 is comfortably above any legitimate
-    // page's real glyph count (a dense page of small type rarely reaches even tens of thousands)
-    // while still bounding per-page work to a finite, deterministic amount.
+    // round-6 (THIS fix, supersedes rounds 3-5 below): fillCellsByRegion no longer uses
+    // PDFTextStripterByArea at all. Rounds 3-5 (see the git history of this file) chased an
+    // inherent, unresolvable tension in that class: setSuppressDuplicateOverlappingText(true)
+    // (needed to collapse a cell whose text is drawn TWICE at the identical (x,y) -- a common
+    // fake-bold-via-redraw / redundant-text-layer generator pattern -- into one correct copy
+    // instead of a garbled interleave) shares its dedup bookkeeping (a single {@code
+    // characterListMapping} field) ACROSS every region registered in one {@code extractRegions()}
+    // call -- so a glyph that geometrically falls inside TWO OR MORE overlapping/nested cell
+    // regions (e.g. one table nested inside another table's cell) gets recorded for only the
+    // FIRST region that claims it and silently DROPPED from every other region that also
+    // genuinely contains it (REPRODUCED: {@code
+    // TableLatticeTest#overlappingCellRegionsBothReceiveSharedGlyph}). Turning suppression off
+    // fixes the overlap case but garbles the duplicate-draw case -- PDFTextStripterByArea cannot
+    // satisfy both at once, no matter how the two per-glyph work budgets (the since-removed
+    // MAX_REGION_CELLS / MAX_REGION_WORK) were tuned.
+    //
+    // Fix: stop using PDFTextStripterByArea's own region-matching entirely. Instead, {@link
+    // PositionCollectingStripper} makes ONE streaming pass collecting this page's TextPositions
+    // (benefiting for free from the dedup every {@code PDFTextStripper} subclass already gets
+    // from the BASE class's {@code processTextPosition} -- suppression there is keyed only by
+    // (character, x, y), not by which region is being read back, so it can't have the
+    // cross-region drop bug at all), then {@link #fillCellsFromPositions} -- the SAME
+    // midpoint-bucketing mechanism the default (non-skip-text-urls) path already uses -- buckets
+    // those positions into each cell INDEPENDENTLY, so overlapping/nested cells each correctly
+    // receive their own copy of a shared glyph.
+    //
+    // MAX_REGION_GLYPHS now bounds the number of TextPositions {@link PositionCollectingStripper}
+    // will RETAIN: {@code writeString} throws {@link RulingOverflowException} once the retained
+    // count would exceed this cap, before delegating to the base class's own per-glyph
+    // bookkeeping -- capping the list at a fixed size regardless of how many glyphs the page
+    // actually contains (closing the FIX-2-era OOM this constant has bounded since round 3: a
+    // 12,483-byte one-page PDF with 6,000,000 glyphs used to throw OutOfMemoryError at -Xmx2g).
+    // {@link PositionCollectingStripper} additionally discards (without counting against the
+    // budget) any position whose bucketing midpoint falls outside the combined bounding box of
+    // every cell being filled -- see that class's doc for why this can never exclude a glyph that
+    // could actually match a cell, only glyphs that provably can't.
+    //
+    // The CPU side no longer needs a dedicated region budget at all: collection is a single O(1)-
+    // per-glyph streaming pass (bounded in TOTAL retained count by this same cap), and the
+    // bucketing pass is {@link #fillCellsFromPositions}'s existing O(cells x positions) budget
+    // ({@link #MAX_TEXTFILL_WORK}) -- the same budget, same formula, same proven bound the default
+    // path has always relied on. 2,000,000 retained TextPositions comfortably fits the production
+    // -Xmx4g heap (measured: see {@code
+    // TableLatticeTest#regionGlyphBombIsBoundedNotBufferedOrOOMed}'s updated doc for the actual
+    // child-JVM heap this round's fixture needed).
     static final int MAX_REGION_GLYPHS = 2_000_000;
-    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the PRODUCT of the
-    // glyph and cell sides -- the load-bearing cap, mirroring MAX_TEXTFILL_WORK/MAX_FINDCELLS_WORK.
-    //
-    // round-3 follow-up: MAX_REGION_GLYPHS alone bounds only the glyph COUNT, and MAX_REGION_CELLS
-    // alone bounds only the cell COUNT, but PDFTextStripperByArea's own per-glyph region-match
-    // scan is O(glyphs x cells) -- maxing BOTH caps simultaneously (2,000,000 glyphs x 5,000
-    // cells) is ~10^10 cheap-but-nonzero region-containment checks in ONE uninterruptible
-    // extractRegions() call, which can run tens of seconds -- long enough to blow past the
-    // hard-halt watchdog's window and get the JVM killed by Runtime.halt, exactly the failure
-    // mode this whole cap hierarchy exists to prevent. Neither existing cap bounds the PRODUCT.
-    // RegionStripper (see below) charges {@code getRegions().size()} (the per-glyph cost: every
-    // glyph is tested against every currently-registered region) against this budget on EVERY
-    // glyph, and throws once it is exceeded -- BEFORE delegating to the base class's per-glyph
-    // work, so the actual cost incurred before bailing out is always <= MAX_REGION_WORK, not
-    // glyphs x cells.
-    //
-    // round-4 follow-up (SUPERSEDED, see round-5 below): 200,000,000 was calibrated assuming every
-    // charged work-unit costs about the same regardless of whether the glyph actually falls inside
-    // a region ("~0.2-2s at typical containment-check speeds"). That holds for a glyph that matches
-    // NO region -- PDFTextStripperByArea.processTextPosition's own {@code rect.contains(...)} check
-    // is cheap and uniform -- but is FALSE for a glyph that DOES match: PDFTextStripperByArea calls
-    // {@code super.processTextPosition(text)} (the base PDFTextStripper's real per-glyph
-    // bookkeeping) once per MATCHING region, and a shape where many registered cell regions
-    // geometrically OVERLAP (so one glyph matches many of them at once) multiplies that per-glyph
-    // cost well beyond what the flat "glyphs x cells" work formula assumes. REPRODUCED: ~100 kept
-    // cells whose registered regions geometrically OVERLAP one another with ~2,000,000 matching
-    // glyphs took 20-33s at the OLD 200,000,000 budget, comfortably past the 15s hard-halt window.
-    // round 4's fix disabled {@code setSuppressDuplicateOverlappingText} on this instance to make
-    // that per-match bookkeeping cheaper, and lowered this budget to 20,000,000 to compensate --
-    // but that traded CORRECTNESS for CPU: cell text that is drawn TWICE at the identical (x,y)
-    // (fake-bold-via-redraw, redundant text layers -- a common NON-hostile PDF-generator pattern,
-    // not just a hostile one) came back GARBLED ("TToottaall" instead of "Total") once suppression
-    // was off, because {@code setSortByPosition(true)} (needed for cell-text ordering / rotation)
-    // sorts the two identically-positioned runs into an interleaved character stream with nothing
-    // left to collapse them back together. See {@code
-    // TableLatticeTest#duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled} for the reproducer.
-    //
-    // round-5 (THIS fix): correctness wins. {@code setSuppressDuplicateOverlappingText(false)} is
-    // REMOVED -- fillCellsByRegion now runs with PDFTextStripperByArea's default (suppression ON),
-    // producing correct text for the duplicate-draw case above. The matched-glyph DoS this budget
-    // exists for is instead bounded by the work budget ALONE, recalibrated for the (now more
-    // expensive per match, thanks to the restored TreeMap/TreeSet dedup bookkeeping)
-    // suppression-ON cost.
-    //
-    // Measured directly against the fixed code (suppression back ON, setSortByPosition still ON),
-    // driving the PRODUCTION fillCellsByRegion (via the package-private (glyphBudget, workBudget)
-    // overload, glyphBudget pinned at the production MAX_REGION_GLYPHS) with the same
-    // fully-overlapping-cell-regions DoS shape as the round-4 repro (2,000,000 matching glyphs,
-    // real PDFBox-measured TextPositions from a real PDF, not synthetic ones), swept across cell
-    // counts {2, 10, 100, 1000, 5000 (= MAX_REGION_CELLS)} x candidate budgets, taking the WORST of
-    // several repeated runs per point to damp JIT/GC noise. The worst case at every budget tested
-    // fell at LOW cell counts (cells=10, not cells=2 or cells=5000) -- for cells=2 the real 2,000,000
-    // glyph feed itself becomes the binding constraint once budget/cellCount exceeds it (so higher
-    // budgets stop making cells=2 any slower), while cells=10 is exactly where "glyphs x cells" first
-    // reaches multi-million-work territory before the (fixed) glyph feed runs out, maximizing the
-    // number of expensive matched-and-forwarded glyphs actually processed before the throw:
-    //   budget=20,000,000 (old, unchanged from round 4): worst ~4.3s (cells=10)  -- ABOVE the ~3s
-    //     target with suppression back on, confirming suppression-ON is materially more expensive
-    //     per match than round 4's suppression-OFF calibration assumed.
-    //   budget=15,000,000: worst ~3.0-3.2s (cells=10) -- borderline/inconsistent across repeats.
-    //   budget=14,000,000: worst ~2.9-3.1s (cells=10) -- still borderline under repeated sampling.
-    //   budget=13,000,000: worst ~2.5-2.7s (cells=10), consistent across 8+ repeats -- comfortably
-    //     under the ~3s target with margin for measurement noise.
-    //   budget=12,000,000: worst ~2.4-2.5s (cells=10).
-    // 13,000,000 is chosen: the largest of the tested candidates whose measured worst case stays
-    // reliably under ~3s (not just on a lucky run), comfortably under the 15s hard-halt window even
-    // with normal environment variance. A legitimate page's real (glyphs x cells) product remains a
-    // tiny fraction of even this lowered budget (few cells, few thousand glyphs), so ordinary tables
-    // are unaffected -- see regionWorkBudgetNotTrippedByLegitSmallTable.
-    //
-    // Trade-off (ACCEPTED): a lower budget truncates a dense LEGITIMATE --skip-text-urls page sooner
-    // (Result.truncated = true, that page's tables simply missing their region-filled text) than the
-    // old 20,000,000 would have. This is the deliberate, documented cost of closing the matched-glyph
-    // DoS without re-introducing the duplicate-draw text-correctness regression: this fallback only
-    // runs in opt-in --skip-text-urls mode, and a capacity cap that degrades visibly (truncated) is a
-    // strictly better failure mode than one that silently garbles cell text or risks the hard-halt
-    // watchdog killing the whole job.
-    static final long MAX_REGION_WORK = 13_000_000;
     // FIX 4: caps splitComponent/tryCuts' OWN recursion depth (distinct from MAX_SPLIT_WORK,
     // which bounds total work but not stack depth), mirroring the depth>64 convention used by
     // every other recursive walk in this class (collectByType/collectGlyphs/resolveElementPage).
@@ -887,8 +822,8 @@ final class TableExtractor {
      * Collect candidate ruling segments from a page's content stream: stroked axis-aligned
      * segments plus thin filled rectangles (many generators draw rules as fills).
      * Output is in the page's VISUAL top-left-origin space, i.e. after applying /Rotate
-     * (see {@link #applyPageRotation}) -- the same frame {@code PDFTextStripperByArea} and
-     * {@code TextPosition.getX()/getY()} use, so rulings and text always share one frame.
+     * (see {@link #applyPageRotation}) -- the same frame {@code TextPosition.getX()/getY()}
+     * use, so rulings and text always share one frame.
      */
     static List<Ruling> collectRulings(PDPage page) throws IOException {
         RulingCollector rc = new RulingCollector(page);
@@ -901,9 +836,8 @@ final class TableExtractor {
      * post shiftX/flipY, which is also the frame {@code TextPosition.getXDirAdj()/getYDirAdj()}
      * always report in -- those track per-glyph text DIRECTION, not the page's /Rotate) into the
      * page's VISUAL top-left frame after applying /Rotate. This is derived to match PDFBox's own
-     * rotation-aware {@code TextPosition.getX()/getY()} (which IS keyed off page.getRotation(),
-     * and which {@code PDFTextStripperByArea} compares region rectangles against): verified by
-     * constructing a rotated fixture and printing getX()/getY() against the formula below for
+     * rotation-aware {@code TextPosition.getX()/getY()} (which IS keyed off page.getRotation()):
+     * verified by constructing a rotated fixture and printing getX()/getY() against the formula below for
      * r=90/180/270. {@code unrotatedW}/{@code unrotatedH} are the page's cropBox width/height
      * BEFORE any 90/270 visual swap.
      */
@@ -1203,176 +1137,165 @@ final class TableExtractor {
     }
 
     /**
-     * FIX A (round 3): streaming, glyph-budgeted subclass of {@code PDFTextStripperByArea} used
-     * by {@link #fillCellsByRegion}. {@code PDFTextStripperByArea}'s own {@code
-     * processTextPosition(TextPosition)} (called once per glyph by the underlying content-stream
-     * engine, the SAME entry point the base {@code PDFTextStripper} uses) tests the glyph against
-     * every registered region and, ONLY for a region it actually falls in, forwards it to {@code
-     * super.processTextPosition(...)} (the base class's own per-glyph text bookkeeping). A glyph
-     * that matches no region is therefore never retained anywhere -- this is what makes the
-     * region-strip approach streaming/O(1)-ish memory, unlike the {@code stripAllPositions}
-     * approach it replaces (see {@link #MAX_REGION_GLYPHS}'s doc for that regression).
+     * round-6: streaming, glyph-budgeted {@code PDFTextStripper} subclass used by {@link
+     * #fillCellsByRegion} to collect a page's TextPositions for the SAME midpoint-bucketing
+     * mechanism ({@link #fillCellsFromPositions}) the default (non-skip-text-urls) path already
+     * uses, instead of the removed PDFTextStripterByArea-based region matching (see {@link
+     * #MAX_REGION_GLYPHS}'s doc for the full round-6 rationale: PDFTextStripterByArea's shared,
+     * cross-region {@code characterListMapping} silently dropped a glyph from all-but-one of
+     * several overlapping/nested cell regions, and there was no way to fix that without
+     * reintroducing the duplicate-drawn-text garble rounds 3-5 fought over).
      *
-     * <p>But the per-glyph region-containment scan itself still runs once per glyph regardless of
-     * match, so a hostile page with a huge glyph count is still unbounded CPU-wise without an
-     * explicit cap. This subclass counts EVERY glyph the engine reports (matched or not) and
-     * throws {@link RulingOverflowException} once {@code glyphBudget} is exceeded, BEFORE calling
-     * {@code super.processTextPosition(...)} -- bounding both the CPU (no more than {@code
-     * glyphBudget} glyphs are ever scanned against the region map) and, as a hard backstop, the
-     * memory a pathological all-glyphs-match-every-region shape could retain (at most {@code
-     * glyphBudget} matched positions total, across every region combined).
+     * <p>Overrides the LOW-level {@code processTextPosition(TextPosition)} hook, not {@code
+     * writeString}: {@code writeString} is only called from {@code writePage()}, which does not
+     * run until AFTER {@code processPage()} has already fed every one of the page's glyphs through
+     * {@code processTextPosition} into the base class's own {@code charactersByArticle} buffer --
+     * by the time {@code writeString} would see anything, an unbounded number of glyphs is already
+     * sitting in memory. (Reproduced directly: an earlier version of this class overrode {@code
+     * writeString} and OOM'd on a 6,000,000-glyph page even at multi-gigabyte heaps -- exactly the
+     * round-3 {@code stripAllPositions} regression this budget exists to prevent, reintroduced by
+     * hooking too late.) Hooking {@code processTextPosition} runs the budget check BEFORE any
+     * buffering happens for this glyph, so the cap is real.
      *
-     * <p>round-3 follow-up ({@link #MAX_REGION_WORK}): {@code glyphBudget} alone bounds only the
-     * glyph COUNT -- it does NOT bound the PRODUCT of glyphs and registered regions, which is the
-     * actual per-page cost (every glyph is tested against every region). Maxing both the glyph
-     * cap and {@link #MAX_REGION_CELLS} simultaneously is still ~10^10 cheap containment checks in
-     * one uninterruptible {@code extractRegions()} call -- bounded (never OOMs, never runs
-     * forever) but slow enough to risk the hard-halt watchdog killing the JVM before this method
-     * ever returns. So this subclass ALSO charges {@code getRegions().size()} (the true per-glyph
-     * cost: this glyph is about to be tested against every one of that many regions) against a
-     * separate {@code workBudget} on every glyph, throwing the same way once THAT is exceeded --
-     * this is the cap that actually bounds the glyphs x cells product, and is checked BEFORE the
-     * (cheaper, coarser) glyph-count check would otherwise let a max-both shape run to completion.
+     * <p>Still gets the base {@code PDFTextStripper}'s {@code suppressDuplicateOverlappingText}
+     * dedup (on by default) for free on every glyph this class forwards, by calling {@code
+     * super.processTextPosition(text)} for it -- unlike PDFTextStripterByArea's version of that
+     * same flag, the base class's dedup is keyed purely by (character, x, y), never by which
+     * "region" is being read back, so it cannot have the cross-region drop bug described above.
      *
-     * <p>round-4 follow-up ({@link #MAX_REGION_WORK}'s doc has the full measurement): charging
-     * {@code getRegions().size()} per glyph assumes every charged unit costs about the same amount
-     * of wall-clock regardless of whether the glyph actually falls inside a region. That is true for
-     * the (cheap, uniform) {@code rect.contains(...)} containment check itself, but NOT true of what
-     * happens next for a glyph that DOES match: {@code PDFTextStripperByArea.processTextPosition}
-     * calls {@code super.processTextPosition(text)} (real per-glyph bookkeeping in the base {@code
-     * PDFTextStripper}) once per matching region, and that bookkeeping is materially more expensive
-     * than the containment check alone -- especially with {@code suppressDuplicateOverlappingText}
-     * (on by default) doing a TreeMap/TreeSet dedup lookup on every match. A shape where many
-     * registered regions geometrically overlap (so a single glyph matches many of them at once)
-     * multiplies that per-glyph cost well beyond what the flat "glyphs x cells" work formula assumes,
-     * which is what let a ~100-cell / ~2,000,000-matching-glyph page take 20-33s despite the work
-     * counter itself topping out at exactly {@code MAX_REGION_WORK}.
+     * <p>Bounded on memory by {@code glyphBudget} (see {@link #MAX_REGION_GLYPHS}): throws {@link
+     * RulingOverflowException} once the RETAINED count ({@code charactersByArticle.get(0).size()})
+     * would exceed the budget, BEFORE calling {@code super.processTextPosition(text)} for this
+     * glyph -- capping retained memory regardless of the page's real glyph count. Also discards --
+     * without counting against the budget, and without ever reaching {@code super} at all -- any
+     * position whose bucketing midpoint (computed with the exact same formula {@link
+     * #fillCellsFromPositions} uses) falls outside the combined bounding box of every cell being
+     * filled: since that combined box is the UNION of every individual cell's rect, a glyph that
+     * lands outside it cannot land inside any cell either, so discarding it here never changes the
+     * final bucketed text -- it just keeps memory flat on an ordinary page where the table(s) cover
+     * only a small fraction of the page's total text.
      *
-     * <p>round-5 follow-up (THIS fix -- see {@link #MAX_REGION_WORK}'s doc for the full
-     * re-calibration): round 4's response to the above was to disable
-     * duplicate-overlapping-text suppression on this instance to make the per-match cost cheaper.
-     * That traded away CORRECTNESS: a cell whose text is drawn twice at the identical position (a
-     * common non-hostile fake-bold-via-redraw / redundant-text-layer generator pattern, not just a
-     * hostile one) came back character-interleaved-garbled once suppression was off, because {@code
-     * setSortByPosition(true)} sorts the two identically-positioned runs together with nothing left
-     * to collapse them back into one copy. Suppression is restored to its default (ON) here --
-     * fixing that correctness regression -- and {@link #MAX_REGION_WORK} is instead recalibrated
-     * (lowered) to keep the matched-glyph DoS bounded under the NOW-more-expensive (suppression-ON)
-     * per-match cost, so the work budget alone -- not a cheaper-but-wrong per-glyph path -- is what
-     * closes this DoS.
+     * <p>{@code writePage()} is overridden to do nothing: the default implementation sorts,
+     * space-collapses, and writes {@code charactersByArticle} out through {@code writeString} --
+     * all needless work here (this class reads {@code charactersByArticle} directly via {@link
+     * #collected()} instead, preserving every retained {@code TextPosition} exactly as {@link
+     * #fillCellsFromPositions}' own {@code joinText} line-clustering expects to sort/join it
+     * itself), and skipping it means {@code output} (a {@code Writer}, normally installed by {@code
+     * getText()}/{@code writeText()} -- neither of which this class's caller ever invokes, see
+     * {@link #fillCellsByRegion}) is never touched, so none needs to be installed at all.
      */
-    private static final class RegionStripper extends PDFTextStripperByArea {
+    private static final class PositionCollectingStripper extends PDFTextStripper {
         private final long glyphBudget;
-        private final long workBudget;
-        private long glyphCount = 0;
-        private long work = 0;
+        private final int rotation;
+        private final float unrotatedW, unrotatedH;
+        private final float bx0, by0, bx1, by1;
 
-        RegionStripper(long glyphBudget, long workBudget) throws IOException {
+        PositionCollectingStripper(long glyphBudget, int rotation, float unrotatedW, float unrotatedH,
+                                    float bx0, float by0, float bx1, float by1) throws IOException {
             super();
             this.glyphBudget = glyphBudget;
-            this.workBudget = workBudget;
+            this.rotation = rotation;
+            this.unrotatedW = unrotatedW;
+            this.unrotatedH = unrotatedH;
+            this.bx0 = bx0; this.by0 = by0; this.bx1 = bx1; this.by1 = by1;
+        }
+
+        /** The positions retained so far -- valid to call any time, including after {@code
+         * processPage} returns normally OR throws {@link RulingOverflowException}. {@code
+         * shouldSeparateByBeads} defaults to false, so the base class only ever populates a single
+         * article (index 0). */
+        List<TextPosition> collected() {
+            return charactersByArticle.isEmpty() ? List.of() : charactersByArticle.get(0);
         }
 
         @Override
         protected void processTextPosition(TextPosition text) {
-            if (++glyphCount > glyphBudget) throw new RulingOverflowException();
-            work += getRegions().size();
-            if (work > workBudget) throw new RulingOverflowException();
-            super.processTextPosition(text);
+            float ux = text.getXDirAdj() + text.getWidthDirAdj() / 2;
+            float uy = text.getYDirAdj() - text.getHeightDir() / 2;
+            float[] v = applyPageRotation(ux, uy, rotation, unrotatedW, unrotatedH);
+            if (v[0] < bx0 || v[0] > bx1 || v[1] < by0 || v[1] > by1) return; // can't land in any cell
+            if (!charactersByArticle.isEmpty() && charactersByArticle.get(0).size() >= glyphBudget) {
+                throw new RulingOverflowException();
+            }
+            super.processTextPosition(text); // base class's own dedup (suppressDuplicateOverlappingText) applies
+        }
+
+        @Override
+        protected void writePage() {
+            // no-op -- see class doc.
         }
     }
 
     /**
-     * Fallback when no TextPositions were collected (--skip-text-urls): a single {@code
-     * PDFTextStripperByArea}-based content-stream pass (via {@link RegionStripper}), registering
-     * one region per kept cell (across every qualifying table on the page, namespaced {@code
-     * "t"+tableIdx+"c"+cellIdx} so cells from different tables never collide) and reading each
-     * cell's matched text back out afterwards.
+     * Fallback when no TextPositions were collected (--skip-text-urls): a single {@link
+     * PositionCollectingStripper} content-stream pass collects this page's TextPositions (bounded
+     * by {@code glyphBudget}, see {@link #MAX_REGION_GLYPHS}), then {@link #fillCellsFromPositions}
+     * -- the SAME midpoint-bucketing mechanism the default path uses -- buckets them into every
+     * kept cell (across every qualifying table on the page), sharing one work counter (bounded by
+     * {@code workBudget}, see {@link #MAX_TEXTFILL_WORK}) across all of them, exactly mirroring
+     * {@link #extractLatticePage}'s own position-path loop.
      *
-     * <p>{@code PDFTextStripperByArea} matches a region against {@code TextPosition.getX()/getY()}
-     * (verified from source: {@code rect.contains(text.getX(), text.getY())}), which -- unlike
-     * getXDirAdj/getYDirAdj -- IS keyed off the page's actual /Rotate. Our cell rects are already
-     * in that same visual frame (via {@link #collectRulings}), so no extra transform is needed
-     * here, and this restores the ORIGINAL region-overlap cell-assignment semantics (rather than
-     * a since-reverted midpoint-containment reimplementation that changed cell-boundary text
-     * inclusion behavior).
+     * <p>Rotation correctness (e.g. {@code rotatedRuled3x3}, and plenty of real scanned/rotated
+     * PDFs, where the page's /Rotate disagrees with its glyphs' own unrotated text direction) is
+     * handled by {@link #fillCellsFromPositions}'/{@link #joinText}'s own line-clustering (by
+     * YDirAdj/XDirAdj, independent of any stripper-level sort setting) -- the same mechanism that
+     * already makes the default (positions-supplied) path rotation-correct, so nothing
+     * rotation-specific is needed in {@link PositionCollectingStripper} itself beyond passing the
+     * page's rotation through to the shared {@link #applyPageRotation} transform.
      *
-     * <p>{@code setSortByPosition(true)}: without it, on a page whose /Rotate disagrees with its
-     * glyphs' own (unrotated) text direction -- exactly the shape produced by rotating an
-     * otherwise-ordinary page via the /Rotate flag alone, which is how {@code rotatedRuled3x3}
-     * (and plenty of real scanned/rotated PDFs) are built -- the default line-grouping
-     * mis-splits a single token across several one-character lines (e.g. "R3C1" back as
-     * "R\n3C\n1"). Verified empirically: identical region, same characters matched, only this
-     * flag differs between the broken and clean output.
-     *
-     * <p>round-4 (REVERTED by round-5, see below): a prior version of this method called {@code
-     * area.setSuppressDuplicateOverlappingText(false)} here, reasoning that cell-text extraction
-     * has no need for cross-call duplicate-overlapping-text suppression (each region is read back
-     * independently via {@link PDFTextStripperByArea#getTextForRegion}, not merged into one running
-     * document-wide transcript) -- so disabling it should cost nothing correctness-wise while
-     * removing a real per-matched-glyph TreeMap/TreeSet cost the work budget's calibration hadn't
-     * accounted for. That reasoning MISSED a real correctness case: a cell whose text is drawn
-     * TWICE at the IDENTICAL (x, y) position (fake-bold-via-redraw / redundant text layers -- a
-     * common NON-hostile PDF-generator pattern) relies on {@code
-     * suppressDuplicateOverlappingText}'s dedup to collapse the two runs back into one copy; with
-     * it off, {@code setSortByPosition(true)} above instead sorts the two identically-positioned
-     * runs into an interleaved character stream ("TToottaall" instead of "Total") -- REPRODUCED by
-     * {@code TableLatticeTest#duplicateDrawnCellTextExtractsAsSingleCopyNotGarbled}.
-     *
-     * <p>round-5 (THIS fix): correctness wins. Suppression is left at its {@code
-     * PDFTextStripperByArea} default (ON) -- the {@code setSuppressDuplicateOverlappingText(false)}
-     * call above is REMOVED. The matched-glyph DoS round 4 was closing is instead bounded by {@link
-     * #MAX_REGION_WORK} alone, recalibrated (lowered) against the real, now-restored suppression-ON
-     * per-match cost -- see that constant's doc for the full measurement sweep and the accepted
-     * capacity trade-off (a lower budget truncates a dense legitimate page sooner, but never garbles
-     * text and never risks the hard-halt watchdog).
+     * <p>See {@link #MAX_REGION_GLYPHS}'s doc for the full round-6 history of why this method no
+     * longer uses PDFTextStripterByArea at all (a confirmed correctness bug: a glyph inside two or
+     * more overlapping/nested cell regions used to be silently dropped from all but one of them).
      */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
-        fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_REGION_WORK);
+        fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_TEXTFILL_WORK);
     }
 
-    /** Package-private overload taking an explicit glyph-count budget (see {@link
-     * RegionStripper}) with {@link #MAX_REGION_WORK} as the (production) product-work budget --
-     * mirrors {@link #fillCellsFromPositions(List, List, int, float, float, long[], long)}'s
-     * test-only budget override, letting a test pin {@link #MAX_REGION_GLYPHS} deterministically
-     * without needing a real multi-million-glyph PDF fixture. */
+    /** Package-private overload taking an explicit glyph-collection budget (see {@link
+     * PositionCollectingStripper}) with {@link #MAX_TEXTFILL_WORK} as the (production)
+     * bucketing-work budget -- mirrors {@link #fillCellsFromPositions(List, List, int, float,
+     * float, long[], long)}'s test-only budget override, letting a test pin {@link
+     * #MAX_REGION_GLYPHS} deterministically without needing a real multi-million-glyph PDF
+     * fixture. */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result, long glyphBudget)
             throws IOException {
-        fillCellsByRegion(tables, page, result, glyphBudget, MAX_REGION_WORK);
+        fillCellsByRegion(tables, page, result, glyphBudget, MAX_TEXTFILL_WORK);
     }
 
-    /** Package-private overload taking BOTH explicit budgets (see {@link RegionStripper}) --
-     * lets a test pin {@link #MAX_REGION_WORK} (the glyphs x cells PRODUCT bound) deterministically
-     * without needing a real fixture large enough to trip it at the production budget. */
+    /** Package-private overload taking BOTH explicit budgets -- lets a test pin the
+     * position-collection cap AND the bucketing-work cap ({@link #fillCellsFromPositions}'s own
+     * budget) deterministically without needing a real fixture large enough to trip either at the
+     * production budget. */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
                                   long glyphBudget, long workBudget) throws IOException {
-        // Bound the cells side (see MAX_REGION_CELLS): a hostile page whose kept-cell count
-        // (across every table combined) exceeds the cap must not register any regions / walk the
-        // content stream at all; flag truncated and bail out promptly instead.
         long totalCells = 0;
         for (List<CellRect> comp : tables) totalCells += comp.size();
-        if (totalCells > MAX_REGION_CELLS) {
-            result.truncated = true;
-            return;
-        }
-        if (tables.isEmpty()) return;
+        if (totalCells == 0) return; // nothing to fill -- avoid registering a bogus bbox below
 
-        RegionStripper area = new RegionStripper(glyphBudget, workBudget);
-        area.setSortByPosition(true);
-        for (int ti = 0; ti < tables.size(); ti++) {
-            List<CellRect> comp = tables.get(ti);
-            for (int ci = 0; ci < comp.size(); ci++) {
-                CellRect c = comp.get(ci);
-                area.addRegion("t" + ti + "c" + ci,
-                        new java.awt.geom.Rectangle2D.Float(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0));
+        int rotation = page.getRotation();
+        PDRectangle cropBox = page.getCropBox();
+        float unrotatedW = cropBox.getWidth();
+        float unrotatedH = cropBox.getHeight();
+
+        // Combined bounding box across every kept cell, in the same visual (/Rotate-applied) space
+        // fillCellsFromPositions buckets against -- see PositionCollectingStripper's doc for why
+        // this is a safe (never-excludes-a-true-match) pre-filter on what it retains.
+        float bx0 = Float.MAX_VALUE, by0 = Float.MAX_VALUE, bx1 = -Float.MAX_VALUE, by1 = -Float.MAX_VALUE;
+        for (List<CellRect> comp : tables) {
+            for (CellRect c : comp) {
+                bx0 = Math.min(bx0, c.x0); by0 = Math.min(by0, c.y0);
+                bx1 = Math.max(bx1, c.x1); by1 = Math.max(by1, c.y1);
             }
         }
-        area.extractRegions(page);
-        for (int ti = 0; ti < tables.size(); ti++) {
-            List<CellRect> comp = tables.get(ti);
-            for (int ci = 0; ci < comp.size(); ci++) {
-                comp.get(ci).text = area.getTextForRegion("t" + ti + "c" + ci).strip();
-            }
+
+        PositionCollectingStripper stripper = new PositionCollectingStripper(
+                glyphBudget, rotation, unrotatedW, unrotatedH, bx0, by0, bx1, by1);
+        if (page.hasContents()) stripper.processPage(page);
+
+        long[] work = {0};
+        List<TextPosition> positions = stripper.collected();
+        for (List<CellRect> comp : tables) {
+            fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, workBudget);
         }
     }
 

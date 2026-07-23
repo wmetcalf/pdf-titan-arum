@@ -114,6 +114,25 @@ final class TableExtractor {
     // page's real glyph count (a dense page of small type rarely reaches even tens of thousands)
     // while still bounding per-page work to a finite, deterministic amount.
     static final int MAX_REGION_GLYPHS = 2_000_000;
+    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the PRODUCT of the
+    // glyph and cell sides -- the load-bearing cap, mirroring MAX_TEXTFILL_WORK/MAX_FINDCELLS_WORK.
+    //
+    // round-3 follow-up: MAX_REGION_GLYPHS alone bounds only the glyph COUNT, and MAX_REGION_CELLS
+    // alone bounds only the cell COUNT, but PDFTextStripperByArea's own per-glyph region-match
+    // scan is O(glyphs x cells) -- maxing BOTH caps simultaneously (2,000,000 glyphs x 5,000
+    // cells) is ~10^10 cheap-but-nonzero region-containment checks in ONE uninterruptible
+    // extractRegions() call, which can run tens of seconds -- long enough to blow past the
+    // hard-halt watchdog's window and get the JVM killed by Runtime.halt, exactly the failure
+    // mode this whole cap hierarchy exists to prevent. Neither existing cap bounds the PRODUCT.
+    // RegionStripper (see below) charges {@code getRegions().size()} (the per-glyph cost: every
+    // glyph is tested against every currently-registered region) against this budget on EVERY
+    // glyph, and throws once it is exceeded -- BEFORE delegating to the base class's per-glyph
+    // work, so the actual cost incurred before bailing out is always <= MAX_REGION_WORK, not
+    // glyphs x cells. 200,000,000 is sized the same way MAX_TEXTFILL_WORK/MAX_FINDCELLS_WORK are:
+    // comfortably above any legitimate page's real (glyphs x cells) cost (few cells, few thousand
+    // glyphs -- a tiny product) while keeping the worst-case wall-clock well under the hard-halt
+    // window (~0.2-2s at typical containment-check speeds, vs. 10-30s+ uncapped).
+    static final long MAX_REGION_WORK = 200_000_000;
     // FIX 4: caps splitComponent/tryCuts' OWN recursion depth (distinct from MAX_SPLIT_WORK,
     // which bounds total work but not stack depth), mirroring the depth>64 convention used by
     // every other recursive walk in this class (collectByType/collectGlyphs/resolveElementPage).
@@ -1143,19 +1162,36 @@ final class TableExtractor {
      * glyphBudget} glyphs are ever scanned against the region map) and, as a hard backstop, the
      * memory a pathological all-glyphs-match-every-region shape could retain (at most {@code
      * glyphBudget} matched positions total, across every region combined).
+     *
+     * <p>round-3 follow-up ({@link #MAX_REGION_WORK}): {@code glyphBudget} alone bounds only the
+     * glyph COUNT -- it does NOT bound the PRODUCT of glyphs and registered regions, which is the
+     * actual per-page cost (every glyph is tested against every region). Maxing both the glyph
+     * cap and {@link #MAX_REGION_CELLS} simultaneously is still ~10^10 cheap containment checks in
+     * one uninterruptible {@code extractRegions()} call -- bounded (never OOMs, never runs
+     * forever) but slow enough to risk the hard-halt watchdog killing the JVM before this method
+     * ever returns. So this subclass ALSO charges {@code getRegions().size()} (the true per-glyph
+     * cost: this glyph is about to be tested against every one of that many regions) against a
+     * separate {@code workBudget} on every glyph, throwing the same way once THAT is exceeded --
+     * this is the cap that actually bounds the glyphs x cells product, and is checked BEFORE the
+     * (cheaper, coarser) glyph-count check would otherwise let a max-both shape run to completion.
      */
     private static final class RegionStripper extends PDFTextStripperByArea {
         private final long glyphBudget;
+        private final long workBudget;
         private long glyphCount = 0;
+        private long work = 0;
 
-        RegionStripper(long glyphBudget) throws IOException {
+        RegionStripper(long glyphBudget, long workBudget) throws IOException {
             super();
             this.glyphBudget = glyphBudget;
+            this.workBudget = workBudget;
         }
 
         @Override
         protected void processTextPosition(TextPosition text) {
             if (++glyphCount > glyphBudget) throw new RulingOverflowException();
+            work += getRegions().size();
+            if (work > workBudget) throw new RulingOverflowException();
             super.processTextPosition(text);
         }
     }
@@ -1184,15 +1220,24 @@ final class TableExtractor {
      * flag differs between the broken and clean output.
      */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
-        fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS);
+        fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_REGION_WORK);
     }
 
     /** Package-private overload taking an explicit glyph-count budget (see {@link
-     * RegionStripper}), mirroring {@link #fillCellsFromPositions(List, List, int, float, float,
-     * long[], long)}'s test-only budget override -- lets a test pin {@link #MAX_REGION_GLYPHS}
-     * deterministically without needing a real multi-million-glyph PDF fixture. */
+     * RegionStripper}) with {@link #MAX_REGION_WORK} as the (production) product-work budget --
+     * mirrors {@link #fillCellsFromPositions(List, List, int, float, float, long[], long)}'s
+     * test-only budget override, letting a test pin {@link #MAX_REGION_GLYPHS} deterministically
+     * without needing a real multi-million-glyph PDF fixture. */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result, long glyphBudget)
             throws IOException {
+        fillCellsByRegion(tables, page, result, glyphBudget, MAX_REGION_WORK);
+    }
+
+    /** Package-private overload taking BOTH explicit budgets (see {@link RegionStripper}) --
+     * lets a test pin {@link #MAX_REGION_WORK} (the glyphs x cells PRODUCT bound) deterministically
+     * without needing a real fixture large enough to trip it at the production budget. */
+    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
+                                  long glyphBudget, long workBudget) throws IOException {
         // Bound the cells side (see MAX_REGION_CELLS): a hostile page whose kept-cell count
         // (across every table combined) exceeds the cap must not register any regions / walk the
         // content stream at all; flag truncated and bail out promptly instead.
@@ -1204,7 +1249,7 @@ final class TableExtractor {
         }
         if (tables.isEmpty()) return;
 
-        RegionStripper area = new RegionStripper(glyphBudget);
+        RegionStripper area = new RegionStripper(glyphBudget, workBudget);
         area.setSortByPosition(true);
         for (int ti = 0; ti < tables.size(); ti++) {
             List<CellRect> comp = tables.get(ti);

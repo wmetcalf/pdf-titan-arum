@@ -262,6 +262,71 @@ class TableLatticeTest {
     }
 
     @Test
+    void regionWorkBudgetCatchesMaxBothShapeThatGlyphCapAloneWouldMiss() throws Exception {
+        // MAX_REGION_WORK reproducer (round 3 follow-up): MAX_REGION_GLYPHS bounds the glyph
+        // COUNT alone, and MAX_REGION_CELLS bounds the cell COUNT alone, but
+        // PDFTextStripperByArea's own per-glyph region-match scan is O(glyphs x cells) -- neither
+        // cap alone bounds that PRODUCT. This fixture deliberately maxes cells (at the
+        // MAX_REGION_CELLS boundary, 5,000) and uses 50,000 real glyphs: comfortably UNDER
+        // MAX_REGION_GLYPHS (2,000,000) -- so the glyph-only cap would let this shape run to
+        // completion (~50,000 x 5,000 = 250,000,000 containment checks, well past
+        // MAX_REGION_WORK=200,000,000, though still "only" a fraction of a second here; the
+        // production-scale adversarial version -- glyphs near the 2,000,000 cap alongside 5,000
+        // cells -- is what risks tens of seconds and the hard-halt window). RegionStripper's
+        // work counter (glyphs x currently-registered-region-count, charged per glyph) must
+        // trip FIRST, proving the product is what's bounded, not just either factor alone.
+        Path pdf = tmp.resolve("regionwork.pdf");
+        int glyphCount = 50_000;
+        TableTestPdfs.manyGlyphsOnePage(pdf, glyphCount);
+        assertTrue(glyphCount < TableExtractor.MAX_REGION_GLYPHS,
+                "sanity: glyph count alone must be nowhere near MAX_REGION_GLYPHS -- "
+                        + "the glyph-only cap would NOT catch this shape, only the product-work cap can");
+
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            PDPage page = doc.getPage(0);
+
+            List<TableExtractor.CellRect> comp = new ArrayList<>();
+            for (int i = 0; i < TableExtractor.MAX_REGION_CELLS; i++) {
+                TableExtractor.CellRect c = new TableExtractor.CellRect();
+                c.x0 = i; c.y0 = 0; c.x1 = i + 1; c.y1 = 1; // position irrelevant -- work is charged per glyph regardless of match
+                comp.add(c);
+            }
+            List<List<TableExtractor.CellRect>> tables = List.of(comp);
+            assertTrue(comp.size() <= TableExtractor.MAX_REGION_CELLS, "sanity: must not trip the (separate) cell-count cap");
+            assertTrue((long) glyphCount * comp.size() > TableExtractor.MAX_REGION_WORK,
+                    "sanity: glyphs x cells must actually exceed MAX_REGION_WORK for this to be a real product-bound test");
+
+            TableExtractor.Result result = new TableExtractor.Result();
+            long start = System.nanoTime();
+            assertThrows(TableExtractor.RulingOverflowException.class,
+                    () -> TableExtractor.fillCellsByRegion(tables, page, result),
+                    "glyphs x cells exceeding MAX_REGION_WORK must throw, even though glyph count alone is under MAX_REGION_GLYPHS");
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertTrue(elapsedMs < 5000, "the product-work cap must trip fast, not process all " + glyphCount + " glyphs: took " + elapsedMs + "ms");
+        }
+    }
+
+    @Test
+    void regionWorkBudgetNotTrippedByLegitSmallTable() throws Exception {
+        // Companion to the adversarial test above: a REALISTIC region-fill shape (a handful of
+        // cells, a handful of glyphs) must complete normally through the PRODUCTION
+        // fillCellsByRegion (real MAX_REGION_GLYPHS / MAX_REGION_WORK budgets) without tripping
+        // either cap -- the work counter must not be so tight that legitimate small tables get
+        // spuriously truncated.
+        Path pdf = tmp.resolve("regionworklegit.pdf");
+        TableTestPdfs.ruled3x3(pdf); // 3x3 table, 9 cells, a dozen or so real glyphs
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertFalse(r.truncated, "a legitimate small table must not trip MAX_REGION_WORK");
+            assertEquals(1, r.tables.size());
+            assertEquals(List.of(
+                    List.of("R1C1", "R1C2", "R1C3"),
+                    List.of("R2C1", "R2C2", "R2C3"),
+                    List.of("R3C1", "R3C2", "R3C3")), r.tables.get(0).rows);
+        }
+    }
+
+    @Test
     void regionGlyphBombIsBoundedNotBufferedOrOOMed() throws Exception {
         // FIX A (round 3) regression reproducer, matching the reviewer's own methodology exactly:
         // a small-on-disk, one-page PDF (a single Flate-compressed (AAAA...) Tj) carrying

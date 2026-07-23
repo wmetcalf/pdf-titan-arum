@@ -38,6 +38,40 @@ final class TableTestPdfs {
     }
 
     /**
+     * One page whose content stream is a single {@code (AAAA...) Tj} of {@code glyphCount}
+     * identical characters, Flate-compressed by PDFBox's own {@code createOutputStream
+     * (FLATE_DECODE)} as it is written -- millions of identical bytes compress to a few KB on
+     * disk, matching how a hostile few-KB PDF can carry a huge glyph count. Used by
+     * region-fill memory/CPU-bound regression tests (round 3, FIX A and its MAX_REGION_WORK
+     * follow-up).
+     */
+    static void manyGlyphsOnePage(Path file, int glyphCount) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            org.apache.pdfbox.pdmodel.PDResources resources = new org.apache.pdfbox.pdmodel.PDResources();
+            resources.put(COSName.getPDFName("F1"), HELV);
+            page.setResources(resources);
+
+            org.apache.pdfbox.cos.COSStream cosStream = doc.getDocument().createCOSStream();
+            try (java.io.OutputStream os = cosStream.createOutputStream(COSName.FLATE_DECODE)) {
+                os.write("BT /F1 12 Tf (".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+                byte[] chunk = new byte[1 << 16];
+                java.util.Arrays.fill(chunk, (byte) 'A');
+                int remaining = glyphCount;
+                while (remaining > 0) {
+                    int n = Math.min(chunk.length, remaining);
+                    os.write(chunk, 0, n);
+                    remaining -= n;
+                }
+                os.write(") Tj ET".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+            }
+            page.getCOSObject().setItem(COSName.CONTENTS, cosStream);
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * One page (US Letter), ruled 3x3 grid: verticals at x=50/150/250/350,
      * horizontals at y=700/670/640/610 (bottom-left origin). Cell (r,c) holds "R{r}C{c}".
      */

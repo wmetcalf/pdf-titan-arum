@@ -500,6 +500,42 @@ class TableTaggedTest {
         }
     }
 
+    @Test
+    void spreadNineCellTaggedTableDoesNotSuppressDistinctNineCellRuledTable() throws Exception {
+        // FIX 2 round-4 (post-review) reproducer: round-3's cell-count guard is bypassed by a
+        // STRUCTURALLY-REAL 9-cell tagged table (a genuine 3x3 TR/TD grid, own MCID text in every
+        // cell -- not a degenerate 1-cell sparse-MCID table) whose 9 cells are legitimately SPREAD
+        // across almost the whole page: cellCount 9 == 9 (ratio 1.0, passes cellCountsComparable)
+        // and IoU against a distinct 9-cell ruled table filling most of that inflated bbox is still
+        // > 0.5 -- neither aggregate-comparison guard can tell this apart from a genuine same-table
+        // match. Only the tagged table's OWN fill ratio (its cells cover a mere sliver of its own
+        // bbox, unlike a real dense table) can. Both tables must survive.
+        Path pdf = tmp.resolve("spread_nine_cell_tagged.pdf");
+        TableTestPdfs.taggedSpreadNineCellPlusDistinctNineCellRuledTable(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(2, r.tables.size(),
+                    "a distinct 9-cell ruled table must NOT be dropped just because a spread, "
+                            + "structurally-real 9-cell tagged table also inflates to near-page size: " + r.tables);
+
+            TableExtractor.TableHit tagged = r.tables.stream()
+                    .filter(t -> "tagged".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(() -> new AssertionError("spread tagged table missing: " + r.tables));
+            assertEquals(9, tagged.cells.size(), "sanity: the tagged table really is a structurally-real 3x3 (9 cells)");
+            assertEquals(List.of(List.of("1", "2", "3"), List.of("4", "5", "6"), List.of("7", "8", "9")), tagged.rows);
+
+            TableExtractor.TableHit lattice = r.tables.stream()
+                    .filter(t -> "lattice".equals(t.extractionMethod))
+                    .findFirst().orElseThrow(
+                            () -> new AssertionError("the distinct 9-cell ruled table must survive, not be suppressed: " + r.tables));
+            assertEquals(9, lattice.cells.size(), "sanity: the ruled table really is a full 3x3 (9 cells)");
+            assertEquals(List.of(
+                    List.of("R1C1", "R1C2", "R1C3"),
+                    List.of("R2C1", "R2C2", "R2C3"),
+                    List.of("R3C1", "R3C2", "R3C3")), lattice.rows);
+        }
+    }
+
     // ---------------------------------------------------------------- FIX 4: lock-in only, no code change
 
     @Test

@@ -1568,6 +1568,27 @@ final class TableExtractor {
      * 1-cell sparse tagged table can now dedup only against an equally tiny (<=2-cell) lattice
      * table, never a large distinct one, regardless of how much of its inflated bbox that large
      * table happens to fill.
+     *
+     * <p>Round-4 (post-review, closes the CLASS): every aggregate comparison between the two
+     * tables -- centroid, IoU, cell-count-ratio -- shares one blind spot: none of them checks
+     * whether the TAGGED table's own bbox is a plausible fit for its OWN cells. REPRODUCED: a
+     * STRUCTURALLY-REAL 9-cell tagged table (a genuine 3x3 TR/TD grid, own MCID text in every
+     * cell) whose 9 cells are legitimately SPREAD across almost the whole page still inflates its
+     * own bbox to near-page size -- {@code cellCountsComparable} no longer excludes it (9 == 9,
+     * ratio 1.0) against a distinct 9-cell ruled table filling most of that bbox (IoU still > 0.5),
+     * so round-3's guard was defeated by simply matching the tagged table's cell COUNT to the
+     * lattice table's while keeping the tagged cells spread thin. Closed by a THIRD, qualitatively
+     * different guard -- {@link #taggedTableIsPlausibleSuppressor} -- that looks at the tagged
+     * table's OWN internal geometry (its cells' summed area vs. its own bbox area) rather than
+     * comparing the two tables to each other at all: a real dense table's cells tile MOST of its
+     * own bbox (this project's own same-table control measures ~0.47), while ANY inflated/degenerate
+     * tagged bbox -- whether from one sparse cell or from many widely-scattered ones -- has its
+     * cells covering only a tiny fraction of that bbox by construction. High fill-ratio + high IoU
+     * can only mean the tagged cells genuinely tile the SAME physical region the lattice table
+     * claims -- and a distinct lattice table cannot ALSO occupy that same region (they would
+     * visually overlap on the source page), so this combination leaves no reachable silent-drop
+     * shape: a tagged table is now only eligible to act as a dedup suppressor when its own bbox
+     * isn't hollow.
      */
     private static boolean overlapsAlreadyEmittedTaggedTable(TableHit candidate, List<TableHit> tables) {
         if (candidate.bbox == null) return false;
@@ -1575,10 +1596,47 @@ final class TableExtractor {
             if (t.page != candidate.page) continue;
             if (!"tagged".equals(t.extractionMethod)) continue;
             if (t.bbox == null) continue;
+            if (!taggedTableIsPlausibleSuppressor(t)) continue;
             if (bboxIoU(candidate.bbox, t.bbox) > IOU_DEDUP_THRESHOLD
                     && cellCountsComparable(t, candidate)) return true;
         }
         return false;
+    }
+
+    // A real, dense table's cells tile MOST of its own bbox -- this project's own same-table
+    // control (a compact, tightly-padded 2x2) measures a real fill ratio ~= 0.47 (cell text extents
+    // never cover 100% of a ruled/padded cell's full box, but come well within a factor of 2). Any
+    // INFLATED/degenerate tagged bbox -- whether from one sparse multi-MCID cell (round-2/round-3's
+    // reproducers) or from many legitimately-real but widely-scattered cells (round-4's reproducer)
+    // -- has its actual cells covering only a sliver of that inflated area BY CONSTRUCTION (that's
+    // what "inflated" means: the bbox is far bigger than what the cells themselves occupy). 0.3
+    // sits with real margin below the same-table control's ~0.47 and with real margin above every
+    // reproduced degenerate shape (measured well under 0.01 in all three).
+    private static final float FILL_RATIO_THRESHOLD = 0.3f;
+
+    /**
+     * True when a tagged table's own cells plausibly occupy their own claimed bbox -- i.e. this
+     * tagged table is dense enough to be trusted as a dedup suppressor at all. Guards against
+     * zero/degenerate areas (a zero-area table bbox, or a table with no cells/no cell bboxes,
+     * is NOT eligible to suppress -- the safe direction is to keep both tables, never to divide by
+     * zero or to let a totally hollow "table" claim dedup rights over something else).
+     *
+     * <p>Cell bboxes are read directly off {@code TableHit.cells} -- the SAME rotation-aware
+     * per-cell bboxes {@link #resolveCellText} builds (FIX 1), already in the visual frame this
+     * whole comparison operates in. A cell with a null bbox (e.g. a textless placeholder cell)
+     * contributes zero area, correctly diluting the ratio rather than being skipped/ignored.
+     */
+    private static boolean taggedTableIsPlausibleSuppressor(TableHit tagged) {
+        float tableArea = bboxArea(tagged.bbox);
+        if (tableArea <= 0f || tagged.cells == null || tagged.cells.isEmpty()) return false;
+        float cellAreaSum = 0f;
+        for (CellHit c : tagged.cells) cellAreaSum += bboxArea(c.bbox);
+        return (cellAreaSum / tableArea) >= FILL_RATIO_THRESHOLD;
+    }
+
+    private static float bboxArea(float[] b) {
+        if (b == null) return 0f;
+        return Math.max(0f, b[2] - b[0]) * Math.max(0f, b[3] - b[1]);
     }
 
     // A genuine same-table match has roughly the same real cell count on both sides (both paths

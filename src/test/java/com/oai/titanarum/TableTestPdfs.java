@@ -680,6 +680,81 @@ final class TableTestPdfs {
     }
 
     /**
+     * FIX 2 round-4 (post-review) reproducer: a STRUCTURALLY-REAL 9-cell tagged table (a genuine
+     * 3x3 TR/TD grid, own MCID text in every cell -- unlike round-2/round-3's degenerate 1-cell
+     * sparse-MCID reproducer) whose 9 cells are legitimately SPREAD across almost the entire page
+     * (each cell a single small glyph at a scattered, perimeter-ish position) -- so its OWN bbox is
+     * still inflated to near-page size, but {@code cellCountsComparable} can no longer exclude it
+     * against a distinct 9-cell ruled table (9 == 9, ratio 1.0), and IoU against a ruled table
+     * filling most of that bbox is still > 0.5. Neither the IoU guard nor the cell-count guard can
+     * tell this apart from a genuine same-table match -- only a SELF-plausibility check on the
+     * tagged table's own fill ratio (its cells' summed area vs. its own bbox area) can: this
+     * table's 9 tiny, widely-scattered glyph cells cover only a sliver of its own huge bbox, unlike
+     * a real dense table whose cells actually tile the region they claim.
+     *
+     * <p>The 9 tagged glyphs are placed around the page's PERIMETER, deliberately avoiding the
+     * separate ruled table's own rectangle (x in [70,470], y in [150,650]) entirely, so no stray
+     * tagged glyph pollutes a ruled cell's text.
+     */
+    static void taggedSpreadNineCellPlusDistinctNineCellRuledTable(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            // Nine perimeter positions, all OUTSIDE the separate ruled table's rectangle below.
+            float[][] spread = {
+                {55, 760}, {300, 760}, {545, 760},
+                {545, 700}, {545, 400}, {545, 100},
+                {300, 100}, {55, 100}, {55, 400},
+            };
+
+            float[] xs = {70, 203.33f, 336.67f, 470};
+            float[] ys = {650, 483.33f, 316.67f, 150}; // same distinct-ruled-table geometry as round-3
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int i = 0; i < 9; i++) {
+                    COSDictionary d = new COSDictionary();
+                    d.setInt(COSName.MCID, i);
+                    cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                    text(cs, spread[i][0], spread[i][1], String.valueOf(i + 1));
+                    cs.endMarkedContent();
+                }
+
+                // Separate, genuinely distinct ruled 3x3 grid (9 cells) filling most of the spread
+                // tagged table's inflated bbox -- no structure reference of its own.
+                cs.setLineWidth(0.75f);
+                for (float y : ys) line(cs, xs[0], y, xs[3], y);
+                for (float x : xs) line(cs, x, ys[0], x, ys[3]);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        text(cs, xs[c] + 10, ys[r] - 20, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            int mcid = 0;
+            for (int r = 0; r < 3; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                for (int c = 0; c < 3; c++) {
+                    PDStructureElement cell = new PDStructureElement("TD", tr);
+                    cell.setPage(page);
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * A tagged 1x1 table (one TD, MCID 0) whose cell text ("Total") is drawn TWICE at the
      * IDENTICAL position -- FIX 4 lock-in: mirrors {@link #ruled2x2DuplicateDrawnCell}'s
      * fake-bold-via-redraw pattern but for the tagged path (glyphs resolved via

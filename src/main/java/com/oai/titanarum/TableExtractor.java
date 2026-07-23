@@ -128,11 +128,34 @@ final class TableExtractor {
     // glyph is tested against every currently-registered region) against this budget on EVERY
     // glyph, and throws once it is exceeded -- BEFORE delegating to the base class's per-glyph
     // work, so the actual cost incurred before bailing out is always <= MAX_REGION_WORK, not
-    // glyphs x cells. 200,000,000 is sized the same way MAX_TEXTFILL_WORK/MAX_FINDCELLS_WORK are:
-    // comfortably above any legitimate page's real (glyphs x cells) cost (few cells, few thousand
-    // glyphs -- a tiny product) while keeping the worst-case wall-clock well under the hard-halt
-    // window (~0.2-2s at typical containment-check speeds, vs. 10-30s+ uncapped).
-    static final long MAX_REGION_WORK = 200_000_000;
+    // glyphs x cells.
+    //
+    // round-4 follow-up (this fix): 200,000,000 was calibrated assuming every charged work-unit
+    // costs about the same regardless of whether the glyph actually falls inside a region ("~0.2-2s
+    // at typical containment-check speeds"). That holds for a glyph that matches NO region --
+    // PDFTextStripperByArea.processTextPosition's own {@code rect.contains(...)} check is cheap and
+    // uniform -- but is FALSE for a glyph that DOES match: PDFTextStripperByArea calls {@code
+    // super.processTextPosition(text)} (the base PDFTextStripper's real per-glyph bookkeeping) once
+    // per MATCHING region, and (with setSortByPosition(true), needed for rotated-page correctness --
+    // see fillCellsByRegion's own doc) suppressDuplicateOverlappingText defaulting on meant every
+    // matched glyph also paid a TreeMap/TreeSet dedup check. REPRODUCED: ~100 kept cells whose
+    // registered regions geometrically OVERLAP one another (so most glyphs of a large run match
+    // MANY of them, multiplying the number of super.processTextPosition calls per glyph well beyond
+    // 1) with ~2,000,000 matching glyphs -- exactly the same (glyphs x cells) work-unit count this
+    // cap already bounds -- took 20-33s at the OLD 200,000,000 budget, comfortably past the 15s
+    // hard-halt window. fillCellsByRegion now calls {@code setSuppressDuplicateOverlappingText(false)}
+    // (cell text doesn't need cross-page duplicate suppression), which helped (32.8s -> ~20.5s on
+    // the same repro) but was NOT sufficient on its own -- the base class's per-match bookkeeping
+    // (ArrayList append + article-division bookkeeping in processTextPosition, called once per
+    // MATCHED region) is still real, non-uniform, per-glyph cost. So this budget is ALSO lowered,
+    // to 20,000,000 (10x): measured directly against the fixed code (setSuppressDuplicateOverlappingText
+    // off, setSortByPosition still on) on the same fully-overlapping-regions worst case, swept across
+    // cell counts from 2 to 2,000 with the glyph count sized to land the call right at this budget,
+    // the worst observed wall-clock was ~2.9s (cells=15) -- comfortably under both this doc's ~3s
+    // target and the 15s hard-halt window, vs. 20+s at the old budget for the equivalent shape. A
+    // legitimate page's real (glyphs x cells) product remains a tiny fraction of even this lowered
+    // budget (few cells, few thousand glyphs), so ordinary tables are unaffected.
+    static final long MAX_REGION_WORK = 20_000_000;
     // FIX 4: caps splitComponent/tryCuts' OWN recursion depth (distinct from MAX_SPLIT_WORK,
     // which bounds total work but not stack depth), mirroring the depth>64 convention used by
     // every other recursive walk in this class (collectByType/collectGlyphs/resolveElementPage).
@@ -1174,6 +1197,25 @@ final class TableExtractor {
      * separate {@code workBudget} on every glyph, throwing the same way once THAT is exceeded --
      * this is the cap that actually bounds the glyphs x cells product, and is checked BEFORE the
      * (cheaper, coarser) glyph-count check would otherwise let a max-both shape run to completion.
+     *
+     * <p>round-4 follow-up ({@link #MAX_REGION_WORK}'s doc has the full measurement): charging
+     * {@code getRegions().size()} per glyph assumes every charged unit costs about the same amount
+     * of wall-clock regardless of whether the glyph actually falls inside a region. That is true for
+     * the (cheap, uniform) {@code rect.contains(...)} containment check itself, but NOT true of what
+     * happens next for a glyph that DOES match: {@code PDFTextStripperByArea.processTextPosition}
+     * calls {@code super.processTextPosition(text)} (real per-glyph bookkeeping in the base {@code
+     * PDFTextStripper}) once per matching region, and that bookkeeping is materially more expensive
+     * than the containment check alone -- especially with {@code suppressDuplicateOverlappingText}
+     * (on by default) doing a TreeMap/TreeSet dedup lookup on every match. A shape where many
+     * registered regions geometrically overlap (so a single glyph matches many of them at once)
+     * multiplies that per-glyph cost well beyond what the flat "glyphs x cells" work formula assumes,
+     * which is what let a ~100-cell / ~2,000,000-matching-glyph page take 20-33s despite the work
+     * counter itself topping out at exactly {@code MAX_REGION_WORK}. {@link #fillCellsByRegion} now
+     * disables duplicate-overlapping-text suppression on this instance (cell text extraction has no
+     * need for it), and {@link #MAX_REGION_WORK} itself is lowered so that the remaining per-match
+     * cost -- which this class cannot make exactly uniform with the non-match cost, only cheaper --
+     * still keeps the worst case well under the hard-halt window even when every charged work-unit
+     * happens to be a real match.
      */
     private static final class RegionStripper extends PDFTextStripperByArea {
         private final long glyphBudget;
@@ -1218,6 +1260,14 @@ final class TableExtractor {
      * mis-splits a single token across several one-character lines (e.g. "R3C1" back as
      * "R\n3C\n1"). Verified empirically: identical region, same characters matched, only this
      * flag differs between the broken and clean output.
+     *
+     * <p>round-4: {@code setSuppressDuplicateOverlappingText(false)} -- see {@link
+     * #MAX_REGION_WORK}'s and {@link RegionStripper}'s docs for the full matched-glyph DoS this
+     * closes. Cell-text extraction has no need for cross-call duplicate-overlapping-text
+     * suppression (each region is read back independently via {@link
+     * PDFTextStripperByArea#getTextForRegion}, not merged into one running document-wide
+     * transcript), so disabling it costs nothing correctness-wise while removing a real per-matched-
+     * glyph TreeMap/TreeSet cost that the work budget's calibration didn't account for.
      */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
         fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_REGION_WORK);
@@ -1251,6 +1301,7 @@ final class TableExtractor {
 
         RegionStripper area = new RegionStripper(glyphBudget, workBudget);
         area.setSortByPosition(true);
+        area.setSuppressDuplicateOverlappingText(false);
         for (int ti = 0; ti < tables.size(); ti++) {
             List<CellRect> comp = tables.get(ti);
             for (int ci = 0; ci < comp.size(); ci++) {

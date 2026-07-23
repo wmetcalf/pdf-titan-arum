@@ -286,6 +286,68 @@ class RulingCollectorTest {
     }
 
     @Test
+    void fillAndStrokeThinBarEmitsOneRulingNotEdgesPlusCenterline() throws Exception {
+        // PR re-review P2 reproducer: a table border commonly drawn as a thin filled+stroked
+        // rectangle (the `B` operator) -- e.g. a shaded/colored bar used as a rule line. Before
+        // the fix, fillAndStrokePath unconditionally emitted BOTH the stroked rectangle's two
+        // long parallel edges (addRulingsForSubpath: bottom + top, the short left/right edges
+        // fall under MIN_RULING_LEN and are dropped) AND the thin-fill centerline
+        // (emitThinFillAsRuling) for the SAME bar -- 3 near-parallel horizontal rulings
+        // (bottom edge, top edge, centerline) all within the bar's own thin height of each
+        // other, which is itself chosen here (2pt) to sit right at the SNAP grid interval so
+        // they'd normalize into distinct micro-rulings rather than collapsing back into one.
+        // A thin fill-and-stroke bar is visually ONE logical border and must contribute
+        // exactly ONE ruling: the single centerline.
+        Path pdf = tmp.resolve("fill-and-stroke-thin-bar.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                cs.addRect(50, 700, 300, 2); // 2pt-tall bar, right at the SNAP (2pt) interval
+                cs.fillAndStroke(); // `B`: fill AND stroke the same rectangle
+            }
+            doc.save(pdf.toFile());
+        }
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            List<TableExtractor.Ruling> rulings = TableExtractor.collectRulings(doc.getPage(0));
+            assertEquals(1, rulings.size(),
+                    "a thin fill-and-stroke bar must yield exactly one ruling (the centerline), "
+                            + "not the stroked edges plus the centerline: " + rulings);
+            assertTrue(rulings.get(0).horizontal());
+        }
+    }
+
+    @Test
+    void fillAndStrokeWideRectStillEmitsStrokedEdgesNotCollapsedToCenterline() throws Exception {
+        // Control for the fix above: a WIDE filled-and-stroked rectangle (e.g. a real shaded
+        // cell background drawn with `B`, not a thin rule line) is NOT a thin bar per
+        // emitThinFillAsRuling's own test, so it must keep contributing its stroked edges
+        // exactly as before -- must NOT be mis-collapsed down to a single centerline.
+        Path pdf = tmp.resolve("fill-and-stroke-wide-rect.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                cs.addRect(50, 400, 300, 200); // wide AND tall: not a thin bar in either dimension
+                cs.fillAndStroke();
+            }
+            doc.save(pdf.toFile());
+        }
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            List<TableExtractor.Ruling> rulings = TableExtractor.collectRulings(doc.getPage(0));
+            assertEquals(4, rulings.size(),
+                    "a wide filled-and-stroked rect's four stroked edges must survive, not "
+                            + "collapse to a centerline: " + rulings);
+            long horiz = rulings.stream().filter(TableExtractor.Ruling::horizontal).count();
+            long vert = rulings.stream().filter(TableExtractor.Ruling::vertical).count();
+            assertEquals(2, horiz, "top and bottom stroked edges");
+            assertEquals(2, vert, "left and right stroked edges");
+        }
+    }
+
+    @Test
     void capThrowsOnRulingBomb() throws Exception {
         Path pdf = tmp.resolve("bomb.pdf");
         try (PDDocument doc = new PDDocument()) {

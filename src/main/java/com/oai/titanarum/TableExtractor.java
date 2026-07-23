@@ -1154,19 +1154,35 @@ final class TableExtractor {
             resetPath();
         }
 
+        /**
+         * PR re-review P2 (correctness -- phantom micro-rows/cols): a table border is often drawn
+         * as a thin filled-AND-stroked rectangle (the {@code B} operator). Such a subpath's fill
+         * geometry qualifies as a thin bar per {@link #emitThinFillAsRuling} -- its stroked outline
+         * traces the SAME bar's own long edges, so unconditionally ALSO calling {@link
+         * #addRulingsForSubpath} used to emit those two stroked edges (bottom+top, or left+right)
+         * PLUS the fill's own centerline: 2-3 near-parallel rulings, all within the bar's own thin
+         * width/height of each other, for what is visually ONE logical border. Near {@link #SNAP}
+         * (2pt) those normalize into DISTINCT micro-rulings, corrupting lattice row/col detection
+         * with phantom rows/columns. Fix: test the thin-bar case FIRST; if {@link
+         * #emitThinFillAsRuling} handled it (one centerline ruling emitted), that IS this
+         * subpath's sole contribution -- skip the stroked edges entirely. A subpath that is NOT a
+         * thin bar (e.g. a real filled cell background) is unaffected and keeps the stroked-edge
+         * behavior exactly as before.
+         */
         @Override public void fillAndStrokePath(int windingRule) {
             finalizeCurrentSubpath();
             for (List<float[]> sp : subpaths) {
-                // Stroke edges AND consider the thin-fill case, per subpath.
-                addRulingsForSubpath(sp);
-                emitThinFillAsRuling(sp);
+                if (!emitThinFillAsRuling(sp)) addRulingsForSubpath(sp);
             }
             resetPath();
         }
 
-        /** A filled axis-aligned rect thinner than THIN_FILL_MAX in one dimension is a drawn line. */
-        private void emitThinFillAsRuling(List<float[]> sp) {
-            if (sp.isEmpty()) return;
+        /** A filled axis-aligned rect thinner than THIN_FILL_MAX in one dimension is a drawn line.
+         * Returns true when {@code sp} qualified as such a thin bar and its single centerline
+         * ruling was emitted -- read by {@link #fillAndStrokePath} to decide whether the stroked
+         * rectangle edges must be suppressed for this same subpath (see that method's doc). */
+        private boolean emitThinFillAsRuling(List<float[]> sp) {
+            if (sp.isEmpty()) return false;
             float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
             for (float[] p : sp) {
                 minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
@@ -1176,10 +1192,13 @@ final class TableExtractor {
             if (h <= THIN_FILL_MAX && w >= MIN_RULING_LEN) {
                 float midY = (minY + maxY) / 2;
                 addRuling(minX, midY, maxX, midY);
+                return true;
             } else if (w <= THIN_FILL_MAX && h >= MIN_RULING_LEN) {
                 float midX = (minX + maxX) / 2;
                 addRuling(midX, minY, midX, maxY);
+                return true;
             }
+            return false;
         }
 
         // -- everything else ignored

@@ -514,4 +514,164 @@ class TableGeometryTest {
         c.x0 = x0; c.y0 = y0; c.x1 = x1; c.y1 = y1;
         return c;
     }
+
+    // ------------------------------------------------------- FIX 3: per-component split isolation
+
+    private static List<TableExtractor.CellRect> plain3x3Grid() {
+        List<TableExtractor.Ruling> raw = new ArrayList<>();
+        for (float y : new float[]{100, 130, 160, 190}) raw.add(h(y, 50, 350));
+        for (float x : new float[]{50, 150, 250, 350}) raw.add(v(x, 100, 190));
+        List<TableExtractor.Ruling> n = TableExtractor.normalize(raw);
+        return TableExtractor.findCells(
+                n.stream().filter(TableExtractor.Ruling::horizontal).toList(),
+                n.stream().filter(TableExtractor.Ruling::vertical).toList());
+    }
+
+    /** The exact offset-pitch shape from {@code splitComponentThrowsOnStraddleScanWorkBudget},
+     * guaranteed to trip {@code MAX_SPLIT_WORK} inside {@code splitComponent}. */
+    private static List<TableExtractor.CellRect> adversarialSplitWorkBomb() {
+        int cols = 5000;
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        cells.add(cellRect(0f, 0f, 10f, 20f));
+        for (int c = 1; c < cols; c++) {
+            cells.add(cellRect(c * 10f, 0f, c * 10f + 10f, 10f));
+            cells.add(cellRect(c * 10f + 5f, 10f, c * 10f + 15f, 20f));
+        }
+        return cells;
+    }
+
+    @Test
+    void selectKeptTablesIsolatesOneAdversarialComponentFromOthers() {
+        // FIX 3 reproducer: extractLatticePage's per-component loop used to call splitComponent
+        // with NO per-component try/catch, so ONE adversarial component's RulingOverflowException
+        // (MAX_SPLIT_WORK) unwound the WHOLE per-page loop -- kept (and, transitively,
+        // Result.tables) is only populated AFTER that loop returns, so every OTHER legitimate
+        // table already found on the page was silently discarded too (REPRODUCED: 3 legit tables
+        // lost to 1 adversarial 880-cell component). 3 good components + 1 adversarial
+        // (budget-tripping) component must yield exactly the 3 good tables, with truncated set
+        // for the skipped adversarial one -- red pre-fix (0 or fewer than 3 tables survive
+        // because the whole call throws), green after.
+        List<List<TableExtractor.CellRect>> components = new ArrayList<>();
+        for (int t = 0; t < 3; t++) components.add(plain3x3Grid());
+        components.add(adversarialSplitWorkBomb());
+
+        TableExtractor.Result result = new TableExtractor.Result();
+        List<List<TableExtractor.CellRect>> kept =
+                TableExtractor.selectKeptTables(components, 1, result);
+
+        assertEquals(3, kept.size(),
+                "the 3 good components must survive even though the 4th trips the split-work budget: "
+                        + kept.size());
+        assertTrue(result.truncated, "the skipped adversarial component must set Result.truncated");
+        for (List<TableExtractor.CellRect> comp : kept) {
+            TableExtractor.TableHit t = TableExtractor.buildTable(1, comp, "lattice");
+            assertNotNull(t, "each surviving component must still build into a valid table");
+            assertEquals(3, t.rowCount);
+            assertEquals(3, t.colCount);
+        }
+    }
+
+    @Test
+    void selectKeptTablesStillWorksWithNoAdversarialComponent() {
+        // Regression guard: the ordinary (no adversarial component) case must behave exactly as
+        // before -- all good components kept, nothing truncated.
+        List<List<TableExtractor.CellRect>> components = new ArrayList<>();
+        for (int t = 0; t < 3; t++) components.add(plain3x3Grid());
+
+        TableExtractor.Result result = new TableExtractor.Result();
+        List<List<TableExtractor.CellRect>> kept =
+                TableExtractor.selectKeptTables(components, 1, result);
+
+        assertEquals(3, kept.size());
+        assertFalse(result.truncated);
+    }
+
+    // --------------------------------------------------------- FIX 4: splitComponent depth cap
+
+    /**
+     * A chain of {@code count} tables placed side by side, each spanning the SAME shared y-range
+     * [0, H] but with its own UNIQUE internal row boundary at y = 2*i (i = 1..count, so all
+     * boundaries land exactly on the SNAP=2pt grid with no rounding ambiguity). Because each
+     * table's boundary is unique to it (no other table in the chain shares that exact y value),
+     * removing ANY single table from the merged set strictly reduces the total distinct-boundary
+     * count by exactly one -- so splitComponent's acceptance condition ("merged perpendicular
+     * count strictly exceeds EITHER side's own") holds at the very first (leftmost) interior x
+     * boundary tried, peeling off table 1 and recursing on the rest, then peeling off table 2,
+     * and so on -- an intentionally "peelable" shape that recurses roughly {@code count} levels
+     * deep, one level per peel, with NO cap.
+     */
+    private static List<TableExtractor.CellRect> peelableChain(int count) {
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        float h = 2f * (count + 1); // shared height; every internal split lands on the SNAP grid
+        for (int i = 1; i <= count; i++) {
+            float xBase = (i - 1) * 200f;
+            float split = 2f * i; // this table's OWN unique internal row boundary
+            cells.add(cellRect(xBase, 0f, xBase + 100f, split));
+            cells.add(cellRect(xBase + 100f, 0f, xBase + 200f, split));
+            cells.add(cellRect(xBase, split, xBase + 100f, h));
+            cells.add(cellRect(xBase + 100f, split, xBase + 200f, h));
+        }
+        return cells;
+    }
+
+    @Test
+    void splitComponentDepthCapPreventsUnboundedRecursionAndStackOverflow() throws Exception {
+        // FIX 4 reproducer: splitComponent/tryCuts recursion had NO depth cap (unlike every
+        // sibling recursive walk in this class), so a "peelable" adversarial shape recurses one
+        // level per peel with nothing to stop it. On a constrained stack (plausible in this
+        // project's firecracker/gvisor microVM deploy targets) this is a StackOverflowError --
+        // an Error that would escape a plain catch(RulingOverflowException)/catch(Exception).
+        // Run on a dedicated 128KB-stack thread to prove no SOE escapes; the depth cap must also
+        // engage well before all `count` tables are individually peeled out.
+        int count = 200;
+        List<TableExtractor.CellRect> chain = peelableChain(count);
+
+        var resultRef = new java.util.concurrent.atomic.AtomicReference<List<List<TableExtractor.CellRect>>>();
+        var errorRef = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        Thread t = new Thread(null, () -> {
+            try {
+                resultRef.set(TableExtractor.splitComponent(chain));
+            } catch (Throwable e) {
+                errorRef.set(e);
+            }
+        }, "small-stack-split-test", 128 * 1024);
+        t.start();
+        t.join(15_000);
+
+        assertFalse(t.isAlive(), "splitComponent must complete promptly on a deep peelable chain, not hang");
+        assertNull(errorRef.get(), "splitComponent must not let a StackOverflowError escape on a "
+                + "constrained (128KB) stack: " + errorRef.get());
+
+        List<List<TableExtractor.CellRect>> split = resultRef.get();
+        assertNotNull(split);
+        int totalCells = split.stream().mapToInt(List::size).sum();
+        assertEquals(chain.size(), totalCells, "no cells may be dropped even when the depth cap engages");
+        assertTrue(split.size() < count,
+                "the depth cap must engage before fully peeling all " + count + " tables individually, got "
+                        + split.size() + " pieces");
+        assertTrue(split.size() <= TableExtractor.MAX_SPLIT_DEPTH + 2,
+                "split piece count must be bounded close to MAX_SPLIT_DEPTH, not merely 'less than " + count
+                        + "': got " + split.size() + " pieces");
+    }
+
+    @Test
+    void splitComponentHandlesAShallowPeelableChainCompletely() {
+        // Positive companion: a chain well under the depth cap must peel apart FULLY and
+        // correctly (every table becomes its own well-formed 2x2 piece), proving the depth cap
+        // doesn't harm a legitimate, moderately-chained input.
+        int count = 10;
+        List<TableExtractor.CellRect> chain = peelableChain(count);
+
+        List<List<TableExtractor.CellRect>> split = TableExtractor.splitComponent(chain);
+        assertEquals(count, split.size(), "a shallow chain must fully separate into " + count + " tables");
+        for (List<TableExtractor.CellRect> piece : split) {
+            assertEquals(4, piece.size());
+            TableExtractor.TableHit t = TableExtractor.buildTable(1, piece, "lattice");
+            assertNotNull(t);
+            assertEquals(2, t.rowCount);
+            assertEquals(2, t.colCount);
+            assertTrue(t.cells.stream().allMatch(c -> c.rowSpan == 1 && c.colSpan == 1),
+                    "each peeled-off table must carry no invented spans: " + t.cells);
+        }
+    }
 }

@@ -222,6 +222,40 @@ class TableLatticeTest {
     }
 
     @Test
+    void fillCellsByRegionGlyphWorkIsBudgeted() throws Exception {
+        // FIX 2 reproducer: fillCellsByRegion's GLYPH side (as opposed to the cell side capped by
+        // MAX_REGION_CELLS above) used to be unbounded -- it registered one PDFTextStripperByArea
+        // region per kept cell and let extractRegions() do its own O(glyphs x cells) matching
+        // internally, with no work budget at all. A hostile page pairing a huge glyph count with
+        // a many-celled table (well under MAX_REGION_CELLS) could stall past the hard-halt in
+        // that single call. fillCellsByRegion now collects positions via one linear strip and
+        // feeds them through the SAME budgeted fillCellsFromPositions bucketing the normal path
+        // uses -- pin that with the package-private explicit-budget overload (mirroring
+        // fillCellsFromPositions' own test-only budget override) rather than needing a real
+        // multi-hundred-thousand-glyph fixture.
+        Path pdf = tmp.resolve("regionbudget.pdf");
+        TableTestPdfs.ruled3x3(pdf); // a handful of real glyphs (R1C1..R3C3) is plenty
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            PDPage page = doc.getPage(0);
+
+            List<TableExtractor.CellRect> comp = new ArrayList<>();
+            for (int i = 0; i < 20; i++) {
+                TableExtractor.CellRect c = new TableExtractor.CellRect();
+                c.x0 = 0; c.y0 = 0; c.x1 = 400; c.y1 = 400; // overlaps all the real glyphs
+                comp.add(c);
+            }
+            List<List<TableExtractor.CellRect>> tables = List.of(comp);
+            assertTrue(comp.size() <= TableExtractor.MAX_REGION_CELLS,
+                    "sanity: this must exercise the GLYPH budget, not the (separate) cell-count cap");
+
+            TableExtractor.Result result = new TableExtractor.Result();
+            assertThrows(TableExtractor.RulingOverflowException.class,
+                    () -> TableExtractor.fillCellsByRegion(tables, page, result, 2L),
+                    "a glyph-count x cell-count product exceeding the budget must throw, not stall unbounded");
+        }
+    }
+
+    @Test
     void interruptedThreadStopsProcessingFurtherPages() throws Exception {
         // extract() had zero interrupt checks: a multi-page hostile doc would ignore a soft
         // --timeout entirely (only checked by the caller AFTER extract() returns), eventually

@@ -19,14 +19,16 @@ import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedConte
 import org.apache.pdfbox.pdmodel.documentinterchange.taggedpdf.PDTableAttributeObject;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImage;
 import org.apache.pdfbox.text.PDFMarkedContentExtractor;
-import org.apache.pdfbox.text.PDFTextStripperByArea;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
 
 import java.awt.geom.Point2D;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -77,12 +79,28 @@ final class TableExtractor {
     // grid at that size completes in low hundreds of thousands of pair checks, comfortably under
     // 1% of this budget). Counts each touches() pair evaluation across the whole call.
     static final long MAX_GROUPING_WORK = 60_000_000;
-    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion), which unlike
-    // fillCellsFromPositions had no work budget: it registers one PDFTextStripperByArea region
-    // per kept cell (up to ~40k) and extractRegions() is O(glyphs x cells). Counted per page,
-    // across every kept table combined (fillCellsByRegion already batches all of them into one
-    // content-stream walk).
+    // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion). FIX 2: this path used
+    // to register one PDFTextStripperByArea region per kept cell (up to ~40k) and run an
+    // extractRegions() pass that was O(glyphs x cells) with NO other work budget -- a few-KB PDF
+    // with millions of glyphs could blow past the hard-halt in one uninterruptible call even
+    // with cells capped. fillCellsByRegion now does a single O(glyphs) content-stream strip (see
+    // stripAllPositions) feeding the already-budgeted fillCellsFromPositions (MAX_TEXTFILL_WORK)
+    // instead, so the glyph side is bounded the same way the normal (non--skip-text-urls) path
+    // always was. This cap remains as a cheap, independent backstop on the cell side (still
+    // bounds memory/region count semantics for callers/tests that rely on it) even though the
+    // glyph-matching cost it used to guard no longer exists in its old unbounded form.
     static final int MAX_REGION_CELLS = 5_000;
+    // FIX 4: caps splitComponent/tryCuts' OWN recursion depth (distinct from MAX_SPLIT_WORK,
+    // which bounds total work but not stack depth), mirroring the depth>64 convention used by
+    // every other recursive walk in this class (collectByType/collectGlyphs/resolveElementPage).
+    // A "peelable" adversarial component -- one legitimate cut found at every level, recursing
+    // into an ever-shrinking remainder -- can otherwise recurse hundreds of levels deep with NO
+    // other guard against it; on a constrained stack (e.g. a 128KB microVM worker thread) this
+    // is a StackOverflowError waiting to happen, an Error that would otherwise escape the lattice
+    // per-page catch(Exception) entirely. Past the cap, splitComponent degrades to "return the
+    // component un-split" (same fallback already used when no valid cut is found) rather than
+    // recursing further -- a plausible-if-imperfect placement, never a crash.
+    static final int MAX_SPLIT_DEPTH = 64;
 
     private TableExtractor() {}
 
@@ -599,11 +617,17 @@ final class TableExtractor {
      * here, separate from the existing per-table cell-count cap.
      */
     static List<List<CellRect>> splitComponent(List<CellRect> comp) {
-        return splitComponent(comp, new long[]{0});
+        return splitComponent(comp, new long[]{0}, 0);
     }
 
-    private static List<List<CellRect>> splitComponent(List<CellRect> comp, long[] work) {
+    /** {@code depth} is FIX 4's recursion-depth guard (see {@link #MAX_SPLIT_DEPTH}), separate
+     * from and in addition to the {@code work}-budget cap: a "peelable" adversarial shape (a
+     * valid cut found at every level, recursing into an ever-shrinking remainder) can recurse
+     * hundreds of levels deep while staying comfortably under MAX_SPLIT_WORK the whole time, so
+     * the work budget alone does not bound stack depth. */
+    private static List<List<CellRect>> splitComponent(List<CellRect> comp, long[] work, int depth) {
         if (comp.size() < 2) return List.of(comp);
+        if (depth > MAX_SPLIT_DEPTH) return List.of(comp); // degrade to "one table", not unbounded recursion
         GridPlacement g = placeGridBudgeted(comp, work);
         if (g.rowCount < 2 || g.colCount < 2 || !hasAnySpan(g)) return List.of(comp);
 
@@ -616,9 +640,9 @@ final class TableExtractor {
         // through to "unsplit", garbling both tables' placement AND clamping B's genuine header
         // colSpan to 1 via buildTable's incoherence safety net -- see
         // TableGeometryTest.splitComponentSplitsWhenOneTableHasNoRowSpanButOtherHasColSpanHeader.
-        List<List<CellRect>> viaVertical = tryCuts(comp, g.xs, true, g.rowCount, work);
+        List<List<CellRect>> viaVertical = tryCuts(comp, g.xs, true, g.rowCount, work, depth);
         if (viaVertical != null) return viaVertical;
-        List<List<CellRect>> viaHorizontal = tryCuts(comp, g.ys, false, g.colCount, work);
+        List<List<CellRect>> viaHorizontal = tryCuts(comp, g.ys, false, g.colCount, work, depth);
         if (viaHorizontal != null) return viaHorizontal;
         return List.of(comp); // no clean cut -- unsplit fallback; buildTable will clamp spans
     }
@@ -629,7 +653,7 @@ final class TableExtractor {
      * (undivided) component's boundary count on the axis perpendicular to the cut (rowCount for a
      * vertical cut, colCount for a horizontal one). */
     private static List<List<CellRect>> tryCuts(List<CellRect> comp, List<Float> boundaries,
-                                                 boolean vertical, int mergedPerpCount, long[] work) {
+                                                 boolean vertical, int mergedPerpCount, long[] work, int depth) {
         for (int k = 1; k < boundaries.size() - 1; k++) {
             float cut = boundaries.get(k);
             List<CellRect> side1 = new ArrayList<>();
@@ -662,8 +686,8 @@ final class TableExtractor {
             if (!(mergedPerpCount > perp1 && mergedPerpCount > perp2)) continue;
 
             List<List<CellRect>> result = new ArrayList<>();
-            result.addAll(splitComponent(side1, work));
-            result.addAll(splitComponent(side2, work));
+            result.addAll(splitComponent(side1, work, depth + 1));
+            result.addAll(splitComponent(side2, work, depth + 1));
             return result;
         }
         return null;
@@ -1065,54 +1089,94 @@ final class TableExtractor {
     }
 
     /**
-     * Fallback when no TextPositions were collected (--skip-text-urls): region-strip, batched
-     * into ONE {@code PDFTextStripperByArea} pass (one content-stream walk) for every qualifying
-     * table on the page, rather than one walk per table. Regions are namespaced
-     * {@code "t"+tableIdx+"c"+cellIdx} so cells from different tables never collide.
+     * Fallback when no TextPositions were collected (--skip-text-urls). FIX 2: previously this
+     * batched every qualifying table's cells into ONE {@code PDFTextStripperByArea} pass (one
+     * content-stream walk), registering one region per kept cell and letting
+     * {@code extractRegions()} do its own O(glyphs x cells) region-matching internally, with NO
+     * work budget on the glyph side -- a hostile few-KB page with a huge glyph count crossed
+     * with a many-celled table could stall well past the hard-halt in that single
+     * uninterruptible call, even with the cell side capped (see {@link #MAX_REGION_CELLS}).
      *
-     * <p>{@code PDFTextStripperByArea} matches a region against {@code TextPosition.getX()/getY()}
-     * (verified from source: {@code rect.contains(text.getX(), text.getY())}), which -- unlike
-     * getXDirAdj/getYDirAdj -- IS keyed off the page's actual /Rotate. Our cell rects are already
-     * in that same visual frame (via {@link #collectRulings}), so no extra transform is needed
-     * here.
-     *
-     * <p>{@code setSortByPosition(true)}: without it, on a page whose /Rotate disagrees with its
-     * glyphs' own (unrotated) text direction -- exactly the shape produced by rotating an
-     * otherwise-ordinary page via the /Rotate flag alone, which is how {@code rotatedRuled3x3}
-     * (and plenty of real scanned/rotated PDFs) are built -- the default line-grouping
-     * mis-splits a single token across several one-character lines (e.g. "R3C1" back as
-     * "R\n3C\n1"). Verified empirically: identical region, same characters matched, only this
-     * flag differs between the broken and clean output.
+     * <p>Instead this now does a single O(glyphs) content-stream strip ({@link
+     * #stripAllPositions}), collecting every {@code TextPosition} on the page exactly once, and
+     * feeds them through the SAME already-budgeted {@link #fillCellsFromPositions} bucketing
+     * (MAX_TEXTFILL_WORK) the normal (non--skip-text-urls) path already uses -- the glyph side is
+     * now bounded the identical way for both paths, and the two are verified to produce identical
+     * output on rotated pages (see {@code TableLatticeTest.rotatedPageExtractsFaithfully}).
      */
     static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
-        // Bound the cells side (see MAX_REGION_CELLS): unlike fillCellsFromPositions, this path
-        // has no other natural work budget -- one PDFTextStripperByArea region per kept cell,
-        // then an O(glyphs x cells) extractRegions() pass. A hostile page whose kept-cell count
-        // (across every table combined) exceeds the cap must not register any regions / walk the
-        // content stream at all; flag truncated and bail out promptly instead.
+        fillCellsByRegion(tables, page, result, MAX_TEXTFILL_WORK);
+    }
+
+    /** Package-private overload taking an explicit glyph-work budget, mirroring {@link
+     * #fillCellsFromPositions(List, List, int, float, float, long[], long)}'s test-only budget
+     * override -- lets a test pin FIX 2's glyph-work bound deterministically without needing a
+     * real multi-hundred-thousand-glyph PDF fixture. */
+    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result, long budget)
+            throws IOException {
+        // Bound the cells side (see MAX_REGION_CELLS): a hostile page whose kept-cell count
+        // (across every table combined) exceeds the cap must not walk the content stream at all;
+        // flag truncated and bail out promptly instead.
         long totalCells = 0;
         for (List<CellRect> comp : tables) totalCells += comp.size();
         if (totalCells > MAX_REGION_CELLS) {
             result.truncated = true;
             return;
         }
-        PDFTextStripperByArea area = new PDFTextStripperByArea();
-        area.setSortByPosition(true);
-        for (int ti = 0; ti < tables.size(); ti++) {
-            List<CellRect> comp = tables.get(ti);
-            for (int ci = 0; ci < comp.size(); ci++) {
-                CellRect c = comp.get(ci);
-                area.addRegion("t" + ti + "c" + ci,
-                        new java.awt.geom.Rectangle2D.Float(c.x0, c.y0, c.x1 - c.x0, c.y1 - c.y0));
-            }
+        if (tables.isEmpty()) return;
+
+        int rotation = page.getRotation();
+        PDRectangle cropBox = page.getCropBox();
+        float unrotatedW = cropBox.getWidth();
+        float unrotatedH = cropBox.getHeight();
+
+        List<TextPosition> positions = stripAllPositions(page);
+        long[] work = {0};
+        for (List<CellRect> comp : tables) {
+            fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, budget);
         }
-        area.extractRegions(page);
-        for (int ti = 0; ti < tables.size(); ti++) {
-            List<CellRect> comp = tables.get(ti);
-            for (int ci = 0; ci < comp.size(); ci++) {
-                comp.get(ci).text = area.getTextForRegion("t" + ti + "c" + ci).strip();
+    }
+
+    /**
+     * Single linear (O(glyphs)) content-stream walk collecting every {@code TextPosition} on the
+     * page -- the FIX 2 replacement for the old per-region {@code PDFTextStripperByArea} pass.
+     * {@code getXDirAdj()/getYDirAdj()} (which {@link #fillCellsFromPositions} keys off) report
+     * per-glyph text DIRECTION, not the page's /Rotate, so this is the SAME raw-position
+     * collection the normal (non--skip-text-urls) path already uses; {@link #applyPageRotation}
+     * (inside fillCellsFromPositions) reconciles it against the /Rotate-aware cell rects.
+     *
+     * <p>{@code setSortByPosition(true)} mirrors {@code PositionAwareTextStripper}'s production
+     * usage (the normal path's own text stripper) for consistency; {@link #joinText} does its own
+     * from-scratch line clustering over the raw positions regardless of how PDFTextStripper
+     * batches characters into {@code writeString} calls, so this collection is order-independent.
+     *
+     * <p>{@code processPage(page)} is called directly (no {@code getText(document)} call, no
+     * explicit setStartPage/setEndPage): PDFTextStripper's defaults (currentPageNo=1,
+     * startPage=1, endPage=MAX_VALUE) already satisfy processPage's own page-range gate for a
+     * single freshly-constructed stripper, the same reason {@code PDFTextStripperByArea
+     * .extractRegions(page)} could call processPage(page) directly before this fix.
+     */
+    private static List<TextPosition> stripAllPositions(PDPage page) throws IOException {
+        List<TextPosition> positions = new ArrayList<>();
+        PDFTextStripper stripper = new PDFTextStripper() {
+            {
+                // processPage() is called directly below (see this method's own doc comment on
+                // why that's safe), bypassing getText(document) -- which is normally what
+                // initializes the protected `output` Writer before any page is processed.
+                // Internal writeXxx hooks other than writeString (paragraph/line separators etc.)
+                // still write straight to `output` regardless of our override below, so it must
+                // be a real (if discarded) Writer, not null.
+                output = new java.io.StringWriter();
             }
-        }
+
+            @Override
+            protected void writeString(String s, List<TextPosition> textPositions) {
+                positions.addAll(textPositions);
+            }
+        };
+        stripper.setSortByPosition(true);
+        stripper.processPage(page);
+        return positions;
     }
 
     // ---------------------------------------------------------------- entry point
@@ -1194,23 +1258,7 @@ final class TableExtractor {
         // MAX_CELLS_PER_TABLE / MAX_TABLES_PER_PAGE gates below, so each resulting sub-table is
         // gated on its own true size/count) detects that case and emits the maximal coherent
         // sub-grids instead of one bogus merged grid.
-        List<List<CellRect>> kept = new ArrayList<>();
-        int tablesOnPage = 0;
-        pageLoop:
-        for (List<CellRect> comp : groupIntoTables(cells)) {
-            if (comp.size() > MAX_CELLS_PER_TABLE) {
-                result.truncated = true;
-                continue;
-            }
-            for (List<CellRect> sub : splitComponent(comp)) {
-                if (buildTable(pageNum, sub, "lattice") == null) continue;
-                if (++tablesOnPage > MAX_TABLES_PER_PAGE) {
-                    result.truncated = true;
-                    break pageLoop;
-                }
-                kept.add(sub);
-            }
-        }
+        List<List<CellRect>> kept = selectKeptTables(groupIntoTables(cells), pageNum, result);
 
         if (positions != null && !positions.isEmpty()) {
             long[] work = {0};
@@ -1228,6 +1276,60 @@ final class TableExtractor {
         }
     }
 
+    /**
+     * Decides which grouped components (from {@link #groupIntoTables}) actually become kept
+     * tables: runs {@link #splitComponent} per component, then gates the resulting sub-tables
+     * against {@link #MAX_CELLS_PER_TABLE} / {@link #MAX_TABLES_PER_PAGE}. Package-private (split
+     * out of {@link #extractLatticePage}) so tests can drive it directly with a synthetic
+     * component list, without needing PDF/ruling geometry.
+     *
+     * <p>FIX 3: splitComponent's {@link RulingOverflowException} (MAX_SPLIT_WORK) used to have no
+     * per-component try/catch here, so ONE adversarial component's budget trip unwound this WHOLE
+     * loop -- since {@code kept} (and, transitively, {@code Result.tables}) is only populated
+     * AFTER the loop returns, every OTHER legitimate table already found on the page was silently
+     * lost too (REPRODUCED: 3 legit tables lost to 1 adversarial 880-cell component). Isolate the
+     * failure to just the offending component: skip it (flagging {@code truncated}) and keep
+     * processing the rest.
+     *
+     * <p>FIX 4(b): likewise, a {@link StackOverflowError} escaping splitComponent's recursion
+     * (the {@link #MAX_SPLIT_DEPTH} guard should already prevent this, but on a constrained stack
+     * an Error can still slip past a coarser guard) must not kill the whole page -- or the worker
+     * -- either, mirroring {@code extractTagged}'s existing {@code catch(StackOverflowError)} for
+     * the tagged path.
+     */
+    static List<List<CellRect>> selectKeptTables(List<List<CellRect>> components, int pageNum, Result result) {
+        List<List<CellRect>> kept = new ArrayList<>();
+        int tablesOnPage = 0;
+        pageLoop:
+        for (List<CellRect> comp : components) {
+            if (comp.size() > MAX_CELLS_PER_TABLE) {
+                result.truncated = true;
+                continue;
+            }
+            List<List<CellRect>> subComponents;
+            try {
+                subComponents = splitComponent(comp);
+            } catch (RulingOverflowException e) {
+                result.truncated = true;
+                System.err.println("WARNING: table split skipped on page " + pageNum + " (split-work cap)");
+                continue;
+            } catch (StackOverflowError e) {
+                result.truncated = true;
+                System.err.println("WARNING: table split overflowed the stack on page " + pageNum + " (component skipped): " + e);
+                continue;
+            }
+            for (List<CellRect> sub : subComponents) {
+                if (buildTable(pageNum, sub, "lattice") == null) continue;
+                if (++tablesOnPage > MAX_TABLES_PER_PAGE) {
+                    result.truncated = true;
+                    break pageLoop;
+                }
+                kept.add(sub);
+            }
+        }
+        return kept;
+    }
+
     // ---------------------------------------------------------------- tagged path
 
     // Structure types collectByType must not descend past when walking for "TR" (or nested
@@ -1242,6 +1344,14 @@ final class TableExtractor {
      * out-of-scope-page table never triggers a content-stream walk. Not reset automatically;
      * callers should snapshot the value before/after the call under test. */
     static int taggedProcessPageCalls = 0;
+
+    /** Test-only instrumentation: counts DISTINCT structure-tree nodes actually recursed into by
+     * {@link #collectByType} and {@link #collectGlyphs} (i.e. AFTER the FIX 1 identity-memoization
+     * skip check), across both call sites. Package-private so tests can assert a DAG "diamond"
+     * fan-in (the same child element referenced as more than one kid) is visited ONCE, not
+     * exponentially re-visited -- linear in distinct nodes, not exponential in depth. Not reset
+     * automatically; callers should snapshot the value before/after the call under test. */
+    static long structureNodesVisited = 0;
 
     /** Internal: one tagged cell before grid placement. */
     private static final class TaggedCell {
@@ -1362,17 +1472,35 @@ final class TableExtractor {
     /** DFS for structure elements of a standard type; depth-capped against cyclic/hostile trees.
      * Does not descend past any element whose standard type is in {@code stopTypes} (still adds
      * it first if it matches {@code type} itself) -- used to keep a nested Table's TR/TD from
-     * being folded into an outer table's row list. */
-    private static void collectByType(PDStructureNode node, String type,
-                                      List<PDStructureElement> out, int depth, Set<String> stopTypes) {
+     * being folded into an outer table's row list.
+     *
+     * <p>FIX 1: a PDF structure tree is a DAG, not a tree -- {@code PDStructureElement.appendKid}
+     * allows the SAME child element to be referenced as a kid of more than one parent. A "diamond"
+     * chain where each level references the same previous element as BOTH of its kids causes 2^N
+     * visits with only a depth guard (REPRODUCED: depth=22 -> 4.1s on a real ~1KB fixture, and
+     * depth is attacker-controlled up to the depth-64 cap, reaching hours). Threads an
+     * IDENTITY-keyed (COS object identity, not structural equals/hashCode) visited-set through the
+     * recursion so a child already reached via one parent is skipped, not re-walked, via another --
+     * converting exponential fan-in blowup into linear-in-distinct-nodes. Package-private (this
+     * entry point, not the recursive helper) so tests can drive a synthetic diamond DAG directly. */
+    static void collectByType(PDStructureNode node, String type,
+                              List<PDStructureElement> out, int depth, Set<String> stopTypes) {
+        collectByType(node, type, out, depth, stopTypes, Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private static void collectByType(PDStructureNode node, String type, List<PDStructureElement> out,
+                                      int depth, Set<String> stopTypes, Set<COSBase> visited) {
         if (depth > 64) return;
         for (Object kid : node.getKids()) {
             if (out.size() > 10_000) return; // bail mid-loop once the cap is hit, not just on entry
             if (!(kid instanceof PDStructureElement el)) continue;
+            COSBase cos = el.getCOSObject();
+            if (cos != null && !visited.add(cos)) continue; // DAG fan-in: already reached via another parent
+            structureNodesVisited++;
             String st = el.getStandardStructureType();
             if (type.equals(st)) out.add(el);
             if (stopTypes.contains(st)) continue; // nested Table (or other stop boundary): don't descend
-            collectByType(el, type, out, depth + 1, stopTypes);
+            collectByType(el, type, out, depth + 1, stopTypes, visited);
         }
     }
 
@@ -1512,9 +1640,23 @@ final class TableExtractor {
         if (resolvedPage != null) cell.page = resolvedPage;
     }
 
+    /** FIX 1: same DAG fan-in hazard as {@link #collectByType} (a shared structure element
+     * reachable via more than one parent), and REPRODUCED even worse here (depth=22 -> 11.2s,
+     * near the 15s hard-halt) since each visit also does glyph-resolution work. Same fix: an
+     * identity-keyed visited-set threaded through the recursion, skipping a child already reached
+     * via another parent. Package-private (this entry point) so tests can drive a synthetic
+     * diamond DAG directly. */
+    static void collectGlyphs(PDStructureNode node, PDPage inheritedPage, List<TextPosition> out,
+                              Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache, int depth,
+                              Map<PDPage, Integer> pageNumbers, Set<Integer> pagesToProcess) throws IOException {
+        collectGlyphs(node, inheritedPage, out, mcidCache, depth, pageNumbers, pagesToProcess,
+                Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
     private static void collectGlyphs(PDStructureNode node, PDPage inheritedPage, List<TextPosition> out,
                                       Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache, int depth,
-                                      Map<PDPage, Integer> pageNumbers, Set<Integer> pagesToProcess) throws IOException {
+                                      Map<PDPage, Integer> pageNumbers, Set<Integer> pagesToProcess,
+                                      Set<COSBase> visited) throws IOException {
         if (depth > 64) return;
         PDPage page = inheritedPage;
         if (node instanceof PDStructureElement el && el.getPage() != null) page = el.getPage();
@@ -1525,7 +1667,10 @@ final class TableExtractor {
                 // duplicate it and defeat the "nested rows don't leak into the outer table"
                 // fix -- so this cell's own text resolution stops at that boundary too.
                 if ("Table".equals(el.getStandardStructureType())) continue;
-                collectGlyphs(el, page, out, mcidCache, depth + 1, pageNumbers, pagesToProcess);
+                COSBase cos = el.getCOSObject();
+                if (cos != null && !visited.add(cos)) continue; // DAG fan-in: already reached via another parent
+                structureNodesVisited++;
+                collectGlyphs(el, page, out, mcidCache, depth + 1, pageNumbers, pagesToProcess, visited);
             } else if (kid instanceof Integer mcid && page != null) {
                 out.addAll(glyphsFor(page, mcid, mcidCache, pageNumbers, pagesToProcess));
             } else if (kid instanceof COSInteger ci && page != null) {

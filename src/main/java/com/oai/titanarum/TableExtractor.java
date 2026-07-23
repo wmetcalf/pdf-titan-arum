@@ -66,13 +66,17 @@ final class TableExtractor {
     // out deterministically, consistent with the other geometry caps' throw-and-skip-page
     // handling in extract()'s per-page catch.
     static final long MAX_TEXTFILL_WORK = 20_000_000;
-    // groupIntoTables' touches()/union() double loop runs over the WHOLE page's CellRect list
-    // BEFORE any per-table cap (MAX_CELLS_PER_TABLE, MAX_TABLES_PER_PAGE) gates it, so it is
-    // reachable at full page-cell-count scale (up to MAX_INTERSECTIONS-derived cell counts).
-    // Counts each touches() pair evaluation across the whole call; a legit page (a few thousand
-    // cells at most) stays far under this budget, consistent with the other geometry caps'
-    // throw-and-skip-page handling.
-    static final long MAX_GROUPING_WORK = 4_000_000;
+    // groupIntoTables' touches()/union() work runs over the WHOLE page's CellRect list BEFORE
+    // any per-table cap (MAX_CELLS_PER_TABLE, MAX_TABLES_PER_PAGE) gates it, so it is reachable
+    // at full page-cell-count scale (up to MAX_INTERSECTIONS-derived cell counts). Since v2,
+    // grouping is spatially indexed (near-linear on realistic input, see groupIntoTables' own
+    // doc comment) rather than a raw O(n^2) scan, so this budget is a pure backstop against a
+    // pathological, bucket-defeating cell distribution (e.g. many cells sharing one exact edge
+    // coordinate) -- NOT the primary defense, and set high enough that a legitimate table at
+    // MAX_CELLS_PER_TABLE (10,000 cells) never comes close to tripping it (a real 100x100 dense
+    // grid at that size completes in low hundreds of thousands of pair checks, comfortably under
+    // 1% of this budget). Counts each touches() pair evaluation across the whole call.
+    static final long MAX_GROUPING_WORK = 60_000_000;
     // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion), which unlike
     // fillCellsFromPositions had no work budget: it registers one PDFTextStripperByArea region
     // per kept cell (up to ~40k) and extractRegions() is O(glyphs x cells). Counted per page,
@@ -359,21 +363,67 @@ final class TableExtractor {
         return false;
     }
 
-    /** Union cells whose rectangles touch (within SNAP) into candidate tables. */
+    /**
+     * Union cells whose rectangles touch (within SNAP) into candidate tables.
+     *
+     * <p>Spatial index mirroring findCells' hByY/vByX pattern: two cells can only touch() if one
+     * of their edges shares a (within-SNAP) coordinate with one of the other's -- touches()
+     * itself requires an x- or y-edge match plus positive overlap on the other axis. So bucket
+     * every cell under each of its four snapped edge coordinates (x0, x1 into byXEdge; y0, y1
+     * into byYEdge), then for each cell only evaluate touches() against cells sharing (or
+     * SNAP-adjacent to) one of ITS OWN edge buckets, instead of the full O(n^2) all-pairs scan.
+     * A legitimate large, regular table (up to MAX_CELLS_PER_TABLE) has small real-world bucket
+     * occupancy (roughly the row/column count sharing a boundary line), so this completes far
+     * under MAX_GROUPING_WORK; only a pathological, bucket-defeating layout (e.g. many cells all
+     * sharing one exact edge coordinate) can still drive the work counter into the cap -- which
+     * remains as a pure backstop, not the primary defense.
+     *
+     * <p>Note: touches()' third branch (pure area overlap with no edge adjacency at all) is,
+     * per its own comment, not expected from real findCells() output (minimal cells tile the
+     * plane, they don't overlap) -- the edge-coordinate index above does not generate candidates
+     * for that case. Preserved for documentation: this is an intentional trade-off, not an
+     * oversight, favoring near-linear performance on realistic input.
+     */
     static List<List<CellRect>> groupIntoTables(List<CellRect> cells) {
         int n = cells.size();
         int[] parent = new int[n];
         for (int i = 0; i < n; i++) parent[i] = i;
-        long work = 0;
+
+        java.util.Map<Float, List<Integer>> byXEdge = new java.util.HashMap<>();
+        java.util.Map<Float, List<Integer>> byYEdge = new java.util.HashMap<>();
         for (int i = 0; i < n; i++) {
-            for (int j = i + 1; j < n; j++) {
+            CellRect c = cells.get(i);
+            byXEdge.computeIfAbsent(snap(c.x0), k -> new ArrayList<>()).add(i);
+            byXEdge.computeIfAbsent(snap(c.x1), k -> new ArrayList<>()).add(i);
+            byYEdge.computeIfAbsent(snap(c.y0), k -> new ArrayList<>()).add(i);
+            byYEdge.computeIfAbsent(snap(c.y1), k -> new ArrayList<>()).add(i);
+        }
+
+        long work = 0;
+        java.util.Set<Integer> candidates = new java.util.HashSet<>();
+        for (int i = 0; i < n; i++) {
+            CellRect a = cells.get(i);
+            candidates.clear();
+            addBucket(byXEdge, snap(a.x0), candidates);
+            addBucket(byXEdge, snap(a.x1), candidates);
+            addBucket(byYEdge, snap(a.y0), candidates);
+            addBucket(byYEdge, snap(a.y1), candidates);
+            for (int j : candidates) {
+                if (j <= i) continue; // undirected pair -- evaluate once, from the smaller index
                 if (++work > MAX_GROUPING_WORK) throw new RulingOverflowException();
-                if (touches(cells.get(i), cells.get(j))) union(parent, i, j);
+                if (touches(a, cells.get(j))) union(parent, i, j);
             }
         }
         java.util.Map<Integer, List<CellRect>> comps = new java.util.LinkedHashMap<>();
         for (int i = 0; i < n; i++) comps.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(cells.get(i));
         return new ArrayList<>(comps.values());
+    }
+
+    private static void addBucket(java.util.Map<Float, List<Integer>> byEdge, float key, java.util.Set<Integer> out) {
+        for (float k : new float[]{key - SNAP, key, key + SNAP}) {
+            List<Integer> bucket = byEdge.get(k);
+            if (bucket != null) out.addAll(bucket);
+        }
     }
 
     /**

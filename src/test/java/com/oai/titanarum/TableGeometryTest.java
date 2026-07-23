@@ -212,17 +212,20 @@ class TableGeometryTest {
 
     @Test
     void groupIntoTablesThrowsOnGroupingWorkBudget() {
-        // Reviewer's reproducer: groupIntoTables' double loop over touches()/union() runs
-        // BEFORE any per-table cap gates it, so a page whose findCells() output is a large,
-        // mutually-non-touching CellRect list (each far from every other -> full O(n^2) work,
-        // no early union short-circuit) must fail fast via MAX_GROUPING_WORK rather than
-        // grinding through every pair. n=3000 -> 3000*2999/2 = 4,498,500 pair checks, just
-        // over the 4,000,000 budget.
-        int n = 3000;
+        // Reshaped for the near-linear spatial-index rewrite (see groupIntoTables' own doc
+        // comment): touches() candidates are now bucketed by shared edge coordinate, so a
+        // merely large, far-apart cell list (the old test's shape) no longer defeats it -- the
+        // budget is now a pure backstop against a genuinely pathological, BUCKET-DEFEATING
+        // distribution. Here every cell shares the exact same y0/y1 (so they all land in the
+        // SAME y-edge bucket, forcing an O(n) candidate set per cell / ~O(n^2) total pair
+        // checks), while remaining spread far apart on x (so none of them actually touch).
+        // n=11,000 -> ~11,000*10,999/2 = 60,494,500 possible pair checks, just over the (now
+        // 60,000,000) budget.
+        int n = 11_000;
         List<TableExtractor.CellRect> cells = new ArrayList<>();
         for (int i = 0; i < n; i++) {
-            float base = i * 1000f;
-            cells.add(cellRect(base, base, base + 10f, base + 10f));
+            float x = i * 1000f;
+            cells.add(cellRect(x, 100f, x + 10f, 130f));
         }
         assertThrows(TableExtractor.RulingOverflowException.class,
                 () -> TableExtractor.groupIntoTables(cells));
@@ -240,6 +243,35 @@ class TableGeometryTest {
         }
         List<List<TableExtractor.CellRect>> comps = TableExtractor.groupIntoTables(cells);
         assertEquals(n, comps.size(), "far-apart cells must remain separate components");
+    }
+
+    @Test
+    void groupIntoTablesHandlesLegitimateLargeTableWithoutTripping() {
+        // Regression guard for the flat-O(n^2)-budget false-drop: a real, densely-touching
+        // table at MAX_CELLS_PER_TABLE scale (100x100 unit cells, every cell touching its
+        // neighbors) must group into ONE component, without throwing, and near-instantly. The
+        // old MAX_GROUPING_WORK=4,000,000 flat budget (below MAX_CELLS_PER_TABLE=10,000) would
+        // have wrongly dropped a table exactly this size -- whole page, before ever reaching the
+        // per-table cell cap. The spatial index must keep real large tables far under the (now
+        // much higher, backstop-only) budget.
+        int side = 100; // 100 x 100 = 10,000 cells == MAX_CELLS_PER_TABLE
+        List<TableExtractor.CellRect> cells = new ArrayList<>();
+        for (int r = 0; r < side; r++) {
+            for (int c = 0; c < side; c++) {
+                cells.add(cellRect(c * 10f, r * 10f, c * 10f + 10f, r * 10f + 10f));
+            }
+        }
+        assertEquals(side * side, cells.size());
+        assertEquals(TableExtractor.MAX_CELLS_PER_TABLE, cells.size());
+
+        long start = System.nanoTime();
+        List<List<TableExtractor.CellRect>> comps = TableExtractor.groupIntoTables(cells);
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        assertEquals(1, comps.size(), "a fully-connected dense grid must group into ONE component");
+        assertEquals(side * side, comps.get(0).size());
+        assertTrue(elapsedMs < 1000,
+                "a legit " + (side * side) + "-cell table must group in well under a second, took " + elapsedMs + "ms");
     }
 
     private static TableExtractor.CellRect cellRect(float x0, float y0, float x1, float y1) {

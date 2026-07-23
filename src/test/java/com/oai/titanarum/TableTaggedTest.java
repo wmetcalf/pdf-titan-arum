@@ -126,6 +126,34 @@ class TableTaggedTest {
     }
 
     @Test
+    void interruptedThreadStopsExtractTaggedPerTableLoop() throws Exception {
+        // extractTagged's per-Table-element loop got the same between-item interrupt check as
+        // extract()'s per-page loop (Fix 4), on the grounds a hostile structure tree can carry
+        // thousands of independent Table elements; this pins that it actually works. Reuses the
+        // existing independent-1x1-tables fixture, kept under MAX_TABLES_PER_PAGE so the
+        // uninterrupted baseline isn't already truncated by the per-page tagged-table cap.
+        Path pdf = tmp.resolve("manytables_interrupt.pdf");
+        int total = 30;
+        TableTestPdfs.taggedManyTablesOnePage(pdf, total);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result full = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(total, full.tables.size(), "sanity: every independent tagged table extracted when uninterrupted");
+            assertFalse(full.truncated);
+
+            Thread.currentThread().interrupt();
+            try {
+                TableExtractor.Result interrupted = TableExtractor.extract(doc, List.of(1), Map.of());
+                assertTrue(interrupted.truncated, "interrupted extractTagged per-table loop must set Result.truncated");
+                assertTrue(interrupted.tables.size() < total,
+                        "interrupted extract() must not process every tagged table: got "
+                                + interrupted.tables.size() + " of " + total);
+            } finally {
+                Thread.interrupted(); // clear the flag so it doesn't leak into other tests
+            }
+        }
+    }
+
+    @Test
     void tableOutsidePagesToProcessNeverWalksThatPagesContentStream() throws Exception {
         Path pdf = tmp.resolve("page2table.pdf");
         TableTestPdfs.taggedOnPageTwo(pdf);

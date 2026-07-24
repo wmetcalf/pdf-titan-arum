@@ -686,9 +686,8 @@ function buildExtractedTextSection(report) {
   if (!pages.length) return '';
   let html = '';
   for (const p of pages) {
-    const open = pages.length === 1 ? ' open' : '';
     const chars = (p.text || '').length;
-    html += '<details' + open + ' style="margin-bottom:0.4rem;border:1px solid #333;border-radius:3px">'
+    html += '<details style="margin-bottom:0.4rem;border:1px solid #333;border-radius:3px">'
       + '<summary style="cursor:pointer;padding:0.4rem 0.6rem;background:#1e1e1e">Page ' + esc(p.page)
       + ' <span style="color:#666;font-weight:normal">(' + chars + ' chars)</span></summary>'
       + '<pre style="margin:0;padding:0.6rem;white-space:pre-wrap;word-break:break-word;'

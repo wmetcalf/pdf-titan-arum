@@ -61,7 +61,10 @@ final class StreamTableExtractor {
             boolean newLine = cur != null && Math.abs(gy0 - prevBaseline) > 0.5f * fs;
             boolean gap     = cur != null && (gx0 - prevX1) > 0.30f * space;
             if (cur == null || whitespace || newLine || gap) {
-                if (cur != null) finishWord(cur, out);
+                if (cur != null) {
+                    finishWord(cur, out);
+                    if (out.size() > MAX_STREAM_WORDS) throw new TableExtractor.RulingOverflowException();
+                }
                 if (whitespace) { cur = null; continue; }
                 cur = new Word();
                 cur.x0 = gx0; cur.y0 = gy0; cur.x1 = gx0 + gw; cur.y1 = gy0 + gh;
@@ -73,9 +76,11 @@ final class StreamTableExtractor {
                 cur.text += u;
             }
             prevX1 = gx0 + gw; prevBaseline = gy0;
+        }
+        if (cur != null) {
+            finishWord(cur, out);
             if (out.size() > MAX_STREAM_WORDS) throw new TableExtractor.RulingOverflowException();
         }
-        if (cur != null) finishWord(cur, out);
         return out;
     }
 

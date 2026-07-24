@@ -97,6 +97,7 @@ public class WorkerPool {
             triageApp.setSkipScreenshots(job.skipScreenshots());
             triageApp.setSkipImages(job.skipImages());
             triageApp.setSkipPhones(job.skipPhones());
+            triageApp.setSkipTables(job.skipTables());
             triageApp.setSkipPageExport(job.skipPageExport());
             triageApp.setSkipTextUrls(job.skipTextUrls());
             triageApp.setNoSkipBlanks(job.noSkipBlanks());

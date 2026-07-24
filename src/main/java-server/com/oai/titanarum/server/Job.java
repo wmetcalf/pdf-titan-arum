@@ -19,6 +19,7 @@ public record Job(
     boolean skipScreenshots,
     boolean skipImages,
     boolean skipPhones,
+    boolean skipTables,
     boolean skipPageExport,
     boolean skipTextUrls,
     boolean skipQr,

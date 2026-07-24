@@ -277,6 +277,13 @@ final class StreamTableExtractor {
 
     static final double STREAM_CONFIDENCE_MIN = 0.55;
 
+    // See the rationale comment at the violationScore computation in scoreGrid(): a small flat
+    // plateau before the penalty ramp starts, tolerating the occasional straddling word that a
+    // real wrapped-cell table produces without disqualifying it, while still ramping heavily
+    // straddling ("really is prose") grids down to zero violationScore by the ceiling.
+    static final double VIOLATION_TOLERANCE = 0.02;  // <=2% straddling words: no penalty
+    static final double VIOLATION_CEILING   = 0.09;  // >=9% straddling words: violationScore = 0
+
     static final class Grid {
         List<Gutter> gutters;
         List<Line> rows;
@@ -303,7 +310,22 @@ final class StreamTableExtractor {
             for (Gutter g : gutters) if (w.x0 < g.cx() && w.x1 > g.cx()) { viol++; break; }
         }
         double violation = words == 0 ? 1 : (double) viol / words;
-        double violationScore = 1 - Math.min(1, violation / 0.05);
+        // A real wrapped-cell table (e.g. one very long token that overruns its column and
+        // pokes across the neighboring gutter) can have an OCCASIONAL straddling word without
+        // being prose -- straddling is a rendering artifact of long content, not proof the grid
+        // is fake. Without tolerance, a single straddler in a ~24-word table (violation ~0.04)
+        // already costs ~0.21 confidence off a term weighted at 0.25, enough to sink a
+        // legitimate table that sits thin above STREAM_CONFIDENCE_MIN. So: no penalty at all up
+        // to VIOLATION_TOLERANCE (occasional straddles are normal), then ramp down to zero by
+        // VIOLATION_CEILING (heavy straddling -- most rows crossing gutters -- really is prose
+        // or a bad column split and should still be punished hard).
+        double violationScore;
+        if (violation <= VIOLATION_TOLERANCE) {
+            violationScore = 1;
+        } else {
+            violationScore = 1 - Math.min(1,
+                (violation - VIOLATION_TOLERANCE) / (VIOLATION_CEILING - VIOLATION_TOLERANCE));
+        }
 
         // column consistency: rows with exactly one word-cluster per column and no straddle
         int consistentRows = 0;
@@ -336,16 +358,20 @@ final class StreamTableExtractor {
         double medianFill = fills.get(fills.size() / 2);
         double proseScore = clamp01((0.85 - medianFill) / 0.25);
 
-        // numeric lean: fraction of interior columns that are mostly numeric
+        // numeric lean: fraction of ALL columns that are mostly numeric. The spec never says
+        // which side holds the numbers -- a 2-column numeric table with the numbers in column
+        // 0 and labels in column 1 is just as real as the reverse. Scanning every column (not
+        // just c=1..cols-1) means the cols==2 gate below passes regardless of which column is
+        // numeric-leaning.
         int numericCols = 0;
-        for (int c = 1; c < cols; c++) {               // interior columns (skip col 0 = labels)
+        for (int c = 0; c < cols; c++) {
             int tot = 0, num = 0;
             for (Line l : lines) for (Word w : l.words) if (colOf(w.cx(), bounds) == c) {
                 tot++; if (w.numeric) num++;
             }
             if (tot > 0 && (double) num / tot >= 0.70) numericCols++;
         }
-        double numericBonus = cols > 1 ? (double) numericCols / (cols - 1) : 0;
+        double numericBonus = cols > 0 ? (double) numericCols / cols : 0;
         grid.numericLeanColumn = numericCols > 0;
 
         if (cols == 2 && numericBonus == 0) { grid.confidence = 0; return grid; }

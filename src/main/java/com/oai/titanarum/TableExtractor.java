@@ -1606,6 +1606,24 @@ final class TableExtractor {
             } catch (RulingOverflowException e) {
                 result.truncated = true;
                 System.err.println("WARNING: table extraction skipped on page " + pageNum + " (ruling cap)");
+            } catch (StackOverflowError e) {
+                // Symmetric with extractTagged's own catch(StackOverflowError) above: this per-page
+                // lattice path calls page.getRotation()/getCropBox() directly (and, via
+                // collectRulings/RulingCollector.processPage, again through pdfbox's own
+                // PDFStreamEngine.initPage), both of which resolve inherited page attributes via
+                // PDPageTree.getInheritableAttribute -- real pdfbox-internal recursion with a cycle
+                // guard but NO depth cap (see extractTagged's catch for the full writeup). A page
+                // whose /Parent is wired into a pathologically deep (but acyclic) chain overflows
+                // the stack here, an Error that the catch(RulingOverflowException)/catch(Exception)
+                // below can NEVER see (Error is not an Exception) -- previously escaping this whole
+                // per-page loop entirely and crashing extract() (and so the worker) outright on a
+                // single hostile page, instead of degrading just that one page. Isolate the failure
+                // to this page only (mirroring selectKeptTables'/splitComponent's own per-component
+                // StackOverflowError isolation): flag truncated and let every other page in
+                // pagesToProcess still extract normally.
+                result.truncated = true;
+                System.err.println("WARNING: table extraction overflowed the stack on page " + pageNum
+                        + " (page skipped): " + e);
             } catch (Exception e) {
                 System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
             }

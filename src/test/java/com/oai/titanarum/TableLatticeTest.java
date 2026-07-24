@@ -1,8 +1,12 @@
 package com.oai.titanarum;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSDictionary;
+import org.apache.pdfbox.cos.COSDocumentState;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.text.TextPosition;
 import org.junit.jupiter.api.Test;
@@ -606,6 +610,75 @@ class TableLatticeTest {
             long[] work = {0};
             assertThrows(TableExtractor.RulingOverflowException.class, () ->
                     TableExtractor.fillCellsFromPositions(List.of(cell), positions, 0, 612f, 792f, work, 2L));
+        }
+    }
+
+    @Test
+    void stackOverflowOnLatticePagePathIsCaughtAndMarksTruncated() throws Exception {
+        // PR re-review round 4 (symmetric hostile-page crash guard): extract()'s per-page LATTICE
+        // loop calls extractLatticePage(...), which itself calls page.getRotation()/getCropBox()
+        // directly (and again, via collectRulings/RulingCollector.processPage, through pdfbox's own
+        // PDFStreamEngine.initPage) -- both resolve inherited page attributes via
+        // PDPageTree.getInheritableAttribute, real pdfbox-internal recursion with a cycle guard but
+        // NO depth cap (see TableTaggedTest#stackOverflowInTaggedExtractionSetsTruncated's doc for
+        // the full writeup of this same mechanism). A page whose /Parent is wired into a
+        // pathologically deep (but acyclic) chain of synthetic /Pages nodes overflows the stack
+        // there -- previously an Error the per-page loop's catch(RulingOverflowException)/
+        // catch(Exception) could never see, escaping the WHOLE loop (and so extract() itself)
+        // uncaught on a single hostile page.
+        //
+        // Two-page document: page 1 is poisoned (no /Count spoof this time -- unlike the tagged
+        // reproducer, THIS test wants the lattice per-page loop to actually reach it); page 2 is a
+        // normal, well-formed ruled table, proving one hostile page degrades only itself while
+        // every other page in pagesToProcess still extracts.
+        try (PDDocument doc = new PDDocument()) {
+            PDPage poisoned = new PDPage(PDRectangle.LETTER);
+            doc.addPage(poisoned);
+
+            PDPage normal = new PDPage(PDRectangle.LETTER);
+            doc.addPage(normal);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, normal)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) TableTestPdfs.line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) TableTestPdfs.line(cs, x, 700, x, 610);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        TableTestPdfs.text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+            }
+
+            // Build the fake ancestry chain outermost-first, propagating pdfbox's own
+            // COSUpdateState.originDocumentState one level at a time as each node is created --
+            // see TableTaggedTest#stackOverflowInTaggedExtractionSetsTruncated's doc: linking a
+            // pre-built deep chain to an already-tracked page in one shot recurses too (a SEPARATE
+            // pdfbox-internal cascade, COSUpdateState.setOriginDocumentState), overflowing the
+            // stack during fixture SETUP rather than inside extract() under test here.
+            COSDocumentState originState = poisoned.getCOSObject().getUpdateState().getOriginDocumentState();
+            int depth = 500_000;
+            COSDictionary nodeAbovePage = null;
+            for (int i = 0; i < depth; i++) {
+                COSDictionary node = new COSDictionary();
+                node.setItem(COSName.TYPE, COSName.PAGES);
+                if (nodeAbovePage != null) node.setItem(COSName.PARENT, nodeAbovePage);
+                node.getUpdateState().setOriginDocumentState(originState);
+                nodeAbovePage = node;
+            }
+            // Kids-based traversal (doc.getPages(), doc.getPage(i)) is unaffected by /Parent, so
+            // page numbering/indexing stays normal -- deliberately NOT spoofing /Count this time,
+            // so the lattice per-page loop's own range check lets it reach this page.
+            poisoned.getCOSObject().setItem(COSName.PARENT, nodeAbovePage);
+
+            TableExtractor.Result r = assertDoesNotThrow(
+                    () -> TableExtractor.extract(doc, List.of(1, 2), Map.of()),
+                    "a StackOverflowError escaping the lattice per-page path must be caught, not propagate");
+
+            assertTrue(r.truncated,
+                    "a StackOverflowError escaping the lattice path for one page must mark the result truncated");
+            assertEquals(1, r.tables.size(),
+                    "the poisoned page must be skipped, but the other (well-formed) page must still extract: "
+                            + r.tables);
+            assertEquals(2, r.tables.get(0).page, "the surviving table must be the well-formed page's own table");
         }
     }
 

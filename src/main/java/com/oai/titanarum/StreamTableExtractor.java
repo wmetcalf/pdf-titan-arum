@@ -485,6 +485,17 @@ final class StreamTableExtractor {
     static final int MAX_STREAM_TABLES_PER_PAGE = 20;
 
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs) {
+        return extractPage(pageNum, glyphs, new BreuelGutterFinder());
+    }
+
+    /**
+     * Same per-page pipeline as {@link #extractPage(int, List)}, but with gutter detection routed
+     * through the given {@link GutterFinder} instead of the hard-coded {@link #findGutters}. Lets a
+     * bake-off harness run the full pipeline against any contender finder through this one seam.
+     * The 2-arg overload delegates here with the production default ({@link BreuelGutterFinder});
+     * that choice is unchanged pending bake-off results.
+     */
+    static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs, GutterFinder finder) {
         try {
             List<Word> words = buildWords(glyphs);
             if (words.size() < 6) return List.of();          // too little to be a table
@@ -496,7 +507,7 @@ final class StreamTableExtractor {
             for (Word w : words) { bandX0 = Math.min(bandX0, w.x0); bandX1 = Math.max(bandX1, w.x1); }
             float medianSpace = 0.5f * mfs;
 
-            List<Gutter> gutters = findGutters(lines, bandX0, bandX1, medianSpace);
+            List<Gutter> gutters = finder.find(lines, bandX0, bandX1, medianSpace);
             Grid grid = scoreGrid(lines, gutters, bandX0, bandX1);
             if (grid.confidence < STREAM_CONFIDENCE_MIN) return List.of();
 

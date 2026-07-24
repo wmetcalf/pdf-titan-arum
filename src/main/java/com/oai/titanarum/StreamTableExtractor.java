@@ -119,7 +119,15 @@ final class StreamTableExtractor {
     }
 
     static final int  MAX_GUTTER_CANDIDATES = 16;
-    static final long MAX_GUTTER_WORK       = 2_000_000;
+    // Bounds the REAL cost of the branch-and-bound below, not the pop count: every surviving
+    // pop runs an O(obstacles) linear scan (firstObstacleInside), so the true cost per pop is
+    // obstacles.size(), and that's what gets charged. Sized like this file's sibling budgets
+    // (MAX_TEXTFILL_WORK/MAX_GROUPING_WORK in TableExtractor) so a normal multi-column table
+    // (a few thousand word-obstacles) completes comfortably, while a dense/adversarial page
+    // near MAX_STREAM_WORDS (60,000 obstacles) aborts within a few hundred scans -- well under
+    // ~1-2s of CPU -- instead of the ~2,000,000-pop budget silently allowing pops*obstacles
+    // (unbounded) real work.
+    static final long MAX_GUTTER_SCAN_WORK  = 20_000_000;
 
     static final class Gutter {
         float x0, x1;
@@ -153,36 +161,61 @@ final class StreamTableExtractor {
         List<Rect> accepted = new ArrayList<>();
         long work = 0;
         while (!pq.isEmpty() && accepted.size() < MAX_GUTTER_CANDIDATES) {
-            if (++work > MAX_GUTTER_WORK) throw new TableExtractor.RulingOverflowException();
             Rect r = pq.poll();
             if (r.w() < minGutterW || r.h() < 0.60f * bandH) continue;
+            // Real cost is the O(obstacles) linear scan below, run once per surviving pop --
+            // charge that (not the pop itself) so the budget bounds actual CPU.
+            work += obstacles.size();
+            if (work > MAX_GUTTER_SCAN_WORK) throw new TableExtractor.RulingOverflowException();
             float[] pivot = firstObstacleInside(r, obstacles);
             if (pivot == null) {
                 accepted.add(r);                       // maximal empty & tall enough
                 continue;
             }
-            // split into up-to-4 maximal sub-rects excluding the pivot
+            // split into up-to-4 maximal sub-rects excluding the pivot. The pivot only
+            // OVERLAPS r (it need not be contained by it), so clamp the above/below
+            // children's y-range to the parent's -- otherwise pivot[1]/pivot[3] can land
+            // outside [r.y0, r.y1] and produce an inverted (negative-height) rect.
             if (pivot[0] - r.x0 >= minGutterW) pq.add(new Rect(r.x0, r.y0, pivot[0], r.y1)); // left
             if (r.x1 - pivot[2] >= minGutterW) pq.add(new Rect(pivot[2], r.y0, r.x1, r.y1)); // right
-            pq.add(new Rect(r.x0, r.y0, r.x1, pivot[1])); // above
-            pq.add(new Rect(r.x0, pivot[3], r.x1, r.y1)); // below
+            float aboveY1 = Math.min(r.y1, Math.max(r.y0, pivot[1]));
+            float belowY0 = Math.max(r.y0, Math.min(r.y1, pivot[3]));
+            pq.add(new Rect(r.x0, r.y0, r.x1, aboveY1)); // above, clamped
+            pq.add(new Rect(r.x0, belowY0, r.x1, r.y1)); // below, clamped
         }
-        // merge x-overlapping accepted rects, count rows covered, drop band edges
+        // Merge x-overlapping accepted rects FIRST (union x-extent, accumulate the set of
+        // rows each merged group covers), THEN apply the row-coverage threshold to the
+        // merged total. The branch-and-bound above can split a genuine full-height gutter
+        // into several vertically-fragmented rects (e.g. one stray glyph poking into the
+        // gutter for a handful of rows forces an above/below split); each fragment alone can
+        // fail minCover while their union covers plenty of rows. Filtering per-fragment
+        // before merging would silently drop such (especially narrow) gutters.
         accepted.sort(Comparator.comparingDouble(a -> a.x0));
-        List<Gutter> gutters = new ArrayList<>();
+        List<float[]> merged = new ArrayList<>();  // {x0, x1}
+        List<BitSet> mergedRows = new ArrayList<>();
         for (Rect r : accepted) {
-            int cover = 0;
-            for (Line l : lines) if (l.yTop < r.y1 && l.yBot > r.y0) cover++;
-            if (cover < minCover) continue;
-            if (r.x0 <= bandX0 + 0.5f || r.x1 >= bandX1 - 0.5f) continue; // edge margin, not interior
-            Gutter last = gutters.isEmpty() ? null : gutters.get(gutters.size() - 1);
-            if (last != null && r.x0 <= last.x1) {       // overlaps previous -> merge
-                last.x1 = Math.max(last.x1, r.x1);
-                last.rowsCovered = Math.max(last.rowsCovered, cover);
-            } else {
-                Gutter g = new Gutter(); g.x0 = r.x0; g.x1 = r.x1; g.rowsCovered = cover;
-                gutters.add(g);
+            BitSet rows = new BitSet(lines.size());
+            for (int i = 0; i < lines.size(); i++) {
+                Line l = lines.get(i);
+                if (l.yTop < r.y1 && l.yBot > r.y0) rows.set(i);
             }
+            if (!merged.isEmpty() && r.x0 <= merged.get(merged.size() - 1)[1]) { // overlaps previous -> merge
+                float[] last = merged.get(merged.size() - 1);
+                last[1] = Math.max(last[1], r.x1);
+                mergedRows.get(mergedRows.size() - 1).or(rows);
+            } else {
+                merged.add(new float[]{r.x0, r.x1});
+                mergedRows.add(rows);
+            }
+        }
+        List<Gutter> gutters = new ArrayList<>();
+        for (int i = 0; i < merged.size(); i++) {
+            float[] m = merged.get(i);
+            int cover = mergedRows.get(i).cardinality();
+            if (cover < minCover) continue;
+            if (m[0] <= bandX0 + 0.5f || m[1] >= bandX1 - 0.5f) continue; // edge margin, not interior
+            Gutter g = new Gutter(); g.x0 = m[0]; g.x1 = m[1]; g.rowsCovered = cover;
+            gutters.add(g);
         }
         return gutters;
     }

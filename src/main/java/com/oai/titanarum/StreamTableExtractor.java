@@ -274,4 +274,94 @@ final class StreamTableExtractor {
         }
         return false;
     }
+
+    static final double STREAM_CONFIDENCE_MIN = 0.55;
+
+    static final class Grid {
+        List<Gutter> gutters;
+        List<Line> rows;
+        float[] colBounds;          // length cols+1: [bandX0, g0.cx, g1.cx, ..., bandX1]
+        double confidence;
+        boolean numericLeanColumn;
+    }
+
+    static Grid scoreGrid(List<Line> lines, List<Gutter> gutters, float bandX0, float bandX1) {
+        Grid grid = new Grid();
+        grid.gutters = gutters; grid.rows = lines;
+        int cols = gutters.size() + 1;
+        int rows = lines.size();
+        float[] bounds = new float[cols + 1];
+        bounds[0] = bandX0; bounds[cols] = bandX1;
+        for (int i = 0; i < gutters.size(); i++) bounds[i + 1] = gutters.get(i).cx();
+        grid.colBounds = bounds;
+        if (cols < 2 || rows < 3) { grid.confidence = 0; return grid; }
+
+        // gutter violations
+        long words = 0, viol = 0;
+        for (Line l : lines) for (Word w : l.words) {
+            words++;
+            for (Gutter g : gutters) if (w.x0 < g.cx() && w.x1 > g.cx()) { viol++; break; }
+        }
+        double violation = words == 0 ? 1 : (double) viol / words;
+        double violationScore = 1 - Math.min(1, violation / 0.05);
+
+        // column consistency: rows with exactly one word-cluster per column and no straddle
+        int consistentRows = 0;
+        for (Line l : lines) {
+            int[] perCol = new int[cols];
+            boolean straddle = false;
+            for (Word w : l.words) {
+                int c = colOf(w.cx(), bounds);
+                perCol[c]++;
+                for (Gutter g : gutters) if (w.x0 < g.cx() && w.x1 > g.cx()) straddle = true;
+            }
+            int filled = 0; for (int p : perCol) if (p >= 1) filled++;
+            if (!straddle && filled >= Math.max(2, cols - 1)) consistentRows++;
+        }
+        double colConsistency = (double) consistentRows / rows;
+        colConsistency = Math.min(1, colConsistency / 0.85); // full credit at 85%
+
+        // prose fill: median widest-cell fill fraction of its column width
+        List<Double> fills = new ArrayList<>();
+        for (Line l : lines) {
+            double maxFill = 0;
+            for (Word w : l.words) {
+                int c = colOf(w.cx(), bounds);
+                float colW = bounds[c + 1] - bounds[c];
+                if (colW > 0) maxFill = Math.max(maxFill, w.width() / colW);
+            }
+            fills.add(maxFill);
+        }
+        Collections.sort(fills);
+        double medianFill = fills.get(fills.size() / 2);
+        double proseScore = clamp01((0.85 - medianFill) / 0.25);
+
+        // numeric lean: fraction of interior columns that are mostly numeric
+        int numericCols = 0;
+        for (int c = 1; c < cols; c++) {               // interior columns (skip col 0 = labels)
+            int tot = 0, num = 0;
+            for (Line l : lines) for (Word w : l.words) if (colOf(w.cx(), bounds) == c) {
+                tot++; if (w.numeric) num++;
+            }
+            if (tot > 0 && (double) num / tot >= 0.70) numericCols++;
+        }
+        double numericBonus = cols > 1 ? (double) numericCols / (cols - 1) : 0;
+        grid.numericLeanColumn = numericCols > 0;
+
+        if (cols == 2 && numericBonus == 0) { grid.confidence = 0; return grid; }
+
+        grid.confidence = 0.30 * colConsistency
+                        + 0.25 * violationScore
+                        + 0.20 * proseScore
+                        + 0.15 * Math.min(1, (cols - 2) / 2.0)
+                        + 0.10 * numericBonus;
+        return grid;
+    }
+
+    private static int colOf(float x, float[] bounds) {
+        for (int c = 0; c < bounds.length - 1; c++) if (x < bounds[c + 1]) return c;
+        return bounds.length - 2;
+    }
+
+    private static double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 }

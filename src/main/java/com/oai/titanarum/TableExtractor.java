@@ -242,7 +242,7 @@ final class TableExtractor {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public static class TableHit {
         public int page;
-        public String extractionMethod;   // "tagged" | "lattice"
+        public String extractionMethod;   // "tagged" | "lattice" | "stream"
         public float[] bbox;              // [x0, y0, x1, y1], top-left-origin points
         public int rowCount;
         public int colCount;
@@ -257,6 +257,9 @@ final class TableExtractor {
         // for any lattice table that isn't flagged, so existing consumers that ignore unknown
         // fields see no change in shape for the common case.
         public Boolean likelyDuplicateOfTagged;
+
+        /** Stream-path only: gridness confidence in [0,1]. null (omitted) for lattice/tagged. */
+        public Double confidence;
     }
 
     /** One cell (span anchor) of a table. */

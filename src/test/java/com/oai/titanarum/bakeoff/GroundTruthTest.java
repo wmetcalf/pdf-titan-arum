@@ -165,4 +165,61 @@ class GroundTruthTest {
         assertEquals(1.0 / 3.0, result.recall(), 1e-9);
         assertTrue(result.f1() > 0.0 && result.f1() < 1.0);
     }
+
+    // ---------------------------------------------------- normalizeCell --
+
+    @Test
+    void normalizeCellIsWhitespaceInsensitive() {
+        String base = GroundTruth.normalizeCell("abcdef");
+        assertEquals(base, GroundTruth.normalizeCell("abc def"));
+        assertEquals(base, GroundTruth.normalizeCell("abc\ndef"));
+        assertEquals(base, GroundTruth.normalizeCell(" ABC  DEF "));
+    }
+
+    @Test
+    void whitespaceOnlyCellCountsAsEmpty() {
+        // A cell that is whitespace-only on one side and truly empty on the
+        // other must normalize to empty on both sides and be ignored
+        // entirely -- not treated as a false positive/negative.
+        GroundTruth.Table expected = new GroundTruth.Table(List.of(
+                List.of("A", "   ")));
+        List<List<String>> actual = List.of(
+                List.of("A", ""));
+
+        TableScore.Result result = TableScore.score(expected, actual);
+
+        assertEquals(1, result.truePositives());
+        assertEquals(0, result.falsePositives());
+        assertEquals(0, result.falseNegatives());
+        assertEquals(1.0, result.f1(), 1e-9);
+    }
+
+    @Test
+    void scoreMatchesAcrossWrapJoinDifference() {
+        // PDF line-wrapping can legitimately produce either "Hello World" (a
+        // wrapped word boundary) or "HelloWorld" (a mid-token wrap) from the
+        // same underlying content, and which shape is "correct" is
+        // ambiguous from the data alone. Scoring must not penalize an
+        // extractor for picking one shape when ground truth encodes the
+        // other -- this is exactly the bias being fixed.
+        GroundTruth.Table expectedSpaced = new GroundTruth.Table(List.of(
+                List.of("Hello World")));
+        List<List<String>> actualJoined = List.of(
+                List.of("HelloWorld"));
+
+        TableScore.Result spacedVsJoined = TableScore.score(expectedSpaced, actualJoined);
+        assertEquals(1, spacedVsJoined.truePositives(), "expected/actual differing only by a wrap-join space must match");
+        assertEquals(0, spacedVsJoined.falsePositives());
+        assertEquals(0, spacedVsJoined.falseNegatives());
+
+        GroundTruth.Table expectedJoined = new GroundTruth.Table(List.of(
+                List.of("HelloWorld")));
+        List<List<String>> actualSpaced = List.of(
+                List.of("Hello World"));
+
+        TableScore.Result joinedVsSpaced = TableScore.score(expectedJoined, actualSpaced);
+        assertEquals(1, joinedVsSpaced.truePositives(), "reverse direction must also match");
+        assertEquals(0, joinedVsSpaced.falsePositives());
+        assertEquals(0, joinedVsSpaced.falseNegatives());
+    }
 }

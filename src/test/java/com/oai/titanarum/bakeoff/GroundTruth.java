@@ -380,12 +380,42 @@ public final class GroundTruth {
 
     // --------------------------------------------------------- Normalize --
 
-    /** Collapses whitespace runs to a single space, trims, and casefolds. */
+    /**
+     * Removes all whitespace, then casefolds, so cell comparison is
+     * whitespace-insensitive rather than merely whitespace-collapsing.
+     *
+     * <p>PDF line-wrapping produces two shapes for the same underlying
+     * content and both are legitimate: a mid-token wrap ("Parastratio-" /
+     * "sphecomyiastratiosphecomyioides", or a bare wrap with no hyphen)
+     * should rejoin with no space, while a wrap at a genuine word boundary
+     * ("Hello" / "World") should rejoin with a space. Which one applies is
+     * not recoverable from the wrapped text alone -- a fixture (or an
+     * extractor) has to pick one, and ground truth and a candidate
+     * extraction can disagree on which without either being "wrong" about
+     * the actual content.
+     *
+     * <p>Collapsing to a single space (the previous behavior) silently
+     * picks the "word boundary" answer for every wrap, which systematically
+     * penalizes correct extractions that instead reconstruct a mid-token
+     * wrap without a space (or vice versa): the two sides would differ only
+     * by an artifact of how the fixture happened to encode line-wrapping,
+     * not by a real extraction error. Stripping whitespace entirely removes
+     * the ambiguity from the metric altogether, since both shapes collapse
+     * to the same normalized text.
+     *
+     * <p>Accepted downside: two cells whose real text differs only in word
+     * boundaries (e.g. "notable" vs. "not able") would now compare equal.
+     * This is intentionally accepted -- the alternative (collapsing to one
+     * space) is a biased metric that systematically penalizes one of two
+     * equally valid wrap reconstructions, which is worse than a blunt
+     * metric that occasionally over-credits a coincidental word-boundary
+     * collision.
+     */
     public static String normalizeCell(String s) {
         if (s == null) {
             return "";
         }
-        String collapsed = s.replaceAll("\\s+", " ").trim();
-        return collapsed.toLowerCase(java.util.Locale.ROOT);
+        String stripped = s.replaceAll("\\s+", "");
+        return stripped.toLowerCase(java.util.Locale.ROOT);
     }
 }

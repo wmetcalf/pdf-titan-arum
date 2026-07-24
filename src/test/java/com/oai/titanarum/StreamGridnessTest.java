@@ -126,6 +126,71 @@ class StreamGridnessTest {
             "one straddling word out of ~24 must not disqualify a real table, got " + grid.confidence);
     }
 
+    @Test
+    void wellAlignedThreeColumnProseIsVetoed() {
+        // The exact "0.625 before proseScore" case from the design-defect report: a
+        // perfectly row-aligned, zero-violation 3-column block (no caption/pull-quote gaps
+        // unlike threeColumnProseScoresBelowThreshold below) where colConsistency +
+        // violationScore + the column-count bonus alone already clear 0.55. Every column is
+        // populated and near-full-width on EVERY row -- the majority-of-columns,
+        // majority-of-rows-per-column prose signature -- so the hard veto must fire and zero
+        // the score outright, regardless of how the graded terms alone would have scored it.
+        List<StreamTableExtractor.Word> ws = new ArrayList<>();
+        for (int r = 0; r < 18; r++) {
+            float y = 20 + r * 15;
+            ws.add(w(10, 95, y, "leftcolumnprosewordthatwrapsfully"));
+            ws.add(w(110, 195, y, "middlecolumnprosewordthatwraps"));
+            ws.add(w(210, 295, y, "rightcolumnprosewordthatwrapsfully"));
+        }
+        var lines = StreamTableExtractor.buildLines(ws, 10f);
+        var g = StreamTableExtractor.findGutters(lines, 10, 295, 6f);
+        var grid = StreamTableExtractor.scoreGrid(lines, g, 10, 295);
+        assertEquals(0.0, grid.confidence, 1e-9,
+            "well-aligned zero-violation 3-col prose must be hard-vetoed, got " + grid.confidence);
+        assertTrue(grid.confidence < 0.55);
+    }
+
+    @Test
+    void wrappedCellTableIsNotVetoed() {
+        // Guard against an over-broad veto: a real borderless Animal | Action | Result
+        // table. Column 1 ("Action") is short on EVERY row ("Says"). Column 0 ("Animal")
+        // is short on every row except one, which holds an extremely long single-token
+        // cell ("Parastratiosphecomyiastratiosphecomyioides") wide enough to nearly fill
+        // its column. Column 2 ("Result") is short on every row except one, whose text
+        // wraps across two physical lines (a continuation line with only that column
+        // populated -- "Ring-dingdingding..." running onto a second line). Because the
+        // wide/wrapped cells are a MINORITY of each column's own rows (not the column's
+        // predominant behavior), and "Action" never qualifies at all, no column -- let
+        // alone a majority of columns -- is "prose-like", so the veto must NOT fire and
+        // this real table must still clear the confidence threshold.
+        List<StreamTableExtractor.Word> ws = new ArrayList<>();
+        String[] animals = {"Cat", "Dog", "Owl", "Fox",
+            "Parastratiosphecomyiastratiosphecomyioides", "Bee", "Ant", "Cow"};
+        String[] results = {"Meow", "Woof", "Hoot", "Yip",
+            "Ring-dingdingding", "Buzz", "March", "Moo"};
+        for (int r = 0; r < animals.length; r++) {
+            float y = 20 + r * 15;
+            if (r == 4) {
+                ws.add(w(10, 148, y, animals[r]));           // fills col0 (extremely long token)
+            } else {
+                ws.add(w(10, 40, y, animals[r]));             // short, every other row
+            }
+            ws.add(w(160, 195, y, "Says"));                   // short on EVERY row
+            ws.add(w(230, 270, y, results[r]));
+            if (r == 4) {
+                // wrapped continuation line for the Result cell only: same column,
+                // no sibling columns populated -- a real wrapped-cell table's signature,
+                // not the majority-of-columns / majority-of-rows prose signature.
+                ws.add(w(230, 390, y + 7, "dingdingding-dingdingding-dingdingding"));
+            }
+        }
+        var lines = StreamTableExtractor.buildLines(ws, 10f);
+        List<StreamTableExtractor.Gutter> gutters = List.of(gutter(150, 160), gutter(220, 230));
+        var grid = StreamTableExtractor.scoreGrid(lines, gutters, 10, 400);
+        assertTrue(grid.confidence >= 0.55,
+            "a real wrapped-cell table must not be vetoed as prose, got " + grid.confidence);
+    }
+
     private static StreamTableExtractor.Gutter gutter(float x0, float x1) {
         StreamTableExtractor.Gutter g = new StreamTableExtractor.Gutter();
         g.x0 = x0; g.x1 = x1;

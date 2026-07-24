@@ -284,6 +284,18 @@ final class StreamTableExtractor {
     static final double VIOLATION_TOLERANCE = 0.02;  // <=2% straddling words: no penalty
     static final double VIOLATION_CEILING   = 0.09;  // >=9% straddling words: violationScore = 0
 
+    // Prose hard-veto constants. See the rationale comment at the veto site in scoreGrid().
+    // VETO_FILL_THRESHOLD mirrors the spec's own wording ("fills >~85% of column width").
+    static final double VETO_FILL_THRESHOLD          = 0.85;
+    // A column counts as "prose-like" only if MORE than half of its own occupied rows hit
+    // the fill threshold -- an occasional long cell (real wrapped-cell tables have these)
+    // must not be enough to brand the whole column as running prose.
+    static final double VETO_ROW_MAJORITY_FRACTION    = 0.50;
+    // The veto fires only if MORE than half of all columns are prose-like -- a single
+    // wide/wrapping column (e.g. a long-text "Result" column in an otherwise short-celled
+    // table) must not be enough to veto the whole grid.
+    static final double VETO_COLUMN_MAJORITY_FRACTION = 0.50;
+
     static final class Grid {
         List<Gutter> gutters;
         List<Line> rows;
@@ -375,6 +387,66 @@ final class StreamTableExtractor {
         grid.numericLeanColumn = numericCols > 0;
 
         if (cols == 2 && numericBonus == 0) { grid.confidence = 0; return grid; }
+
+        // Prose hard veto (spec: "reject if median cell text fills >~85% of column width
+        // and wraps across lines -- the two-column-prose signature"). The graded proseScore
+        // term above is NOT sufficient on its own to enforce this: for a perfectly
+        // row-aligned 3+-column block with zero gutter violations, colConsistency +
+        // violationScore + the column-count bonus alone already sum to 0.625 (>
+        // STREAM_CONFIDENCE_MIN=0.55), so well-aligned multi-column prose clears the gate
+        // no matter how prose-like its content is, before proseScore is ever applied. The
+        // spec's condition list is an ALL-must-hold gate, so the prose signature must be a
+        // hard veto (confidence=0), exactly like the cols<2 / rows<3 / cols==2-non-numeric
+        // gates above -- in ADDITION to keeping proseScore as a graded term for borderline
+        // prose-ish content that doesn't trip the veto.
+        //
+        // The veto must not fire on a real table that merely has ONE long wrapped cell
+        // (e.g. Animal|Action|Result with an outlier long token/wrapped phrase in one or
+        // two rows): such a table still has SHORT cells in its other columns and in the
+        // rest of that same column's rows. The discriminator (per the design research) is
+        // that genuine multi-column PROSE fills its column AND wraps on the MAJORITY of
+        // *rows within that column* for a MAJORITY of *columns* -- an independent running
+        // paragraph in every column, advancing one (near-full-width) line per row, on
+        // nearly every row. A real wrapped-cell table instead has a MINORITY of rows in
+        // any given column that are wide/wrapped; the rest of that column's rows (and the
+        // sibling columns) stay short. So: per column, compute the fraction of that
+        // column's OWN occupied rows whose text spans > VETO_FILL_THRESHOLD of the column
+        // width (this doubles as the "wraps" signal too -- a column whose text keeps
+        // re-filling the full width on row after row is exactly a paragraph re-wrapping
+        // down the page, whether realized as one wide word/line per row or as an extra
+        // continuation line with no sibling columns populated). A column counts as
+        // "prose-like" only if that fraction exceeds VETO_ROW_MAJORITY_FRACTION (i.e. it's
+        // the column's *predominant* behavior, not an occasional long cell). The veto then
+        // fires only if a MAJORITY of columns (> VETO_COLUMN_MAJORITY_FRACTION) are
+        // prose-like AND no column is numeric-leaning (a numeric column is conclusive
+        // proof this is a data table, not prose, regardless of adjacent wide text columns).
+        int proseColumns = 0;
+        for (int c = 0; c < cols; c++) {
+            int occupiedLines = 0, highFillLines = 0;
+            float colW = bounds[c + 1] - bounds[c];
+            for (Line l : lines) {
+                float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE;
+                boolean any = false;
+                for (Word w : l.words) {
+                    if (colOf(w.cx(), bounds) == c) {
+                        any = true;
+                        minX = Math.min(minX, w.x0);
+                        maxX = Math.max(maxX, w.x1);
+                    }
+                }
+                if (any) {
+                    occupiedLines++;
+                    if (colW > 0 && (maxX - minX) / colW > VETO_FILL_THRESHOLD) highFillLines++;
+                }
+            }
+            double colFillFrac = occupiedLines > 0 ? (double) highFillLines / occupiedLines : 0;
+            if (colFillFrac > VETO_ROW_MAJORITY_FRACTION) proseColumns++;
+        }
+        double proseColumnFraction = cols > 0 ? (double) proseColumns / cols : 0;
+        if (proseColumnFraction > VETO_COLUMN_MAJORITY_FRACTION && numericCols == 0) {
+            grid.confidence = 0;
+            return grid;
+        }
 
         grid.confidence = 0.30 * colConsistency
                         + 0.25 * violationScore

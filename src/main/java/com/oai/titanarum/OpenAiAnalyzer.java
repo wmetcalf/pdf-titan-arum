@@ -335,9 +335,18 @@ public class OpenAiAnalyzer {
             if (omitted || emitted < report.tables.size()) {
                 sb.append("  ... and ").append(report.tables.size() - emitted).append(" more tables (omitted for length)\n");
             }
-            if (Boolean.TRUE.equals(report.tablesTruncated)) {
-                sb.append("  (table extraction hit safety caps; list may be incomplete)\n");
-            }
+        }
+        // PR re-review P2: the tablesTruncated warning must surface even when EVERY table was
+        // rejected by TableExtractor's own safety caps (report.tables empty/null but
+        // tablesTruncated == true) -- previously this warning lived INSIDE the
+        // "tables non-empty" guard above, so that case emitted no "=== TABLES ===" section AND no
+        // truncation indication at all, letting the AI classify a document as if its tables had
+        // been fully scanned when they were in fact entirely dropped. Guarded on tablesTruncated
+        // alone (independent of report.tables) so it fires exactly once in every case: once here
+        // when tables is empty, and once here (no longer duplicated inside the block above) when
+        // tables is non-empty.
+        if (Boolean.TRUE.equals(report.tablesTruncated)) {
+            sb.append("  (table extraction hit safety caps; list may be incomplete)\n");
         }
 
         // JavaScript

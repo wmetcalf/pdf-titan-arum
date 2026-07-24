@@ -506,6 +506,60 @@ class TableTaggedTest {
         }
     }
 
+    @Test
+    void taggedCellMcidReReferenceAmplificationIsBoundedNotUnbounded() throws Exception {
+        // PR re-review P2 (DoS) reproducer: glyphsFor's per-page cache bounds how many DISTINCT
+        // glyphs one MCID can ever hold (MAX_TAGGED_GLYPHS, extraction-side) and
+        // structureNodesVisited/MAX_STRUCTURE_WORK bounds how many structure NODES one traversal
+        // visits -- but neither bounds how many times a SINGLE cell's own kid list re-references
+        // the SAME in-scope MCID. Here MCID 0 carries a modest, legitimate 1,000 glyphs, but the
+        // TD's /K kid array lists that one MCID 2,001 times -- collectGlyphs' out.addAll(...)
+        // accumulates 1,000 * 2,001 = 2,001,000 TextPosition references for this ONE cell, crossing
+        // MAX_TAGGED_GLYPHS (2,000,000) via pure re-reference amplification, not real content.
+        // Pre-fix this list grows unbounded (no cap on accumulated per-cell output) toward a
+        // memory-exhausting size; post-fix collectGlyphs must throw once out.size() crosses the
+        // cap, isolated by extractTagged's per-table catch into Result.truncated=true with the
+        // hostile table simply dropped -- deterministically, not by racing an OOM or a timeout.
+        Path pdf = tmp.resolve("mcid_amplification.pdf");
+        int glyphsPerMcid = 1_000;
+        int referenceCount = 2_001; // 1,000 * 2,001 = 2,001,000 > MAX_TAGGED_GLYPHS (2,000,000)
+        TableTestPdfs.taggedCellReReferencingSameMcid(pdf, glyphsPerMcid, referenceCount);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            long start = System.nanoTime();
+            TableExtractor.Result r = assertDoesNotThrow(
+                    () -> TableExtractor.extract(doc, List.of(1), Map.of()),
+                    "the per-cell MCID re-reference cap must be caught, not propagate/OOM");
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+            assertTrue(elapsedMs < 5_000,
+                    "the per-cell output cap must bound this deterministically, not accumulate "
+                            + "millions of glyph references: took " + elapsedMs + "ms");
+            assertTrue(r.truncated,
+                    "the per-cell MCID re-reference cap trip must set Result.truncated");
+            assertTrue(r.tables.isEmpty(),
+                    "the sole hostile table must be dropped, not emitted with a bogus giant cell");
+        }
+    }
+
+    @Test
+    void taggedCellReReferencingSameMcidASmallNumberOfTimesStillExtracts() throws Exception {
+        // Control for the amplification cap immediately above: a cell that references its own
+        // in-scope MCID only a HANDFUL of times (well under MAX_TAGGED_GLYPHS even multiplied out)
+        // must still extract normally -- the new per-cell ceiling must not false-positive on
+        // ordinary small cells.
+        Path pdf = tmp.resolve("mcid_small_repeat.pdf");
+        int glyphsPerMcid = 3;
+        int referenceCount = 4; // 3 * 4 = 12, nowhere near MAX_TAGGED_GLYPHS
+        TableTestPdfs.taggedCellReReferencingSameMcid(pdf, glyphsPerMcid, referenceCount);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertFalse(r.truncated, "a small, legitimate re-reference count must not trip the cap");
+            assertEquals(1, r.tables.size(), "the one legitimate table must still be extracted");
+            assertFalse(r.tables.get(0).cells.get(0).text.isEmpty(),
+                    "the cell must still resolve its (repeated) glyph text, not come back empty");
+        }
+    }
+
     // ---------------------------------------------------------------- FIX 1: rotated tagged bbox
 
     @Test

@@ -104,6 +104,60 @@ class OpenAiAnalyzerDigestTest {
     }
 
     @Test
+    void tablesTruncatedFlagAddsCapNoteEvenWhenEveryTableWasDropped() throws Exception {
+        // PR re-review P2: previously the tablesTruncated warning lived INSIDE the
+        // "report.tables non-empty" guard, so when TableExtractor's own safety caps rejected
+        // EVERY table (tables empty/null but tablesTruncated == true -- e.g. the per-cell MCID
+        // re-reference cap in FIX 1 above dropping the sole hostile table), the digest carried
+        // NEITHER a "=== TABLES ===" section NOR any indication that extraction was truncated --
+        // letting the AI classify the document as if its tables had been fully, successfully
+        // scanned when they were in fact entirely dropped. The warning must surface independently
+        // of whether report.tables is non-empty.
+        AnalysisReport reportEmptyList = baseReport();
+        reportEmptyList.tablesTruncated = Boolean.TRUE;
+        String digestEmptyList = buildDigest(reportEmptyList, "all-tables-dropped.pdf");
+        assertTrue(digestEmptyList.contains("table extraction hit safety caps"),
+                "an empty (but non-null) table list with tablesTruncated=true must still warn:\n" + digestEmptyList);
+
+        AnalysisReport reportNullTables = baseReport();
+        reportNullTables.tables = null;
+        reportNullTables.tablesTruncated = Boolean.TRUE;
+        String digestNullTables = buildDigest(reportNullTables, "all-tables-dropped.pdf");
+        assertTrue(digestNullTables.contains("table extraction hit safety caps"),
+                "a null table list with tablesTruncated=true must still warn:\n" + digestNullTables);
+    }
+
+    @Test
+    void tablesTruncatedWarningNeverDoublesWhenTablesArePresent() throws Exception {
+        AnalysisReport report = baseReport();
+        report.tables.add(smallTable(1, "A", "B"));
+        report.tablesTruncated = Boolean.TRUE;
+
+        String digest = buildDigest(report, "capped-with-tables.pdf");
+
+        String marker = "table extraction hit safety caps";
+        int count = 0, idx = 0;
+        while ((idx = digest.indexOf(marker, idx)) != -1) {
+            count++;
+            idx += marker.length();
+        }
+        assertEquals(1, count, "the warning must appear exactly once, not duplicated:\n" + digest);
+    }
+
+    @Test
+    void noTablesTruncatedWarningWhenNotTruncated() throws Exception {
+        AnalysisReport reportFalse = baseReport();
+        reportFalse.tables.add(smallTable(1, "A", "B"));
+        reportFalse.tablesTruncated = Boolean.FALSE;
+        assertFalse(buildDigest(reportFalse, "not-capped.pdf").contains("table extraction hit safety caps"));
+
+        AnalysisReport reportNullFlag = baseReport();
+        reportNullFlag.tables.add(smallTable(1, "A", "B"));
+        assertFalse(buildDigest(reportNullFlag, "not-capped.pdf").contains("table extraction hit safety caps"),
+                "tablesTruncated left null (default) must not warn");
+    }
+
+    @Test
     void nullOrEmptyTablesProduceNoSection() throws Exception {
         AnalysisReport reportNull = baseReport();
         reportNull.tables = null;

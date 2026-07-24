@@ -2389,7 +2389,26 @@ final class TableExtractor {
      * near the 15s hard-halt) since each visit also does glyph-resolution work. Same fix: an
      * identity-keyed visited-set threaded through the recursion, skipping a child already reached
      * via another parent. Package-private (this entry point) so tests can drive a synthetic
-     * diamond DAG directly. */
+     * diamond DAG directly.
+     *
+     * <p>PR re-review P2 (DoS, MCID re-reference amplification): {@link #glyphsFor} returns the
+     * PAGE-WIDE cached glyph list for one MCID, itself bounded to at most {@link
+     * #MAX_TAGGED_GLYPHS} distinct glyphs per page by the round-1 P1 fix -- but nothing previously
+     * bounded how many times a SINGLE cell's kid list re-references that same in-scope MCID (or
+     * several large ones). A hostile TD/TH whose kids list one MCID (with, say, a modest but
+     * non-trivial cached glyph list) thousands of times would have {@code out} accumulate that
+     * cached list's size once per repetition -- kids x cached-size, NOT bounded by
+     * MAX_TAGGED_GLYPHS (which only bounds page-wide EXTRACTION) or by {@link
+     * #structureNodesVisited}/{@link #MAX_STRUCTURE_WORK} (which bounds node-visit COUNT, not
+     * total glyphs appended per node). Fix: re-use MAX_TAGGED_GLYPHS as a per-cell OUTPUT ceiling
+     * too -- after every {@code out.addAll(...)} below (all three kid shapes: Integer, COSInteger,
+     * PDMarkedContentReference), throw {@link RulingOverflowException} once {@code out.size()}
+     * exceeds it. A legitimate cell references each of its own MCIDs once, so its real glyph count
+     * is bounded by the page's own MAX_TAGGED_GLYPHS cap and never trips this; only amplification
+     * (the same MCID re-listed far more times than the cell has genuine content) does. The
+     * exception propagates via resolveCellText -> buildTaggedTable -> extractTagged's per-table
+     * catch, same as every other tagged-path cap, flagging {@code result.truncated} for just that
+     * table rather than escaping uncaught. */
     static void collectGlyphs(PDStructureNode node, PDPage inheritedPage, List<TextPosition> out,
                               Map<PDPage, Map<Integer, List<TextPosition>>> mcidCache, int depth,
                               Map<PDPage, Integer> pageNumbers, Set<Integer> pagesToProcess) throws IOException {
@@ -2417,11 +2436,16 @@ final class TableExtractor {
                 collectGlyphs(el, page, out, mcidCache, depth + 1, pageNumbers, pagesToProcess, visited);
             } else if (kid instanceof Integer mcid && page != null) {
                 out.addAll(glyphsFor(page, mcid, mcidCache, pageNumbers, pagesToProcess));
+                if (out.size() > MAX_TAGGED_GLYPHS) throw new RulingOverflowException();
             } else if (kid instanceof COSInteger ci && page != null) {
                 out.addAll(glyphsFor(page, (int) ci.longValue(), mcidCache, pageNumbers, pagesToProcess));
+                if (out.size() > MAX_TAGGED_GLYPHS) throw new RulingOverflowException();
             } else if (kid instanceof PDMarkedContentReference mcr) {
                 PDPage mcrPage = mcr.getPage() != null ? mcr.getPage() : page;
-                if (mcrPage != null) out.addAll(glyphsFor(mcrPage, mcr.getMCID(), mcidCache, pageNumbers, pagesToProcess));
+                if (mcrPage != null) {
+                    out.addAll(glyphsFor(mcrPage, mcr.getMCID(), mcidCache, pageNumbers, pagesToProcess));
+                    if (out.size() > MAX_TAGGED_GLYPHS) throw new RulingOverflowException();
+                }
             }
         }
     }

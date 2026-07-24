@@ -1086,6 +1086,67 @@ final class TableTestPdfs {
     }
 
     /**
+     * PR re-review P2 (DoS) reproducer: a tagged 1x1 table (one TD) whose MCID 0 carries only a
+     * MODEST, legitimate glyph count ({@code glyphsPerMcid}), but whose TD's OWN {@code /K} kid
+     * array lists that SAME in-scope MCID {@code referenceCount} times -- not the single reference
+     * a legitimate cell would carry. glyphsFor's per-page cache means each of those references
+     * resolves to the identical cached {@code List<TextPosition>} for MCID 0, so
+     * collectGlyphs' {@code out.addAll(...)} accumulates {@code glyphsPerMcid * referenceCount}
+     * TextPosition REFERENCES for this one cell -- amplification that neither MAX_TAGGED_GLYPHS
+     * (bounds page-wide EXTRACTION, already satisfied since only glyphsPerMcid glyphs are ever
+     * extracted for MCID 0) nor MAX_STRUCTURE_WORK/structureNodesVisited (bounds node-VISIT count,
+     * not glyphs appended per node) previously bounded. Callers choose glyphsPerMcid/referenceCount
+     * so the product crosses MAX_TAGGED_GLYPHS cheaply (a small, real glyph count repeated many
+     * times) rather than needing a giant fixture.
+     */
+    static void taggedCellReReferencingSameMcid(Path file, int glyphsPerMcid, int referenceCount) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            org.apache.pdfbox.pdmodel.PDResources resources = new org.apache.pdfbox.pdmodel.PDResources();
+            resources.put(COSName.getPDFName("F1"), HELV);
+            page.setResources(resources);
+
+            org.apache.pdfbox.cos.COSStream cosStream = doc.getDocument().createCOSStream();
+            try (java.io.OutputStream os = cosStream.createOutputStream(COSName.FLATE_DECODE)) {
+                // MCID 0's own real glyph content: a modest run of distinct-position characters
+                // (default Tj advance separates each), well under MAX_TAGGED_GLYPHS on its own.
+                os.write("/TD << /MCID 0 >> BDC BT /F1 12 Tf 60 700 Td (".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+                byte[] chunk = new byte[Math.min(glyphsPerMcid, 1 << 16)];
+                java.util.Arrays.fill(chunk, (byte) 'A');
+                int remaining = glyphsPerMcid;
+                while (remaining > 0) {
+                    int n = Math.min(chunk.length, remaining);
+                    os.write(chunk, 0, n);
+                    remaining -= n;
+                }
+                os.write(") Tj ET EMC".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+            }
+            page.getCOSObject().setItem(COSName.CONTENTS, cosStream);
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(page);
+            // The amplification: /K = [0, 0, 0, ... ] (referenceCount copies), not a single kid --
+            // a hostile TD re-referencing the SAME in-scope MCID far more times than it has
+            // genuine content.
+            COSArray k = new COSArray();
+            for (int i = 0; i < referenceCount; i++) k.add(COSInteger.get(0));
+            cell.getCOSObject().setItem(COSName.K, k);
+            tr.appendKid(cell);
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * A tagged 1x1 table (one TD, MCID 0) whose text is wrapped in {@code nestDepth} nested,
      * untagged "Span" BDC/EMC marked-content blocks in the content stream -- exercising
      * flattenMarkedContent's recursive walk over a deeply nested {@code PDMarkedContent} tree

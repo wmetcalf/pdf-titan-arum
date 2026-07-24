@@ -1,5 +1,11 @@
 package com.oai.titanarum;
 
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.apache.pdfbox.text.TextPosition;
 import org.apache.pdfbox.util.Matrix;
 import org.junit.jupiter.api.Test;
@@ -122,5 +128,70 @@ class StreamWordLineTest {
                 () -> StreamTableExtractor.buildWords(glyphs),
                 "word cap must be enforced even when the overflowing word terminates on an explicit "
                         + "whitespace glyph at the very end of the glyph list");
+    }
+
+    @Test
+    void buildWordsHandlesCtmScaledText() throws Exception {
+        // Reviewer-verified follow-up: TextPosition.getFontSizeInPt() is computed from the Tm-only
+        // matrix (PDFBox's own javadoc: "the actual rendering may appear bigger or smaller
+        // depending on the [cm] transformation matrix") -- it is CTM-BLIND. getTextMatrix() is (per
+        // its own javadoc) the effective text RENDERING matrix (Tfs-scaled Tm x CTM), so its Y
+        // scaling factor alone IS the correct device-space font size. buildWords' newLine test
+        // (Math.abs(gy0 - prevBaseline) > 0.5f * fs) has no ctm-aware floor (unlike `space`, which
+        // is floored against the ctm-aware getWidthOfSpace()), so using the CTM-blind
+        // getFontSizeInPt() alone under a scaling `cm` produces a wrong (too-small, here) threshold.
+        //
+        // Fixture: a 2x magnifying `cm` (device space = 2x text space) wraps three groups of real,
+        // PDFBox-rendered glyphs (harvested via TableTestPdfs.harvestGlyphs, not hand-built doubles):
+        //   1) "RowOne" and "RowTwo": two genuinely separate rows, 30 text-space units (60 device
+        //      units) apart -- comfortably past BOTH the wrong (ctm-blind) and correct (ctm-aware)
+        //      thresholds, so they must never merge into one word either way (regression guard).
+        //   2) "A" then "B": one intended SINGLE word, drawn as two adjacent single-character text
+        //      runs (zero x-gap: 'B' starts exactly at 'A''s own measured advance) with a small
+        //      y offset between them -- 3.5 text-space units, i.e. 7 device units. That sits
+        //      strictly between the WRONG half-threshold (0.5 * getFontSizeInPt()=10 -> 5, since
+        //      Tm's own scale is 1 and getFontSizeInPt() never sees the 2x cm) and the CORRECT
+        //      half-threshold (0.5 * effective device fs=20 -> 10). Pre-fix, 7 > 5 so newLine
+        //      erroneously fires between 'A' and 'B', shattering one word into two single-character
+        //      words. Post-fix, 7 is not > 10, so newLine correctly stays quiet and (with the x-gap
+        //      at ~0, well under the space-gap floor) 'A' and 'B' correctly accumulate into one "AB"
+        //      word.
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(600, 600));
+            doc.addPage(page);
+            PDType1Font f = new PDType1Font(Standard14Fonts.FontName.HELVETICA);
+            float fontSize = 10f;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.transform(Matrix.getScaleInstance(2f, 2f)); // cm: device = 2x text space
+
+                cs.beginText(); cs.setFont(f, fontSize);
+                cs.newLineAtOffset(10, 100); cs.showText("RowOne"); cs.endText();
+
+                cs.beginText(); cs.setFont(f, fontSize);
+                cs.newLineAtOffset(10, 70); cs.showText("RowTwo"); cs.endText();
+
+                float aWidth = f.getStringWidth("A") / 1000f * fontSize;
+                cs.beginText(); cs.setFont(f, fontSize);
+                cs.newLineAtOffset(10, 30); cs.showText("A"); cs.endText();
+
+                cs.beginText(); cs.setFont(f, fontSize);
+                cs.newLineAtOffset(10 + aWidth, 30 - 3.5f); cs.showText("B"); cs.endText();
+            }
+
+            List<TextPosition> glyphs = TableTestPdfs.harvestGlyphs(doc, 0);
+            List<StreamTableExtractor.Word> words = StreamTableExtractor.buildWords(glyphs);
+            List<String> texts = new ArrayList<>();
+            for (StreamTableExtractor.Word w : words) texts.add(w.text);
+
+            assertTrue(texts.contains("RowOne"), "expected a 'RowOne' word, got " + texts);
+            assertTrue(texts.contains("RowTwo"), "expected a 'RowTwo' word, got " + texts);
+            assertFalse(texts.contains("RowOneRowTwo"),
+                    "two visually separate rows must not merge into one word: " + texts);
+
+            assertTrue(texts.contains("AB"),
+                    "row's words must not be over-split into single characters under ctm-scaled "
+                            + "text (pre-fix ctm-blind fs shatters 'AB' into 'A'+'B'): " + texts);
+            assertEquals(3, words.size(), "expected exactly 3 words (RowOne, RowTwo, AB): " + texts);
+        }
     }
 }

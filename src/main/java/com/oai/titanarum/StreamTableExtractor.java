@@ -55,20 +55,26 @@ final class StreamTableExtractor {
             float gy0 = tp.getYDirAdj();                 // top of glyph, top-left origin
             float gh  = Math.max(1f, tp.getHeightDir());
             float gw  = tp.getWidthDirAdj();
-            // TextPosition.getFontSizeInPt() is ALREADY the effective device-space font size --
-            // per its own javadoc, it's getFontSize() "multiplied ... with the text matrix
-            // horizontal scaling factor", i.e. any Tm/CTM scale is already folded in. getTextMatrix()
-            // is (also per its own javadoc) NOT the raw "Tm" operator matrix despite the name -- it's
-            // the full text-RENDERING matrix (Trm = Tfs-scaled Tm x CTM), so its own scaling factor
-            // ALSO already has the font size baked in. Multiplying the two together (as a prior
-            // version of this line did) double-counts the font size for any genuinely-PDFBox-parsed
-            // TextPosition (e.g. fs=121 for an 11pt font, instead of 11) -- on real content this
-            // inflated the newLine threshold (0.5*fs) enough that glyphs a full row apart no longer
-            // triggered a line break, silently merging adjacent rows' words into one. It only
-            // "worked" for StreamWordLineTest's hand-built TextPosition doubles because those
-            // construct textMatrix as a pure Matrix.getTranslateInstance() (scale factor 1,
-            // decoupled from the fontSizeInPt ctor arg) -- a shape no real rendered PDF produces.
-            float fs  = Math.max(1f, tp.getFontSizeInPt());
+            // getTextMatrix() is (per its own javadoc) NOT the raw "Tm" operator matrix despite the
+            // name -- it's the full effective text-RENDERING matrix (Trm = Tfs-scaled Tm x CTM), so
+            // its Y scaling factor alone IS the correct device-space font size: it already folds in
+            // the font size, the "Tm" operator's own scale, AND the "cm" operator's (CTM) scale.
+            // getFontSizeInPt(), by contrast, is CTM-BLIND: per ITS OWN javadoc it's computed from
+            // fontSize and the Tm-only matrix, and "the actual rendering may appear bigger or
+            // smaller depending on the [cm] transformation matrix" -- i.e. any cm scale is NOT
+            // folded in. A prior version of this line multiplied the two together
+            // (getFontSizeInPt() * getTextMatrix().getScalingFactorY()), which double-counts the
+            // font size for any genuinely-PDFBox-parsed TextPosition (e.g. fs=121 for an 11pt font,
+            // instead of 11) -- inflating the newLine threshold (0.5*fs) enough that glyphs a full
+            // row apart no longer triggered a line break, silently merging adjacent rows' words into
+            // one. Dropping the multiplication (using getFontSizeInPt() alone) fixed that but left
+            // this CTM-blind gap: for text drawn under a scaling `cm` (scaled form XObjects,
+            // watermarks, embedded scaled content), getFontSizeInPt() omits the cm scale entirely,
+            // so the newLine threshold is wrong -- unlike `space` below, which is floored against
+            // the ctm-aware getWidthOfSpace(), newLine has no such floor. Using
+            // getTextMatrix().getScalingFactorY() alone is correct in both the scaled and unscaled
+            // case (see StreamWordLineTest.buildWordsHandlesCtmScaledText).
+            float fs  = Math.max(1f, tp.getTextMatrix().getScalingFactorY());
             float space = Math.max(tp.getWidthOfSpace(), 0.25f * fs);
             boolean whitespace = u.trim().isEmpty();
             boolean newLine = cur != null && Math.abs(gy0 - prevBaseline) > 0.5f * fs;

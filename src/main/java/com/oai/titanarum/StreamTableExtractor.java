@@ -117,4 +117,84 @@ final class StreamTableExtractor {
         for (Line l : lines) l.words.sort(Comparator.comparingDouble(a -> a.x0));
         return lines;
     }
+
+    static final int  MAX_GUTTER_CANDIDATES = 16;
+    static final long MAX_GUTTER_WORK       = 2_000_000;
+
+    static final class Gutter {
+        float x0, x1;
+        int rowsCovered;
+        float cx() { return (x0 + x1) * 0.5f; }
+    }
+
+    private static final class Rect {
+        float x0, y0, x1, y1;
+        Rect(float a, float b, float c, float d) { x0=a; y0=b; x1=c; y1=d; }
+        float w() { return x1 - x0; }
+        float h() { return y1 - y0; }
+    }
+
+    static List<Gutter> findGutters(List<Line> lines, float bandX0, float bandX1, float medianSpace) {
+        if (lines.isEmpty() || bandX1 - bandX0 <= 0) return List.of();
+        float yTop = Float.MAX_VALUE, yBot = -Float.MAX_VALUE;
+        List<float[]> obstacles = new ArrayList<>(); // {x0,y0,x1,y1}
+        for (Line l : lines) {
+            yTop = Math.min(yTop, l.yTop); yBot = Math.max(yBot, l.yBot);
+            for (Word w : l.words) obstacles.add(new float[]{w.x0, w.y0, w.x1, w.y1});
+        }
+        final float bandH = yBot - yTop;
+        final float minGutterW = Math.max(medianSpace, 1f);
+        final float minCover = 0.60f * lines.size();
+
+        // best-first branch & bound
+        PriorityQueue<Rect> pq = new PriorityQueue<>(
+            (a, b) -> Float.compare(quality(b, medianSpace), quality(a, medianSpace)));
+        pq.add(new Rect(bandX0, yTop, bandX1, yBot));
+        List<Rect> accepted = new ArrayList<>();
+        long work = 0;
+        while (!pq.isEmpty() && accepted.size() < MAX_GUTTER_CANDIDATES) {
+            if (++work > MAX_GUTTER_WORK) throw new TableExtractor.RulingOverflowException();
+            Rect r = pq.poll();
+            if (r.w() < minGutterW || r.h() < 0.60f * bandH) continue;
+            float[] pivot = firstObstacleInside(r, obstacles);
+            if (pivot == null) {
+                accepted.add(r);                       // maximal empty & tall enough
+                continue;
+            }
+            // split into up-to-4 maximal sub-rects excluding the pivot
+            if (pivot[0] - r.x0 >= minGutterW) pq.add(new Rect(r.x0, r.y0, pivot[0], r.y1)); // left
+            if (r.x1 - pivot[2] >= minGutterW) pq.add(new Rect(pivot[2], r.y0, r.x1, r.y1)); // right
+            pq.add(new Rect(r.x0, r.y0, r.x1, pivot[1])); // above
+            pq.add(new Rect(r.x0, pivot[3], r.x1, r.y1)); // below
+        }
+        // merge x-overlapping accepted rects, count rows covered, drop band edges
+        accepted.sort(Comparator.comparingDouble(a -> a.x0));
+        List<Gutter> gutters = new ArrayList<>();
+        for (Rect r : accepted) {
+            int cover = 0;
+            for (Line l : lines) if (l.yTop < r.y1 && l.yBot > r.y0) cover++;
+            if (cover < minCover) continue;
+            if (r.x0 <= bandX0 + 0.5f || r.x1 >= bandX1 - 0.5f) continue; // edge margin, not interior
+            Gutter last = gutters.isEmpty() ? null : gutters.get(gutters.size() - 1);
+            if (last != null && r.x0 <= last.x1) {       // overlaps previous -> merge
+                last.x1 = Math.max(last.x1, r.x1);
+                last.rowsCovered = Math.max(last.rowsCovered, cover);
+            } else {
+                Gutter g = new Gutter(); g.x0 = r.x0; g.x1 = r.x1; g.rowsCovered = cover;
+                gutters.add(g);
+            }
+        }
+        return gutters;
+    }
+
+    private static float quality(Rect r, float medianSpace) {
+        return r.h() * Math.min(r.w(), 3f * medianSpace);
+    }
+
+    private static float[] firstObstacleInside(Rect r, List<float[]> obstacles) {
+        for (float[] o : obstacles) {
+            if (o[0] < r.x1 && o[2] > r.x0 && o[1] < r.y1 && o[3] > r.y0) return o;
+        }
+        return null;
+    }
 }

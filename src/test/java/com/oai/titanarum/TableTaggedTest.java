@@ -5,14 +5,18 @@ import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDMarkedContentReference;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureElement;
 import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureTreeRoot;
 import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedContent;
+import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDPropertyList;
 import org.apache.pdfbox.text.TextPosition;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
@@ -424,6 +428,58 @@ class TableTaggedTest {
             assertTrue(r.truncated,
                     "a StackOverflowError escaping tagged extraction must mark the result truncated, "
                             + "so report.json's tablesTruncated warning isn't silently omitted");
+        }
+    }
+
+    @Test
+    void genericExceptionInTaggedExtractionSetsTruncated() throws Exception {
+        // Codex re-review P2 (consistency) reproducer: extractTagged's OWN top-level
+        // catch(Exception e) in extract() -- the generic fallback below the
+        // StackOverflowError/RulingOverflowException catches above it -- used to only log, leaving
+        // Result.truncated FALSE. A document whose tagged extraction genuinely FAILED (e.g. an
+        // IOException from a malformed content stream) was then indistinguishable in report.json
+        // from a document with genuinely no tagged tables at all.
+        //
+        // Real, narrow reproducer: the tagged cell's own page content stream is a single
+        // unterminated hex string ("<AB", no closing ">"). glyphsFor's
+        // BudgetedMarkedContentExtractor.processPage(page) hits PDFBox's own low-level tokenizer
+        // (PDFStreamParser) while reading that token and throws a plain java.io.IOException
+        // ("Missing closing bracket for hex string...") BEFORE any operator is ever dispatched --
+        // neither a RulingOverflowException nor a StackOverflowError -- which propagates out of
+        // resolveCellText -> buildTaggedTable, uncaught by extractTagged's own per-table
+        // catch(RulingOverflowException), all the way to extract()'s catch(Exception) around the
+        // whole extractTagged call. Verified directly against PDFBox 3.0.8 with a scratch probe
+        // (both this tagged engine and the lattice one) before writing this test, rather than
+        // assumed from reading PDFBox's source alone.
+        try (PDDocument doc = new PDDocument()) {
+            PDPage poisoned = new PDPage(PDRectangle.LETTER);
+            doc.addPage(poisoned);
+            org.apache.pdfbox.pdmodel.common.PDStream badContent =
+                    new org.apache.pdfbox.pdmodel.common.PDStream(doc);
+            try (var os = badContent.createOutputStream()) {
+                os.write("<AB".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            }
+            poisoned.setContents(badContent);
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(poisoned);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(poisoned);
+            cell.getCOSObject().setInt(COSName.K, 0);
+            tr.appendKid(cell);
+
+            TableExtractor.Result r = assertDoesNotThrow(
+                    () -> TableExtractor.extract(doc, List.of(1), Map.of()),
+                    "a generic Exception escaping tagged extraction must be caught, not propagate");
+
+            assertTrue(r.truncated,
+                    "a document whose tagged extraction genuinely FAILED must mark the result "
+                            + "truncated, so it's distinguishable from a document with no tagged tables at all");
         }
     }
 
@@ -926,6 +982,147 @@ class TableTaggedTest {
                     .findFirst()
                     .orElseThrow(() -> new AssertionError("inner 2x2 table not found: " + r.tables));
             assertEquals(List.of(List.of("R1C1", "R1C2"), List.of("R2C1", "R2C2")), inner.rows);
+        }
+    }
+
+    // ---------------------------------------------------------------- PR re-review P2: MCR-page
+    // ---------------------------------------------------------------- precedence over an INHERITED
+    // ---------------------------------------------------------------- ancestor /Pg
+
+    /**
+     * Builds Table -&gt; TR -&gt; TD (single cell, no rulings) where {@code table.setPage(pageA)}
+     * (so {@code pageA} is only reachable by the TD via ANCESTOR /Pg inheritance) while the TD's
+     * OWN kid is a {@link PDMarkedContentReference} whose OWN /Pg points at {@code pageB} --
+     * {@code pageB} is where the cell's real marked content (and so its real glyphs) lives. The TD
+     * itself carries no direct {@code setPage(...)} of its own. Returns the TD element so the
+     * caller can also drive {@link TableExtractor#resolveElementPageWithMcrFallback} on it
+     * directly.
+     */
+    private static PDStructureElement buildCellWithOwnMcrOnDifferentPageThanInheritedAncestor(
+            PDDocument doc, PDPage pageA, PDPage pageB) throws IOException {
+        try (PDPageContentStream cs = new PDPageContentStream(doc, pageB)) {
+            COSDictionary d = new COSDictionary();
+            d.setInt(COSName.MCID, 0);
+            cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+            TableTestPdfs.text(cs, 60, 700, "Hi");
+            cs.endMarkedContent();
+        }
+
+        PDStructureTreeRoot root = new PDStructureTreeRoot();
+        doc.getDocumentCatalog().setStructureTreeRoot(root);
+        PDStructureElement table = new PDStructureElement("Table", root);
+        table.setPage(pageA); // INHERITED by TR/TD below -- neither calls setPage() itself
+        root.appendKid(table);
+        PDStructureElement tr = new PDStructureElement("TR", table);
+        table.appendKid(tr); // no tr.setPage()
+        PDStructureElement cell = new PDStructureElement("TD", tr);
+        // No cell.setPage() -- the cell's own /Pg is absent, so only inheritance (pageA) or its
+        // own MCR (pageB) can resolve it.
+        PDMarkedContentReference mcr = new PDMarkedContentReference();
+        mcr.setPage(pageB); // the cell's OWN MCR page -- where collectGlyphs actually reads from
+        mcr.setMCID(0);
+        cell.appendKid(mcr);
+        tr.appendKid(cell);
+        return cell;
+    }
+
+    @Test
+    void cellOwnMcrPageTakesPrecedenceOverInheritedAncestorPage() throws Exception {
+        // Codex re-review P2 (correctness) reproducer: resolveElementPageWithMcrFallback used to
+        // do the element+ANCESTOR /Pg walk FIRST, only falling back to a cell's own MCR page when
+        // that walk returned null -- so a cell that INHERITS /Pg from an ancestor (here, the
+        // Table) but whose OWN MCR points at a DIFFERENT page (where its glyphs actually live) was
+        // wrongly resolved to the ANCESTOR's page. That both mis-gates the cell against
+        // pagesToProcess and (were the ancestor page ever in scope too) mis-attributes the cell's
+        // rotation/bbox to the wrong page's frame.
+        //
+        // Reference build: the SAME cell/glyph content, but with pageB UNROTATED, to get a "raw"
+        // bbox U in the shared visual frame -- exactly the technique
+        // taggedTableBboxSharesLatticeVisualFrameAcrossRotation above uses to prove which page's
+        // rotation was actually applied, without hardcoding glyph-metric constants.
+        float[] unrotatedBbox;
+        try (PDDocument doc = new PDDocument()) {
+            PDPage pageA = new PDPage(PDRectangle.LETTER);
+            doc.addPage(pageA);
+            PDPage pageB = new PDPage(PDRectangle.LETTER);
+            doc.addPage(pageB);
+            buildCellWithOwnMcrOnDifferentPageThanInheritedAncestor(doc, pageA, pageB);
+
+            TableExtractor.Result ref = TableExtractor.extract(doc, List.of(2), Map.of());
+            assertEquals(1, ref.tables.size(), "sanity: reference (unrotated pageB) build must extract");
+            unrotatedBbox = ref.tables.get(0).bbox;
+            assertNotNull(unrotatedBbox, "sanity: reference table must carry a bbox");
+        }
+
+        try (PDDocument doc = new PDDocument()) {
+            PDPage pageA = new PDPage(PDRectangle.LETTER); // ancestor's INHERITED /Pg (wrong answer)
+            doc.addPage(pageA);
+            PDPage pageB = new PDPage(PDRectangle.LETTER); // cell's OWN MCR page (correct answer)
+            pageB.setRotation(90);
+            doc.addPage(pageB);
+            PDStructureElement cell =
+                    buildCellWithOwnMcrOnDifferentPageThanInheritedAncestor(doc, pageA, pageB);
+
+            // Direct unit-level assertion (RED pre-fix: returns pageA).
+            assertEquals(pageB, TableExtractor.resolveElementPageWithMcrFallback(cell),
+                    "a cell's OWN MCR page must take precedence over an INHERITED ancestor /Pg");
+
+            // End-to-end: only pageB (page 2, where the glyphs really live) is in scope. Pre-fix,
+            // the early page-gate resolves pageA (page 1, out of scope) for this cell, so the
+            // whole table is silently dropped even though its only real content is in scope.
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(2), Map.of());
+            assertEquals(1, r.tables.size(),
+                    "a table whose only cell resolves via its own MCR to an in-scope page must not "
+                            + "be dropped just because it INHERITS a different, out-of-scope page: "
+                            + r.tables);
+            TableExtractor.TableHit t = r.tables.get(0);
+            assertEquals(2, t.page,
+                    "table attributed to the cell's own MCR page, not the inherited ancestor page");
+            assertEquals("Hi", t.cells.get(0).text);
+            assertNotNull(t.cells.get(0).bbox);
+
+            // Not mis-rotated: the cell's bbox must reflect pageB's OWN rotation (90) -- the page
+            // its glyphs are actually on -- not pageA's (0, the merely-inherited ancestor page).
+            PDRectangle cropBox = pageB.getCropBox();
+            float uw = cropBox.getWidth(), uh = cropBox.getHeight();
+            float[] c0 = TableExtractor.applyPageRotation(unrotatedBbox[0], unrotatedBbox[1], 90, uw, uh);
+            float[] c1 = TableExtractor.applyPageRotation(unrotatedBbox[2], unrotatedBbox[3], 90, uw, uh);
+            float expX0 = Math.min(c0[0], c1[0]), expX1 = Math.max(c0[0], c1[0]);
+            float expY0 = Math.min(c0[1], c1[1]), expY1 = Math.max(c0[1], c1[1]);
+            assertEquals(expX0, t.cells.get(0).bbox[0], 0.05f, "bbox[0] must use pageB's rotation");
+            assertEquals(expY0, t.cells.get(0).bbox[1], 0.05f, "bbox[1] must use pageB's rotation");
+            assertEquals(expX1, t.cells.get(0).bbox[2], 0.05f, "bbox[2] must use pageB's rotation");
+            assertEquals(expY1, t.cells.get(0).bbox[3], 0.05f, "bbox[3] must use pageB's rotation");
+        }
+    }
+
+    @Test
+    void cellOwnDirectPgTakesPrecedenceOverOwnMcr() throws Exception {
+        // Control for the fix above: a cell's OWN direct /Pg (not inherited from any ancestor)
+        // must still beat its OWN MCR child's page -- the MCR fallback is a fallback for when NO
+        // more-specific /Pg source is present, not a competitor to the cell's own explicit /Pg.
+        try (PDDocument doc = new PDDocument()) {
+            PDPage pageC = new PDPage(PDRectangle.LETTER); // cell's OWN direct /Pg (correct answer)
+            doc.addPage(pageC);
+            PDPage pageD = new PDPage(PDRectangle.LETTER); // cell's OWN MCR page (must lose)
+            doc.addPage(pageD);
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            table.appendKid(tr);
+            PDStructureElement cell = new PDStructureElement("TD", tr);
+            cell.setPage(pageC); // cell's OWN direct /Pg
+            PDMarkedContentReference mcr = new PDMarkedContentReference();
+            mcr.setPage(pageD); // same cell ALSO carries an MCR pointing elsewhere
+            mcr.setMCID(0);
+            cell.appendKid(mcr);
+            tr.appendKid(cell);
+
+            assertEquals(pageC, TableExtractor.resolveElementPageWithMcrFallback(cell),
+                    "a cell's OWN direct /Pg must take precedence over its OWN MCR child's page");
         }
     }
 }

@@ -1578,6 +1578,13 @@ final class TableExtractor {
             result.truncated = true;
             System.err.println("WARNING: tagged table extraction truncated (structure-traversal work cap): " + e);
         } catch (Exception e) {
+            // PR re-review P2 (consistency): this used to leave result.truncated FALSE, unlike
+            // every sibling hostile-input cap in this class (StackOverflowError/RulingOverflowException
+            // just above) -- a page whose tagged extraction failed here (e.g. an IOException from a
+            // malformed content stream) was indistinguishable from a page with genuinely no tagged
+            // tables at all. Flag it so report.json's tablesTruncated warning surfaces the omission,
+            // same as every other skip-extraction catch in this class.
+            result.truncated = true;
             System.err.println("WARNING: tagged table extraction failed: " + e);
         }
         // FIX 2 (Codex P1 / ledger M-T6-2): a page carrying a tagged table used to be entirely
@@ -1625,6 +1632,13 @@ final class TableExtractor {
                 System.err.println("WARNING: table extraction overflowed the stack on page " + pageNum
                         + " (page skipped): " + e);
             } catch (Exception e) {
+                // PR re-review P2 (consistency): same fix as extractTagged's own catch(Exception)
+                // above -- this used to leave result.truncated FALSE, unlike every sibling
+                // hostile-input cap on this per-page loop (RulingOverflowException/StackOverflowError
+                // just above), so a page whose lattice extraction failed (e.g. an IOException on a
+                // malformed content stream) was indistinguishable from a clean page with genuinely no
+                // tables. Flag it; the loop still continues to the next page as before.
+                result.truncated = true;
                 System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
             }
         }
@@ -2074,13 +2088,12 @@ final class TableExtractor {
     }
 
     /**
-     * Resolve a structure element's page, walking up ANCESTOR structure elements
-     * ({@code getParent()}) when the element itself carries no explicit /Pg. Per ISO 32000, /Pg
-     * is commonly inherited -- set once on an ancestor (e.g. the enclosing Table or TR) rather
-     * than repeated on every TD/TH leaf -- so checking only the element itself silently treats a
-     * spec-conforming, accessibility-tagged table as pageless.
+     * Walk up ANCESTOR structure elements ({@code getParent()}), starting at {@code startDepth}
+     * (0 to also read {@code node} itself, 1 to skip straight to its parent), returning the first
+     * /Pg found. Per ISO 32000, /Pg is commonly inherited -- set once on an ancestor (e.g. the
+     * enclosing Table or TR) rather than repeated on every TD/TH leaf.
      *
-     * <p>Cheap and side-effect-free: only reads each ancestor's /Pg dictionary reference, no MCID
+     * <p>Cheap and side-effect-free: only reads each node's /Pg dictionary reference, no MCID
      * resolution or content-stream access, so callers can gate the resolved page against
      * pagesToProcess BEFORE any glyph work -- this must not reintroduce the out-of-scope-page-walk
      * DoS the pagesToProcess gating previously fixed.
@@ -2089,9 +2102,8 @@ final class TableExtractor {
      * cyclic/hostile structure tree; past the cap this simply gives up and returns null (same as
      * "no /Pg found anywhere"), it does not loop or overflow.
      */
-    private static PDPage resolveElementPage(PDStructureElement el) {
-        PDStructureNode node = el;
-        int depth = 0;
+    private static PDPage resolveElementPage(PDStructureNode node, int startDepth) {
+        int depth = startDepth;
         while (node instanceof PDStructureElement se && depth <= 64) {
             PDPage page = se.getPage();
             if (page != null) return page;
@@ -2102,35 +2114,52 @@ final class TableExtractor {
     }
 
     /**
-     * PR re-review P2 (recall): {@link #resolveElementPage} only consults the element's OWN /Pg
-     * plus ancestor /Pg (element + TR + Table, per ISO 32000's common inheritance pattern) -- but
-     * a TD/TH's page can ALSO be declared SOLELY via one of its {@link PDMarkedContentReference}
-     * kids' own /Pg, with no /Pg anywhere on the element or any ancestor at all (a third, equally
-     * legal way ISO 32000 lets marked content be associated with a page). {@link #collectGlyphs}
-     * (further down this class) already resolves glyphs correctly through exactly this path
-     * ({@code mcr.getPage()}) -- but that only runs AFTER {@link #selectedCellPage}'s early, cheap
-     * page-gate in {@code extractTagged}, so a table using ONLY this structure was silently
-     * rejected before glyph resolution ever ran.
+     * PR re-review P2 (recall): a TD/TH's page can be declared THREE different, equally legal
+     * (ISO 32000) ways -- the element's OWN /Pg, an INHERITED ancestor /Pg (element + TR + Table),
+     * or SOLELY via one of its {@link PDMarkedContentReference} kids' own /Pg, with no /Pg
+     * anywhere on the element or any ancestor at all. {@link #collectGlyphs} (further down this
+     * class) always resolves this cell's actual glyphs through {@code mcr.getPage()} PER MCR --
+     * so whichever page source this method returns must agree with THAT page, not some other
+     * ancestor's, or the cell's resolved page (used for the pagesToProcess gate AND for
+     * rotation/cropbox-based bbox attribution in {@link #resolveCellText}) disagrees with where
+     * its glyphs actually live.
      *
-     * <p>Falls back to a SHALLOW scan of {@code el}'s own direct kids for a {@link
-     * PDMarkedContentReference} (matching exactly the depth {@link #collectGlyphs} itself uses to
-     * find one -- no recursion into nested structure elements here), returning the first non-null
-     * {@code mcr.getPage()} found. Never resolves glyphs itself -- this stays as cheap as the
-     * ancestor walk above it (one dictionary-reference read per kid, no content-stream access, no
-     * MCID resolution) -- so callers can still gate the returned page against pagesToProcess
-     * BEFORE any glyph work, exactly as {@link #resolveElementPage} already requires; this must
-     * not reintroduce the out-of-scope-page-walk DoS the pagesToProcess gating previously fixed.
+     * <p>PR re-review P2 (correctness): precedence MUST be (1) the element's OWN direct /Pg
+     * (depth 0, NOT inherited) if present; else (2) the element's OWN direct MCR-kid page (a
+     * SHALLOW scan of {@code el}'s own kids only -- matching exactly the depth {@link
+     * #collectGlyphs} itself uses to find one, no recursion into nested structure elements);
+     * else (3) an INHERITED ancestor /Pg, walked via {@code getParent()} starting at {@code el}'s
+     * parent. (2) must beat (3): an inherited ancestor /Pg is a fallback for when NOTHING more
+     * specific is declared, but this cell's own MCR kid is exactly as specific/authoritative as
+     * an own direct /Pg would be, and is where {@link #collectGlyphs} actually reads glyphs from
+     * -- letting a merely-inherited ancestor page win over it would resolve this cell to a page
+     * its glyphs are not even on, corrupting both the pagesToProcess gate and the rotation/bbox
+     * transform {@link #resolveCellText} applies. When a cell has MCRs on multiple pages, the
+     * first (document order) is used -- simple and bounded, matching the non-recursive scan of
+     * direct kids above.
+     *
+     * <p>Never resolves glyphs itself -- this stays as cheap as the ancestor walk (one
+     * dictionary-reference read per kid, no content-stream access, no MCID resolution) -- so
+     * callers can still gate the returned page against pagesToProcess BEFORE any glyph work; this
+     * must not reintroduce the out-of-scope-page-walk DoS the pagesToProcess gating previously
+     * fixed.
      */
-    private static PDPage resolveElementPageWithMcrFallback(PDStructureElement el) {
-        PDPage page = resolveElementPage(el);
-        if (page != null) return page;
+    static PDPage resolveElementPageWithMcrFallback(PDStructureElement el) {
+        // (1) el's OWN direct /Pg (depth 0 only, NOT inherited) wins over everything else.
+        PDPage ownPage = el.getPage();
+        if (ownPage != null) return ownPage;
+        // (2) el's OWN direct MCR-kid page -- this is where collectGlyphs actually resolves this
+        // cell's glyphs from (mcr.getPage() per MCR), so it must beat a merely-INHERITED ancestor
+        // /Pg below.
         for (Object kid : el.getKids()) {
             if (kid instanceof PDMarkedContentReference mcr) {
                 PDPage mcrPage = mcr.getPage();
                 if (mcrPage != null) return mcrPage;
             }
         }
-        return null;
+        // (3) last resort: an ancestor's /Pg, inherited per ISO 32000. Starts at el's PARENT
+        // (depth 1) -- el's own /Pg was already checked (and missed) in (1) above.
+        return resolveElementPage(el.getParent(), 1);
     }
 
     /** DFS for structure elements of a standard type; depth-capped against cyclic/hostile trees.

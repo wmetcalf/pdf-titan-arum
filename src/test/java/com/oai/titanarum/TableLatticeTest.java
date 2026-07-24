@@ -682,6 +682,80 @@ class TableLatticeTest {
         }
     }
 
+    @Test
+    void genericExceptionOnLatticePagePathMarksTruncated() throws Exception {
+        // Codex re-review P2 (consistency) reproducer: extract()'s per-page LATTICE loop's
+        // catch(Exception e) -- the generic fallback below the StackOverflowError/RulingOverflowException
+        // catches above -- used to only log, leaving Result.truncated FALSE. A page whose table
+        // extraction genuinely FAILED (e.g. a malformed content stream) was then indistinguishable
+        // in report.json from a clean page that simply has no tables at all.
+        //
+        // Real, narrow reproducer: a content stream consisting of a single unterminated hex
+        // string ("<AB", no closing ">"). PDFBox's own low-level content-stream tokenizer
+        // (PDFStreamParser, invoked by RulingCollector.processPage inside collectRulings) throws a
+        // plain java.io.IOException ("Missing closing bracket for hex string...") the moment it
+        // tries to read this token -- BEFORE any operator is ever dispatched, so this is neither a
+        // RulingOverflowException nor a StackOverflowError, and (unlike a malformed/missing-resource
+        // operand, which PDFStreamEngine.operatorException logs and swallows for leniency) a raw
+        // tokenizer failure like this propagates all the way up uncaught. Verified directly against
+        // PDFBox 3.0.8 before writing this test (a scratch probe against both the tagged and
+        // lattice engines) to confirm this exact byte sequence throws here, rather than assuming it
+        // from reading PDFBox's source alone.
+        //
+        // Two-page document, mirroring stackOverflowOnLatticePagePathIsCaughtAndMarksTruncated just
+        // above: page 1 is poisoned; page 2 is a normal, well-formed ruled table, proving one
+        // hostile page degrades only itself while every other page in pagesToProcess still extracts.
+        try (PDDocument doc = new PDDocument()) {
+            PDPage poisoned = new PDPage(PDRectangle.LETTER);
+            doc.addPage(poisoned);
+            org.apache.pdfbox.pdmodel.common.PDStream badContent =
+                    new org.apache.pdfbox.pdmodel.common.PDStream(doc);
+            try (var os = badContent.createOutputStream()) {
+                os.write("<AB".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            }
+            poisoned.setContents(badContent);
+
+            PDPage normal = new PDPage(PDRectangle.LETTER);
+            doc.addPage(normal);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, normal)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) TableTestPdfs.line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) TableTestPdfs.line(cs, x, 700, x, 610);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        TableTestPdfs.text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+            }
+
+            TableExtractor.Result r = assertDoesNotThrow(
+                    () -> TableExtractor.extract(doc, List.of(1, 2), Map.of()),
+                    "a generic Exception escaping the lattice per-page path must be caught, not propagate");
+
+            assertTrue(r.truncated,
+                    "a page whose lattice extraction genuinely FAILED must mark the result truncated, "
+                            + "so it's distinguishable from a clean page with no tables at all");
+            assertEquals(1, r.tables.size(),
+                    "the poisoned page must be skipped, but the other (well-formed) page must still extract: "
+                            + r.tables);
+            assertEquals(2, r.tables.get(0).page, "the surviving table must be the well-formed page's own table");
+        }
+    }
+
+    @Test
+    void cleanPageWithNoTablesStaysUntruncated() throws Exception {
+        // Companion control for the fix above: a normal, well-formed page with no tables at all
+        // must NOT set Result.truncated -- only a genuine extraction FAILURE may signal it.
+        Path pdf = tmp.resolve("no_tables.pdf");
+        TableTestPdfs.taggedDegenerate(pdf); // no rulings, no tagged content worth keeping
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertTrue(r.tables.isEmpty(), "sanity: this fixture carries no tables");
+            assertFalse(r.truncated,
+                    "a clean page with genuinely no tables must not be flagged truncated");
+        }
+    }
+
     private static String javaBinary() {
         return Path.of(System.getProperty("java.home"), "bin", "java").toString();
     }

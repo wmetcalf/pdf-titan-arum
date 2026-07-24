@@ -681,6 +681,23 @@ function buildTablesSection(report) {
   return section('Tables', html, ' <span style="color:#666;font-weight:normal">('+tables.length+')</span>');
 }
 
+function buildExtractedTextSection(report) {
+  const pages = (report.pageTexts || []).filter(p => p && (p.text || '').trim().length);
+  if (!pages.length) return '';
+  let html = '';
+  for (const p of pages) {
+    const open = pages.length === 1 ? ' open' : '';
+    const chars = (p.text || '').length;
+    html += '<details' + open + ' style="margin-bottom:0.4rem;border:1px solid #333;border-radius:3px">'
+      + '<summary style="cursor:pointer;padding:0.4rem 0.6rem;background:#1e1e1e">Page ' + esc(p.page)
+      + ' <span style="color:#666;font-weight:normal">(' + chars + ' chars)</span></summary>'
+      + '<pre style="margin:0;padding:0.6rem;white-space:pre-wrap;word-break:break-word;'
+      + 'font-size:0.78rem;color:#ccc;max-height:420px;overflow:auto">' + esc(p.text) + '</pre>'
+      + '</details>';
+  }
+  return section('Extracted Text', html, ' <span style="color:#666;font-weight:normal">(' + pages.length + ' page' + (pages.length === 1 ? '' : 's') + ')</span>');
+}
+
 function buildReportView(job, report) {
   let html = buildCveBanner(report);
   html += '<div class="job-sections">';
@@ -703,6 +720,7 @@ function buildReportView(job, report) {
   html += buildOcgSection(report);
   html += buildEmbeddedFilesSection(report);
   html += buildTablesSection(report);
+  html += buildExtractedTextSection(report);
   html += '</div>';
   return html;
 }

@@ -121,13 +121,22 @@ final class StreamTableExtractor {
     static final int  MAX_GUTTER_CANDIDATES = 16;
     // Bounds the REAL cost of the branch-and-bound below, not the pop count: every surviving
     // pop runs an O(obstacles) linear scan (firstObstacleInside), so the true cost per pop is
-    // obstacles.size(), and that's what gets charged. Sized like this file's sibling budgets
-    // (MAX_TEXTFILL_WORK/MAX_GROUPING_WORK in TableExtractor) so a normal multi-column table
-    // (a few thousand word-obstacles) completes comfortably, while a dense/adversarial page
-    // near MAX_STREAM_WORDS (60,000 obstacles) aborts within a few hundred scans -- well under
-    // ~1-2s of CPU -- instead of the ~2,000,000-pop budget silently allowing pops*obstacles
-    // (unbounded) real work.
-    static final long MAX_GUTTER_SCAN_WORK  = 20_000_000;
+    // obstacles.size(), and that's what gets charged.
+    //
+    // Retuned from an earlier 20,000,000. The redundant-re-derivation fix below (coveredByAccepted
+    // + duplicatesSkipped) removes the wasted O(obstacles) SCAN for a duplicate gutter re-
+    // derivation, but a duplicate is still correctly counted against MAX_GUTTER_CANDIDATES (see
+    // that field's doc), so tables whose search legitimately needs to walk through more
+    // candidates before settling (e.g. real cell-width variance across hundreds of rows, or
+    // gutters narrower than the 3x-median-space quality cap needing several row-peeled
+    // fragments before the widest-row boundary dominates) still consume real, charged pops.
+    // 500,000,000 gives multiple-hundred-ms headroom for such legitimate large/narrow-gutter
+    // tables (measured: a 150-row x 6-col table with a gutter *below* the quality cap, previously
+    // throwing at the old budget, now completes in ~70ms) while an adversarial page near
+    // MAX_STREAM_WORDS (no row ever leaves a gutter clean, so nothing is ever a duplicate or
+    // accepted) still aborts in a few thousand pops -- a few ms of CPU, since each pop is a cheap
+    // O(obstacles) scan and the budget directly caps pop count at budget/obstacles regardless.
+    static final long MAX_GUTTER_SCAN_WORK  = 500_000_000;
 
     static final class Gutter {
         float x0, x1;
@@ -159,10 +168,31 @@ final class StreamTableExtractor {
             (a, b) -> Float.compare(quality(b, medianSpace), quality(a, medianSpace)));
         pq.add(new Rect(bandX0, yTop, bandX1, yBot));
         List<Rect> accepted = new ArrayList<>();
+        // Any candidate fully CONTAINED (x AND y, within a small float-slop epsilon) by an
+        // already-accepted rect is provably empty too -- a sub-rectangle of a region already
+        // verified obstacle-free is itself obstacle-free, no re-scan needed. Without this, the
+        // search re-derives the SAME already-known gutter over and over: e.g. a full-height
+        // gutter gets accepted once, but the above/below splits of unrelated sibling rects
+        // (peeling the table one row at a time off a full-width "remainder") keep re-isolating
+        // that identical x-interval at ever-shrinking y-ranges, each a strict subset of the
+        // rect already accepted for it. Every such re-derivation burns a real O(obstacles) scan
+        // for zero new information; skipping it outright (not just deprioritizing) removes
+        // that wasted scan cost.
+        //
+        // A detected duplicate still counts against MAX_GUTTER_CANDIDATES via duplicatesSkipped
+        // (the loop bound below), rather than being invisible to it: this preserves the search's
+        // existing termination behavior for ordinary tables with natural per-row width variance
+        // (different digit counts etc.), where a handful of near-boundary duplicates are a
+        // normal, expected part of converging on the true (widest-row) safe gutter -- NOT
+        // counting them (i.e. only skipping the wasted scan without also bounding the search by
+        // it) was measured to make the search run substantially longer per candidate on such
+        // ordinary tables and reintroduce exactly the completion regression this fix targets.
+        int duplicatesSkipped = 0;
         long work = 0;
-        while (!pq.isEmpty() && accepted.size() < MAX_GUTTER_CANDIDATES) {
+        while (!pq.isEmpty() && accepted.size() + duplicatesSkipped < MAX_GUTTER_CANDIDATES) {
             Rect r = pq.poll();
             if (r.w() < minGutterW || r.h() < 0.60f * bandH) continue;
+            if (coveredByAccepted(r, accepted)) { duplicatesSkipped++; continue; }
             // Real cost is the O(obstacles) linear scan below, run once per surviving pop --
             // charge that (not the pop itself) so the budget bounds actual CPU.
             work += obstacles.size();
@@ -229,5 +259,19 @@ final class StreamTableExtractor {
             if (o[0] < r.x1 && o[2] > r.x0 && o[1] < r.y1 && o[3] > r.y0) return o;
         }
         return null;
+    }
+
+    private static final float RESOLVED_EPS = 0.01f;
+
+    /** True if r lies entirely inside (within a small float-slop epsilon of, in BOTH x and y)
+     * some already-accepted rect. Any such r is a sub-rectangle of a region already verified
+     * obstacle-free, so it is necessarily obstacle-free itself -- re-scanning it can never
+     * find a pivot, and it is safe to prune outright rather than merely deprioritize. */
+    private static boolean coveredByAccepted(Rect r, List<Rect> accepted) {
+        for (Rect g : accepted) {
+            if (r.x0 >= g.x0 - RESOLVED_EPS && r.x1 <= g.x1 + RESOLVED_EPS
+                && r.y0 >= g.y0 - RESOLVED_EPS && r.y1 <= g.y1 + RESOLVED_EPS) return true;
+        }
+        return false;
     }
 }

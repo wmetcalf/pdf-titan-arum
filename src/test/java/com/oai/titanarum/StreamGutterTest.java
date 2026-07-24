@@ -25,6 +25,30 @@ class StreamGutterTest {
         return StreamTableExtractor.buildLines(ws, 10f);
     }
 
+    /**
+     * Uniform, non-adversarial grid of {@code rows} x {@code cols} with ordinary,
+     * well-separated column slots (no staggering between rows). Cell width has a small,
+     * realistic spread (4 distinct widths, like numbers with a few different digit counts)
+     * rather than being byte-identical across every row -- real PDF text essentially never
+     * repeats the exact same glyph metrics hundreds of rows straight, and a small spread is
+     * exactly what legitimately forces the branch-and-bound to verify a handful of candidate
+     * gutter boundaries per column before settling on the true (widest-row) safe interval.
+     */
+    private static List<StreamTableExtractor.Line> uniformGrid(int rows, int cols) {
+        List<StreamTableExtractor.Word> ws = new ArrayList<>();
+        float colWidth = 60f, rowSpacing = 15f;
+        Random rnd = new Random(42);
+        for (int r = 0; r < rows; r++) {
+            float y = r * rowSpacing;
+            for (int c = 0; c < cols; c++) {
+                float x0 = c * colWidth;
+                float wordWidth = 20f + rnd.nextInt(4) * 2f; // 20,22,24,26 -- well clear of the gutter
+                ws.add(w(x0, x0 + wordWidth, y, String.valueOf((r * 31 + c * 7) % 97)));
+            }
+        }
+        return StreamTableExtractor.buildLines(ws, 10f);
+    }
+
     @Test
     void findsTwoInteriorGuttersInThreeColumnGrid() {
         List<StreamTableExtractor.Gutter> g =
@@ -133,5 +157,69 @@ class StreamGutterTest {
         assertTrue(g.get(1).cx() > 79 && g.get(1).cx() < 89, "gutter2 between col1 and col2");
         assertEquals(7, g.get(0).rowsCovered, "gutter1's merged fragments must cover all 7 rows");
         assertEquals(7, g.get(1).rowsCovered, "gutter2 covers all 7 rows");
+    }
+
+    /**
+     * A normal multi-column table must still complete. A plain uniform grid (well-separated
+     * gutters, no staggering) with a small, realistic per-cell width spread -- real PDF text
+     * essentially never repeats byte-identical glyph metrics across hundreds of rows -- at
+     * 150 rows x 6 columns is comfortably inside "a normal multi-column table" per the
+     * acceptance bar.
+     */
+    @Test
+    void largeLegitimateTableCompletes() {
+        int rows = 150, cols = 6;
+        List<StreamTableExtractor.Line> lines = uniformGrid(rows, cols);
+        assertEquals(rows, lines.size());
+        float bandX1 = (cols - 1) * 60f + 26f + 20f;
+        List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 0f, bandX1, 6f);
+        assertEquals(cols - 1, g.size(), "expect cols-1 interior gutters for a " + rows + "x" + cols + " grid");
+    }
+
+    /**
+     * Locks in headroom at a higher column count: 200 rows x 10 columns (9 interior gutters),
+     * hundreds of rows and up to a dozen columns is squarely within MAX_STREAM_LINES=8000 and
+     * should complete fast, not just "eventually".
+     */
+    @Test
+    void largeLegitimateTableCompletesAtHigherColumnCount() {
+        int rows = 200, cols = 10;
+        List<StreamTableExtractor.Line> lines = uniformGrid(rows, cols);
+        assertEquals(rows, lines.size());
+        float bandX1 = (cols - 1) * 60f + 26f + 20f;
+        long t0 = System.nanoTime();
+        List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 0f, bandX1, 6f);
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+        assertEquals(cols - 1, g.size(), "expect cols-1 interior gutters for a " + rows + "x" + cols + " grid");
+        assertTrue(elapsedMs < 2000, "must complete well under 2s, took " + elapsedMs + "ms");
+    }
+
+    /**
+     * The actual pre-fix regression: a uniform grid whose column gutters are NARROWER than the
+     * quality cap (3*medianSpace = 18 here; gutterW=16), still ordinary/non-adversarial (no
+     * staggering, identical column slots every row) but a case that genuinely threw
+     * RulingOverflowException pre-fix at just 150 rows x 6 columns (verified against the
+     * pre-fix algorithm) because duplicate re-derivation of the SAME already-known gutter (via
+     * the row-peeling above/below splits of unrelated sibling rects) burned real O(obstacles)
+     * scans for zero new information. coveredByAccepted prunes the re-scan of those
+     * duplicates outright.
+     */
+    @Test
+    void largeTableWithNarrowGuttersCompletes() {
+        int rows = 150, cols = 6;
+        float colSlot = 40f, gutterW = 16f, rowSpacing = 15f;
+        List<StreamTableExtractor.Word> ws = new ArrayList<>();
+        for (int r = 0; r < rows; r++) {
+            float y = r * rowSpacing;
+            for (int c = 0; c < cols; c++) {
+                float x0 = c * (colSlot + gutterW);
+                ws.add(w(x0, x0 + colSlot, y, String.valueOf((r * 31 + c * 7) % 97)));
+            }
+        }
+        List<StreamTableExtractor.Line> lines = StreamTableExtractor.buildLines(ws, 10f);
+        assertEquals(rows, lines.size());
+        float bandX1 = (cols - 1) * (colSlot + gutterW) + colSlot + 10f;
+        List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 0f, bandX1, 6f);
+        assertEquals(cols - 1, g.size(), "expect cols-1 interior gutters for a " + rows + "x" + cols + " grid");
     }
 }

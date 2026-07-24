@@ -484,6 +484,149 @@ final class StreamTableExtractor {
 
     static final int MAX_STREAM_TABLES_PER_PAGE = 20;
 
+    // ---------------------------------------------------------------------- region segmentation
+    //
+    // Task 9d: extractPage used to feed EVERY line on the page into one findGutters/scoreGrid/
+    // buildHit call, treating the whole page as a single candidate table. Measured consequence
+    // (see .superpowers/sdd/task-9c-diagnosis-report.md): the page's title/running-header/
+    // caption lines sit ABOVE the table's own y-range but get pooled in as "row 0" anyway (e.g.
+    // us-020 produced row 0 = the running header "HIGHLIGHTS FROM PIRLS 2011", confidence 0.98),
+    // which -- because TableScore matches cells by exact (row, col, text) -- shifts every
+    // subsequent row index and alone explains F1~=0. A second, independent failure: pooling an
+    // entire page's prose+multiple-small-tables into one findGutters call can blow
+    // MAX_GUTTER_SCAN_WORK, and the resulting RulingOverflowException used to abort the WHOLE
+    // page (see the old catch-clause below), silently losing every real table on it (eu-001).
+    //
+    // The fix below splits the page's lines into candidate blocks by vertical gap (Step A),
+    // detects a table independently within each sufficiently-large block (Step B, capped at
+    // MAX_STREAM_TABLES_PER_PAGE hits and a per-page work budget), and trims non-conforming
+    // leading/trailing lines (title/footnote glued to a block with too small a gap to be split
+    // by Step A alone) off each block before final scoring (Step C).
+
+    // Step A: split the page's line list wherever the gap to the next line exceeds this factor
+    // times the MEDIAN line-to-line pitch. Rationale for 1.6: real intra-table/intra-paragraph
+    // row pitch is fairly uniform (typically <=1.3x variation even across wrapped multi-line
+    // rows/headers -- see task-9c's spot checks against pdftotext -layout), while a genuine
+    // paragraph-to-table (or table-to-footnote) transition typically inserts at least a
+    // half-to-full blank-line's worth of extra leading, i.e. comfortably >=2x the body pitch.
+    // 1.6 sits between those two regimes: high enough that normal within-block pitch jitter
+    // never triggers a spurious split, low enough to catch genuine section breaks reliably.
+    // Deliberately does NOT rely on catching every title/footnote this way, though (many
+    // real-world report pages use uniform single-spacing throughout, so the gap above a title
+    // can be smaller than this threshold) -- that residual case is exactly what Step C's
+    // edge-trimming exists to clean up within a single surviving block.
+    static final float BLOCK_GAP_FACTOR = 1.6f;
+
+    // Step C: cap non-conforming-edge trimming at this many lines per end (front/back each),
+    // so a pathological block (e.g. many consecutive non-conforming lines) can't be trimmed
+    // down to nothing one line at a time in an unbounded loop. A real title/caption or
+    // footnote is essentially always 1-3 physical lines (a wrapped 2-3 line caption at most,
+    // per the us-007/us-020 samples in the task-9c report); 3 gives headroom above that
+    // without allowing trimming to eat meaningfully into real table rows.
+    static final int MAX_EDGE_TRIM_ITERATIONS = 3;
+
+    // Step D: bounds the TOTAL per-page cost of per-block detection (gutter search +
+    // gridness scoring + edge trimming) summed across every candidate block on one page.
+    // Each individual block's own findGutters call is already independently bounded
+    // (MAX_GUTTER_SCAN_WORK), and buildWords/buildLines already cap total page glyphs/words/
+    // lines (MAX_STREAM_GLYPHS/MAX_STREAM_WORDS/MAX_STREAM_LINES) -- so the REMAINING linear
+    // (scoreGrid/trimEdgeLines are O(block word count)) per-block work, summed across every
+    // block on the page, can never exceed a small constant multiple of MAX_STREAM_WORDS
+    // (60,000) even in the pathological case of thousands of tiny blocks each independently
+    // processed. Charging each block's own word count against a running page total and
+    // stopping once it's exhausted (WITHOUT discarding hits already built from prior blocks --
+    // see the loop below) makes that bound explicit and enforced, rather than merely implied
+    // by the upstream caps. Sized at 10x MAX_STREAM_WORDS: comfortably above the worst
+    // legitimate case (every page word landing in blocks that all get fully processed, i.e.
+    // a total charge of exactly MAX_STREAM_WORDS) while still being a real, finite ceiling.
+    static final long MAX_STREAM_PAGE_BLOCK_WORK = 10L * MAX_STREAM_WORDS;
+
+    /**
+     * Step A: split an ordered (top-to-bottom) line list into candidate blocks wherever the
+     * vertical gap to the next line exceeds {@link #BLOCK_GAP_FACTOR} times the median
+     * line-to-line pitch. {@code lines} must already be sorted by {@code yTop} (as returned by
+     * {@link #buildLines}).
+     */
+    static List<List<Line>> splitIntoBlocks(List<Line> lines) {
+        List<List<Line>> blocks = new ArrayList<>();
+        if (lines.isEmpty()) return blocks;
+        if (lines.size() == 1) { blocks.add(new ArrayList<>(lines)); return blocks; }
+
+        float[] pitches = new float[lines.size() - 1];
+        for (int i = 1; i < lines.size(); i++) pitches[i - 1] = lines.get(i).yTop - lines.get(i - 1).yTop;
+        float[] sortedPitches = pitches.clone();
+        Arrays.sort(sortedPitches);
+        // Degenerate-input floor (near-zero/overlapping line pitch): without it a zero-ish
+        // median would make BLOCK_GAP_FACTOR*median ~0, so every nonzero gap -- however tiny --
+        // would trigger a split, over-fragmenting into near-useless 1-2 line "blocks". This is
+        // purely a defensive floor for pathological input, not expected on real PDFs (real line
+        // pitch is always a real fraction of the font size).
+        float medianPitch = Math.max(sortedPitches[sortedPitches.length / 2], 0.5f);
+        float threshold = BLOCK_GAP_FACTOR * medianPitch;
+
+        List<Line> cur = new ArrayList<>();
+        cur.add(lines.get(0));
+        for (int i = 1; i < lines.size(); i++) {
+            float gap = lines.get(i).yTop - lines.get(i - 1).yTop;
+            if (gap > threshold) {
+                blocks.add(cur);
+                cur = new ArrayList<>();
+            }
+            cur.add(lines.get(i));
+        }
+        blocks.add(cur);
+        return blocks;
+    }
+
+    /**
+     * Step C: iteratively drop leading/trailing lines of {@code block} that don't conform to
+     * the column model implied by {@code gutters} -- a title/caption/footnote line glued to a
+     * table block by a gap too small for Step A to have split off on its own. A line is
+     * non-conforming if: it has fewer than 2 words, OR any of its words straddles a gutter
+     * center, OR all its words fall into a single column while the block's OTHER (remaining)
+     * lines occupy 2+ columns. Trimming is capped at {@link #MAX_EDGE_TRIM_ITERATIONS} per end.
+     * {@code gutters}/{@code bandX0}/{@code bandX1} (the block's own column model) are NOT
+     * recomputed as lines are dropped -- only the surviving line list changes.
+     */
+    static List<Line> trimEdgeLines(List<Line> block, List<Gutter> gutters, float bandX0, float bandX1) {
+        List<Line> cur = new ArrayList<>(block);
+        float[] bounds = colBoundsOf(gutters, bandX0, bandX1);
+        for (int i = 0; i < MAX_EDGE_TRIM_ITERATIONS && cur.size() > 1; i++) {
+            if (!isNonConformingEdge(cur.get(0), cur, bounds, gutters)) break;
+            cur.remove(0);
+        }
+        for (int i = 0; i < MAX_EDGE_TRIM_ITERATIONS && cur.size() > 1; i++) {
+            if (!isNonConformingEdge(cur.get(cur.size() - 1), cur, bounds, gutters)) break;
+            cur.remove(cur.size() - 1);
+        }
+        return cur;
+    }
+
+    private static float[] colBoundsOf(List<Gutter> gutters, float bandX0, float bandX1) {
+        float[] bounds = new float[gutters.size() + 2];
+        bounds[0] = bandX0; bounds[bounds.length - 1] = bandX1;
+        for (int i = 0; i < gutters.size(); i++) bounds[i + 1] = gutters.get(i).cx();
+        return bounds;
+    }
+
+    private static boolean isNonConformingEdge(Line line, List<Line> context, float[] bounds, List<Gutter> gutters) {
+        if (line.words.size() < 2) return true;
+        for (Word w : line.words) {
+            for (Gutter g : gutters) if (w.x0 < g.cx() && w.x1 > g.cx()) return true;
+        }
+        Set<Integer> ownCols = new HashSet<>();
+        for (Word w : line.words) ownCols.add(colOf(w.cx(), bounds));
+        if (ownCols.size() == 1) {
+            Set<Integer> otherCols = new HashSet<>();
+            for (Line l : context) {
+                if (l == line) continue;
+                for (Word w : l.words) otherCols.add(colOf(w.cx(), bounds));
+            }
+            if (otherCols.size() >= 2) return true;
+        }
+        return false;
+    }
+
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs) {
         return extractPage(pageNum, glyphs, new BreuelGutterFinder());
     }
@@ -494,28 +637,68 @@ final class StreamTableExtractor {
      * bake-off harness run the full pipeline against any contender finder through this one seam.
      * The 2-arg overload delegates here with the production default ({@link BreuelGutterFinder});
      * that choice is unchanged pending bake-off results.
+     *
+     * <p>Pipeline (see the "region segmentation" block above for the Task 9d rationale): build
+     * words/lines for the whole page (as before), split the lines into candidate blocks by
+     * vertical gap (Step A), then for each block with >=3 lines independently find its own
+     * band/gutters, trim non-conforming edge lines (Step C), and score/build a hit (Step B) --
+     * capped at {@link #MAX_STREAM_TABLES_PER_PAGE} hits and a per-page work budget (Step D). A
+     * DoS abort ({@link TableExtractor.RulingOverflowException}) from an individual block's
+     * gutter search or cell-count cap only skips THAT block, not the whole page -- unlike the
+     * page-global glyph/word/line caps in buildWords/buildLines, which (as before) abort the
+     * whole page with no partial output, since a breach there means the line data itself
+     * couldn't be safely built at all.
      */
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs, GutterFinder finder) {
+        List<Word> words;
+        List<Line> lines;
         try {
-            List<Word> words = buildWords(glyphs);
-            if (words.size() < 6) return List.of();          // too little to be a table
+            words = buildWords(glyphs);
+            if (words.size() < 6) return List.of();           // too little to be a table
             float mfs = medianFontSize(words);
-            List<Line> lines = buildLines(words, mfs);
+            lines = buildLines(words, mfs);
             if (lines.size() < 3) return List.of();
-
-            float bandX0 = Float.MAX_VALUE, bandX1 = -Float.MAX_VALUE;
-            for (Word w : words) { bandX0 = Math.min(bandX0, w.x0); bandX1 = Math.max(bandX1, w.x1); }
-            float medianSpace = 0.5f * mfs;
-
-            List<Gutter> gutters = finder.find(lines, bandX0, bandX1, medianSpace);
-            Grid grid = scoreGrid(lines, gutters, bandX0, bandX1);
-            if (grid.confidence < STREAM_CONFIDENCE_MIN) return List.of();
-
-            TableExtractor.TableHit hit = buildHit(pageNum, grid);
-            return hit == null ? List.of() : List.of(hit);
         } catch (TableExtractor.RulingOverflowException e) {
-            return List.of();                                 // DoS budget breached -> abort page
+            return List.of();                                  // page-global DoS budget breached -> abort page
         }
+        float medianSpace = 0.5f * medianFontSize(words);
+
+        List<List<Line>> blocks = splitIntoBlocks(lines);
+        List<TableExtractor.TableHit> hits = new ArrayList<>();
+        long pageWork = 0;
+
+        for (List<Line> block : blocks) {
+            if (hits.size() >= MAX_STREAM_TABLES_PER_PAGE) break;
+            if (block.size() < 3) continue;
+
+            long charge = block.stream().mapToLong(l -> l.words.size()).sum();
+            if (pageWork + charge > MAX_STREAM_PAGE_BLOCK_WORK) break; // page budget exhausted -> keep prior hits, stop
+            pageWork += charge;
+
+            try {
+                float bandX0 = Float.MAX_VALUE, bandX1 = -Float.MAX_VALUE;
+                for (Line l : block) for (Word w : l.words) {
+                    bandX0 = Math.min(bandX0, w.x0); bandX1 = Math.max(bandX1, w.x1);
+                }
+
+                List<Gutter> gutters = finder.find(block, bandX0, bandX1, medianSpace);
+                List<Line> trimmed = trimEdgeLines(block, gutters, bandX0, bandX1);
+                if (trimmed.size() < 3) continue;               // Step C left too little to be a table -> reject block
+
+                Grid grid = scoreGrid(trimmed, gutters, bandX0, bandX1);
+                if (grid.confidence < STREAM_CONFIDENCE_MIN) continue;
+
+                TableExtractor.TableHit hit = buildHit(pageNum, grid);
+                if (hit != null) hits.add(hit);
+            } catch (TableExtractor.RulingOverflowException e) {
+                // this block's own gutter search or cell-count cap blew its budget -- skip only
+                // this block (not the whole page), keeping whatever hits other blocks already
+                // produced. This is the fix for the eu-001 failure mode in task-9c: a whole-page
+                // search over 356 words/56 lines (prose + 7 small tables) used to blow
+                // MAX_GUTTER_SCAN_WORK and silently lose every real table on the page.
+            }
+        }
+        return hits;
     }
 
     private static TableExtractor.TableHit buildHit(int pageNum, Grid grid) {

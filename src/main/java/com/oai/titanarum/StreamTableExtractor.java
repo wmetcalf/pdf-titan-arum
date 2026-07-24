@@ -55,7 +55,20 @@ final class StreamTableExtractor {
             float gy0 = tp.getYDirAdj();                 // top of glyph, top-left origin
             float gh  = Math.max(1f, tp.getHeightDir());
             float gw  = tp.getWidthDirAdj();
-            float fs  = Math.max(1f, tp.getFontSizeInPt() * tp.getTextMatrix().getScalingFactorY());
+            // TextPosition.getFontSizeInPt() is ALREADY the effective device-space font size --
+            // per its own javadoc, it's getFontSize() "multiplied ... with the text matrix
+            // horizontal scaling factor", i.e. any Tm/CTM scale is already folded in. getTextMatrix()
+            // is (also per its own javadoc) NOT the raw "Tm" operator matrix despite the name -- it's
+            // the full text-RENDERING matrix (Trm = Tfs-scaled Tm x CTM), so its own scaling factor
+            // ALSO already has the font size baked in. Multiplying the two together (as a prior
+            // version of this line did) double-counts the font size for any genuinely-PDFBox-parsed
+            // TextPosition (e.g. fs=121 for an 11pt font, instead of 11) -- on real content this
+            // inflated the newLine threshold (0.5*fs) enough that glyphs a full row apart no longer
+            // triggered a line break, silently merging adjacent rows' words into one. It only
+            // "worked" for StreamWordLineTest's hand-built TextPosition doubles because those
+            // construct textMatrix as a pure Matrix.getTranslateInstance() (scale factor 1,
+            // decoupled from the fontSizeInPt ctor arg) -- a shape no real rendered PDF produces.
+            float fs  = Math.max(1f, tp.getFontSizeInPt());
             float space = Math.max(tp.getWidthOfSpace(), 0.25f * fs);
             boolean whitespace = u.trim().isEmpty();
             boolean newLine = cur != null && Math.abs(gy0 - prevBaseline) > 0.5f * fs;
@@ -462,4 +475,72 @@ final class StreamTableExtractor {
     }
 
     private static double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+    static final int MAX_STREAM_TABLES_PER_PAGE = 20;
+
+    static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs) {
+        try {
+            List<Word> words = buildWords(glyphs);
+            if (words.size() < 6) return List.of();          // too little to be a table
+            float mfs = medianFontSize(words);
+            List<Line> lines = buildLines(words, mfs);
+            if (lines.size() < 3) return List.of();
+
+            float bandX0 = Float.MAX_VALUE, bandX1 = -Float.MAX_VALUE;
+            for (Word w : words) { bandX0 = Math.min(bandX0, w.x0); bandX1 = Math.max(bandX1, w.x1); }
+            float medianSpace = 0.5f * mfs;
+
+            List<Gutter> gutters = findGutters(lines, bandX0, bandX1, medianSpace);
+            Grid grid = scoreGrid(lines, gutters, bandX0, bandX1);
+            if (grid.confidence < STREAM_CONFIDENCE_MIN) return List.of();
+
+            TableExtractor.TableHit hit = buildHit(pageNum, grid);
+            return hit == null ? List.of() : List.of(hit);
+        } catch (TableExtractor.RulingOverflowException e) {
+            return List.of();                                 // DoS budget breached -> abort page
+        }
+    }
+
+    private static TableExtractor.TableHit buildHit(int pageNum, Grid grid) {
+        int cols = grid.colBounds.length - 1;
+        int rows = grid.rows.size();
+        if ((long) rows * cols > TableExtractor.MAX_CELLS_PER_TABLE)
+            throw new TableExtractor.RulingOverflowException();
+
+        TableExtractor.TableHit t = new TableExtractor.TableHit();
+        t.page = pageNum;
+        t.extractionMethod = "stream";
+        t.confidence = Math.round(grid.confidence * 1000.0) / 1000.0;
+        t.rowCount = rows; t.colCount = cols;
+        t.cells = new ArrayList<>();
+        float tx0=Float.MAX_VALUE, ty0=Float.MAX_VALUE, tx1=-Float.MAX_VALUE, ty1=-Float.MAX_VALUE;
+
+        for (int r = 0; r < rows; r++) {
+            Line line = grid.rows.get(r);
+            StringBuilder[] text = new StringBuilder[cols];
+            float[][] box = new float[cols][]; // {x0,y0,x1,y1}
+            for (Word w : line.words) {
+                int c = colOf(w.cx(), grid.colBounds);
+                if (text[c] == null) { text[c] = new StringBuilder(); box[c] = new float[]{w.x0,w.y0,w.x1,w.y1}; }
+                else { if (text[c].length() > 0) text[c].append(' '); }
+                text[c].append(w.text);
+                box[c][0]=Math.min(box[c][0],w.x0); box[c][1]=Math.min(box[c][1],w.y0);
+                box[c][2]=Math.max(box[c][2],w.x1); box[c][3]=Math.max(box[c][3],w.y1);
+            }
+            for (int c = 0; c < cols; c++) {
+                if (text[c] == null) continue;                // sparse cell -> omit (renderViews fills "")
+                TableExtractor.CellHit cell = new TableExtractor.CellHit();
+                cell.row = r; cell.col = c; cell.rowSpan = 1; cell.colSpan = 1;
+                cell.text = text[c].toString();
+                cell.bbox = box[c];
+                t.cells.add(cell);
+                tx0=Math.min(tx0,box[c][0]); ty0=Math.min(ty0,box[c][1]);
+                tx1=Math.max(tx1,box[c][2]); ty1=Math.max(ty1,box[c][3]);
+            }
+        }
+        if (t.cells.isEmpty()) return null;
+        t.bbox = new float[]{tx0, ty0, tx1, ty1};
+        TableExtractor.renderViews(t);                        // fills rows + markdown
+        return t;
+    }
 }

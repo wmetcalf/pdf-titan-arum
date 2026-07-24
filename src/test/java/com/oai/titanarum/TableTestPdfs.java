@@ -1724,4 +1724,18 @@ final class TableTestPdfs {
             doc.save(file.toFile());
         }
     }
+
+    /** Harvest all TextPositions on a 0-based page index (top-left-origin coords). */
+    static java.util.List<org.apache.pdfbox.text.TextPosition> harvestGlyphs(
+            org.apache.pdfbox.pdmodel.PDDocument doc, int pageIndex) throws java.io.IOException {
+        java.util.List<org.apache.pdfbox.text.TextPosition> out = new java.util.ArrayList<>();
+        org.apache.pdfbox.text.PDFTextStripper s = new org.apache.pdfbox.text.PDFTextStripper() {
+            @Override protected void writeString(String t, java.util.List<org.apache.pdfbox.text.TextPosition> ps) {
+                out.addAll(ps);
+            }
+        };
+        s.setStartPage(pageIndex + 1); s.setEndPage(pageIndex + 1);
+        s.getText(doc);
+        return out;
+    }
 }

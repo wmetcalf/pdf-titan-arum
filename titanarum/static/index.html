@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <title>titanarum</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23c0392b'/%3E%3Ctext x='8' y='12' font-size='10' text-anchor='middle' fill='%23fff' font-family='monospace'%3Et%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <h1><a href="/" data-act="nav-list" data-prevent="1" style="color:inherit;text-decoration:none">titanarum</a> <span id="version"></span></h1>
+
+  <!-- Detail view — shown only on /jobs/<id>. Renders into #detail-content
+       via showJobDetailView(). -->
+  <div id="detail-view" style="display:none">
+    <div class="card">
+      <div class="detail-hdr" style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
+        <a href="/" data-act="nav-list" data-prevent="1" style="color:#64b5f6;text-decoration:none;font-size:0.9rem">&#8592; Recent Jobs</a>
+        <span style="color:#555">/</span>
+        <span style="font-family:'Courier New',monospace;font-size:0.85rem;color:#c0392b" id="detail-id"></span>
+        <span id="detail-state" style="margin-left:auto"></span>
+      </div>
+      <div id="detail-content"></div>
+    </div>
+  </div>
+
+  <!-- List view — shown on / (default). The Submit + Recent Jobs cards. -->
+  <div id="list-view">
+  <div class="card">
+    <h2>Submit PDF</h2>
+    <div class="upload-row">
+      <input type="file" id="file-input" accept=".pdf" multiple>
+    </div>
+    <div class="toggles">
+      <label><input type="checkbox" id="toggle-skip-screenshots"> Skip screenshots</label>
+      <label><input type="checkbox" id="toggle-skip-images"> Skip images</label>
+      <label style="margin-left:0.5rem;color:#777">DPI:</label>
+      <input type="number" id="opt-dpi" min="50" max="600" placeholder="150"
+             style="width:4.5rem;background:#1a1a1a;border:1px solid #444;color:#ccc;padding:0.1rem 0.3rem;border-radius:3px;font-size:0.85rem">
+      <label style="color:#777">Pages:</label>
+      <input type="text" id="opt-pages" placeholder="default" title="e.g. 1-4,z  or  all"
+             style="width:6rem;background:#1a1a1a;border:1px solid #444;color:#ccc;padding:0.1rem 0.3rem;border-radius:3px;font-size:0.85rem">
+    </div>
+    <div class="btn-row">
+      <button id="queue-btn" data-act="upload-async">Submit</button>
+    </div>
+    <div id="upload-status"></div>
+  </div>
+
+  <div class="card">
+    <div class="table-header">
+      <h2>Recent Jobs</h2>
+      <span id="refresh-indicator"></span>
+    </div>
+    <div class="search-row" style="margin-top:0.5rem">
+      <input type="text" id="search-input" placeholder="Search by filename (partial), SHA-256, or job ID&hellip;"
+             autocomplete="off" spellcheck="false" title="Search by filename (partial), SHA-256, or job ID">
+      <button id="search-clear" data-act="clear-search" title="Clear">&times;</button>
+      <span id="search-count"></span>
+    </div>
+    <div id="state-pills" style="margin-top:0.4rem;display:flex;gap:0.4rem;flex-wrap:wrap;font-size:0.78rem"></div>
+    <div class="jobs-scroll" style="margin-top:0.25rem">
+      <table>
+        <colgroup>
+          <col style="width: 19rem">    <!-- ID (full 36-char UUID, no ellipsis) -->
+          <col>                         <!-- Filename (flexes to fill) -->
+          <col style="width: 9rem">    <!-- State -->
+          <col style="width: 9rem">    <!-- Submitted -->
+          <col style="width: 6.5rem">  <!-- Duration -->
+          <col style="width: 8rem">    <!-- Highlights -->
+        </colgroup>
+        <thead>
+          <tr><th>ID</th><th>Filename</th><th>State</th><th>Submitted</th><th>Duration</th><th>Highlights</th></tr>
+        </thead>
+        <tbody id="jobs-body">
+          <tr><td colspan="6" class="no-jobs">Loading&hellip;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="pager"></div>
+  </div>
+  </div><!-- #list-view -->
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

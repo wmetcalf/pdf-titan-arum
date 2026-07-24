@@ -743,9 +743,91 @@ final class StreamTableExtractor {
         return hits;
     }
 
+    // ------------------------------------------------------------- Task 9f: logical-row merging
+    //
+    // buildHit used to map each display Line 1:1 to a table row. Real tables have cells whose
+    // text WRAPS across several display lines (long descriptions, multi-line headers), and every
+    // wrapped cell manufactured a phantom row -- shifting every subsequent row index and, since
+    // TableScore matches cells by exact (row, col, text), tanking F1 even when the extracted TEXT
+    // was correct (measured: us-020 produced 49 rows vs. ground truth's 46; us-007, 44 vs. 36).
+    //
+    // Fix: cluster display lines into LOGICAL rows before ever building a cell, using an
+    // anchor-column heuristic. Rationale: in a real table, the label/key column (or, for a
+    // multi-line header, the FIRST header cell's own column) starts each new logical row; a
+    // continuation line of a wrapped cell in some OTHER column leaves that anchor column empty.
+    // Walking lines top-to-bottom, a line with anchor content starts a new row; a line without it
+    // is folded into the row above. This handles wrapped data cells and multi-line headers with
+    // the exact same rule -- no special-casing needed for headers.
+
+    // Anchor column = the LEFTMOST column populated on at least this fraction of the block's
+    // lines. 0.6 (not e.g. 0.5) deliberately requires a clear majority-plus-margin: a column
+    // that's merely "more often populated than not" (just over 50%) is still plausibly itself a
+    // wrapping/continuation-heavy column in a ragged table, whereas requiring 60% means the
+    // chosen anchor is populated on a supermajority of rows -- consistent with it being the
+    // record-starting key column rather than incidental content. Picking the LEFTMOST such
+    // column (not just any) matches how real tables are laid out: the leading/label column is
+    // conventionally first, and scanning left-to-right also means a mostly-numeric trailing
+    // column that happens to clear the threshold never gets picked over a real label column to
+    // its left.
+    static final float ANCHOR_MIN_FILL = 0.6f;
+
+    /**
+     * Returns the index of the leftmost column populated on >= {@link #ANCHOR_MIN_FILL} of
+     * {@code lines}, or -1 if no column meets that bar (caller must then fall back to one
+     * logical row per display line -- guessing at an anchor from a weak signal risks merging
+     * unrelated lines into one row, which is worse than the pre-fix behavior it would replace).
+     */
+    static int findAnchorColumn(List<Line> lines, float[] colBounds) {
+        int cols = colBounds.length - 1;
+        int n = lines.size();
+        if (n == 0) return -1;
+        for (int c = 0; c < cols; c++) {
+            int filled = 0;
+            for (Line l : lines) {
+                for (Word w : l.words) {
+                    if (colOf(w.cx(), colBounds) == c) { filled++; break; }
+                }
+            }
+            if ((float) filled / n >= ANCHOR_MIN_FILL) return c;
+        }
+        return -1;
+    }
+
+    /**
+     * Groups {@code lines} (top-to-bottom, as produced by {@link #buildLines}) into logical
+     * rows. A line starts a NEW logical row if its anchor-column cell is non-empty; otherwise it
+     * is a CONTINUATION of the current logical row (its content gets appended into whichever
+     * column(s) it populates when the group is later flattened into cells). If the very first
+     * line has no anchor content, it still starts a row on its own (there is no prior row to
+     * continue). If {@link #findAnchorColumn} finds no qualifying column, falls back to one
+     * logical row per display line -- i.e. the pre-Task-9f behavior -- for this block.
+     */
+    static List<List<Line>> groupLogicalRows(List<Line> lines, float[] colBounds) {
+        List<List<Line>> groups = new ArrayList<>();
+        int anchorCol = findAnchorColumn(lines, colBounds);
+        if (anchorCol < 0) {
+            for (Line l : lines) groups.add(List.of(l));      // fallback: one row per display line
+            return groups;
+        }
+        List<Line> cur = null;
+        for (Line l : lines) {
+            boolean anchorPopulated = false;
+            for (Word w : l.words) {
+                if (colOf(w.cx(), colBounds) == anchorCol) { anchorPopulated = true; break; }
+            }
+            if (cur == null || anchorPopulated) {
+                cur = new ArrayList<>();
+                groups.add(cur);
+            }
+            cur.add(l);
+        }
+        return groups;
+    }
+
     private static TableExtractor.TableHit buildHit(int pageNum, Grid grid) {
         int cols = grid.colBounds.length - 1;
-        int rows = grid.rows.size();
+        List<List<Line>> rowGroups = groupLogicalRows(grid.rows, grid.colBounds);
+        int rows = rowGroups.size();
         if ((long) rows * cols > TableExtractor.MAX_CELLS_PER_TABLE)
             throw new TableExtractor.RulingOverflowException();
 
@@ -758,16 +840,21 @@ final class StreamTableExtractor {
         float tx0=Float.MAX_VALUE, ty0=Float.MAX_VALUE, tx1=-Float.MAX_VALUE, ty1=-Float.MAX_VALUE;
 
         for (int r = 0; r < rows; r++) {
-            Line line = grid.rows.get(r);
+            // Cell bbox for a merged cell = union of the contributing words' boxes across ALL
+            // its display lines (not just one). Text is joined across lines the same way it's
+            // already joined WITHIN a line (single space between successive fragments), so a
+            // cell's text reads naturally whether its words came from one display line or several.
             StringBuilder[] text = new StringBuilder[cols];
             float[][] box = new float[cols][]; // {x0,y0,x1,y1}
-            for (Word w : line.words) {
-                int c = colOf(w.cx(), grid.colBounds);
-                if (text[c] == null) { text[c] = new StringBuilder(); box[c] = new float[]{w.x0,w.y0,w.x1,w.y1}; }
-                else { if (text[c].length() > 0) text[c].append(' '); }
-                text[c].append(w.text);
-                box[c][0]=Math.min(box[c][0],w.x0); box[c][1]=Math.min(box[c][1],w.y0);
-                box[c][2]=Math.max(box[c][2],w.x1); box[c][3]=Math.max(box[c][3],w.y1);
+            for (Line line : rowGroups.get(r)) {
+                for (Word w : line.words) {
+                    int c = colOf(w.cx(), grid.colBounds);
+                    if (text[c] == null) { text[c] = new StringBuilder(); box[c] = new float[]{w.x0,w.y0,w.x1,w.y1}; }
+                    else { if (text[c].length() > 0) text[c].append(' '); }
+                    text[c].append(w.text);
+                    box[c][0]=Math.min(box[c][0],w.x0); box[c][1]=Math.min(box[c][1],w.y0);
+                    box[c][2]=Math.max(box[c][2],w.x1); box[c][3]=Math.max(box[c][3],w.y1);
+                }
             }
             for (int c = 0; c < cols; c++) {
                 if (text[c] == null) continue;                // sparse cell -> omit (renderViews fills "")

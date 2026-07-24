@@ -1,10 +1,13 @@
 package com.oai.titanarum;
 
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSDictionary;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureElement;
+import org.apache.pdfbox.pdmodel.documentinterchange.logicalstructure.PDStructureTreeRoot;
 import org.apache.pdfbox.pdmodel.documentinterchange.markedcontent.PDMarkedContent;
 import org.apache.pdfbox.text.TextPosition;
 import org.junit.jupiter.api.Test;
@@ -281,6 +284,146 @@ class TableTaggedTest {
             assertNull(t.cells.get(2).bbox, "a cell resolved from a different page must not carry a bbox");
             assertNull(t.cells.get(3).bbox);
             assertNotNull(t.bbox, "table bbox must still be built from the page-1 cells");
+        }
+    }
+
+    @Test
+    void crossPageTaggedTableSurvivesWithOnlyContinuationPageSelected() throws Exception {
+        // PR re-review P2 (recall) reproducer: the OLD gate (firstCellPage) resolved only the
+        // table's FIRST cell's page (page 1, carrying "A"/"B") and dropped the WHOLE table when
+        // that page wasn't in pagesToProcess -- even though this SAME table continues onto page 2
+        // (carrying "C"/"D"), which IS selected here. This simulates a noncontiguous page
+        // selection like "1-4,last" where a table starts on an unselected page and continues onto
+        // a selected one: it must survive as a page-scoped PARTIAL table, not be dropped outright.
+        Path pdf = tmp.resolve("crosspage_p2only.pdf");
+        TableTestPdfs.taggedCrossPage(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            int before = TableExtractor.taggedProcessPageCalls;
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(2), Map.of());
+
+            assertEquals(1, r.tables.size(),
+                    "a table with a continuation page in scope must NOT be dropped entirely: " + r.tables);
+            TableExtractor.TableHit t = r.tables.get(0);
+            assertEquals(2, t.page, "table's page must be a SELECTED page among its cells (page 2), "
+                    + "not the unselected page its first cell happens to be on");
+            assertEquals("", t.cells.get(0).text, "page-1 cell (out of scope) must be empty");
+            assertEquals("", t.cells.get(1).text, "page-1 cell (out of scope) must be empty");
+            assertEquals("C", t.cells.get(2).text, "page-2 cell (in scope) must resolve its real text");
+            assertEquals("D", t.cells.get(3).text, "page-2 cell (in scope) must resolve its real text");
+            assertNull(t.cells.get(0).bbox, "an out-of-scope cell must not carry a bbox");
+            assertNull(t.cells.get(1).bbox, "an out-of-scope cell must not carry a bbox");
+            assertNotNull(t.cells.get(2).bbox, "an in-scope cell must carry a bbox");
+            assertNotNull(t.cells.get(3).bbox, "an in-scope cell must carry a bbox");
+
+            // The out-of-scope-page-walk DoS guard must remain intact: glyphsFor's own per-page
+            // pagesToProcess gate is what produced the empty page-1 cell text above, and since
+            // pagesToProcess=[2] here, page 1's content stream is the ONLY one that could ever be
+            // walked in error -- exactly one page (2) is genuinely in scope, so exactly one
+            // taggedProcessPageCalls increment (memoized per page) is the only way this can play
+            // out if page 1 was never touched.
+            assertEquals(1, TableExtractor.taggedProcessPageCalls - before,
+                    "page 1 (out of scope) must never be content-walked -- only page 2's single "
+                            + "(memoized) walk may count against taggedProcessPageCalls");
+        }
+    }
+
+    @Test
+    void taggedTableFullyOutOfScopeAcrossAllItsCellsStaysDropped() throws Exception {
+        // Control for the fix above: when NONE of a tagged table's cells resolve to a page in
+        // pagesToProcess (both page 1 and page 2 excluded here), it must still be skipped
+        // entirely -- and neither page's content stream may ever be walked.
+        Path pdf = tmp.resolve("crosspage_none_selected.pdf");
+        TableTestPdfs.taggedCrossPage(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            int before = TableExtractor.taggedProcessPageCalls;
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(), Map.of());
+
+            assertTrue(r.tables.isEmpty(),
+                    "a table with NO cell on a selected page must still be dropped entirely: " + r.tables);
+            assertEquals(before, TableExtractor.taggedProcessPageCalls,
+                    "neither page's content stream may be walked when no page is in scope");
+        }
+    }
+
+    @Test
+    void stackOverflowInTaggedExtractionSetsTruncated() throws Exception {
+        // PR re-review P2 (trivial) reproducer: extract()'s catch(StackOverflowError) around
+        // extractTagged used to skip tagged extraction (lattice still runs) WITHOUT marking
+        // Result.truncated -- unlike every sibling hostile-input cap in this class. A hostile/deep
+        // structure could silently omit every tagged table from report.json with NO
+        // tablesTruncated warning to explain why.
+        //
+        // Real end-to-end trigger, not a synthetic depth-cap probe: every recursive walk inside
+        // TableExtractor's OWN tagged-path traversal (collectByType/collectGlyphs/
+        // resolveElementPage/flattenMarkedContent) is already depth-capped at 64 and cannot
+        // overflow by design. The genuine, still-unguarded overflow source here is INSIDE pdfbox
+        // itself: PDPageTree.getInheritableAttribute (used by PDPage.getCropBox()/getRotation(),
+        // called the moment glyphsFor's PDFMarkedContentExtractor.processPage(page) initializes)
+        // recurses up a page's /Parent ancestry with a cycle GUARD but NO depth cap. A page whose
+        // /Parent points into a pathologically deep (but acyclic) chain of synthetic /Pages nodes
+        // overflows the stack there, well outside any of this class's own guards.
+        //
+        // This same page.getCropBox()/getRotation() call is ALSO made directly, unconditionally,
+        // by the (separate, out-of-scope-for-this-fix) LATTICE per-page loop -- so to isolate this
+        // reproducer to the TAGGED path's own catch(StackOverflowError) under test here, the
+        // document's page-tree root /Count is spoofed to 0 (PDDocument.getNumberOfPages() reads
+        // /Count directly, independent of the actual /Kids-based traversal doc.getPages() uses),
+        // which makes extractLatticePage's own page-range guard reject page 1 before ever calling
+        // getRotation()/getCropBox() on it -- without touching any lattice-path code.
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            // Build the fake ancestry chain OUTERMOST-first, propagating pdfbox's own
+            // COSUpdateState.originDocumentState one level at a time as each node is created,
+            // rather than linking the whole pre-built 500,000-deep chain to the (already-tracked)
+            // document in one shot at the end. That single-shot link is itself a real,
+            // currently-unbounded RECURSIVE cascade in pdfbox (COSUpdateState.setOriginDocumentState
+            // walks every nested COSUpdateInfo value) -- attaching a deep pre-built chain to a
+            // tracked document in one call overflows the stack during FIXTURE SETUP, before
+            // TableExtractor.extract() is ever called, which would not exercise the catch under
+            // test here. Setting each node's origin state immediately after it is created (while
+            // its own /Parent still points only to an ALREADY-tracked node, whose state is already
+            // set and so short-circuits per setOriginDocumentState's own already-set guard) keeps
+            // every step O(1), producing the identical deep-chain STRUCTURE for
+            // getInheritableAttribute to walk later, without any construction-time recursion.
+            org.apache.pdfbox.cos.COSDocumentState originState =
+                    page.getCOSObject().getUpdateState().getOriginDocumentState();
+            int depth = 500_000;
+            COSDictionary nodeAbovePage = null;
+            for (int i = 0; i < depth; i++) {
+                COSDictionary node = new COSDictionary();
+                node.setItem(COSName.TYPE, COSName.PAGES);
+                if (nodeAbovePage != null) node.setItem(COSName.PARENT, nodeAbovePage);
+                node.getUpdateState().setOriginDocumentState(originState);
+                nodeAbovePage = node;
+            }
+            // Decouple ancestry (used by getInheritableAttribute) from the real, shallow Kids-based
+            // tree doc.getPages() still uses for enumeration -- PDPageTree's iterator is Kids-based
+            // BFS and never follows /Parent, so pageNumbers resolution is unaffected by this.
+            page.getCOSObject().setItem(COSName.PARENT, nodeAbovePage);
+            // Spoof /Count so the LATTICE per-page loop's own bounds check rejects page 1 outright
+            // (see this test's own doc above) -- isolating the reproducer to the tagged path.
+            doc.getDocumentCatalog().getPages().getCOSObject().setInt(COSName.COUNT, 0);
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            root.appendKid(table);
+            PDStructureElement tr = new PDStructureElement("TR", table);
+            tr.setPage(page);
+            table.appendKid(tr);
+            PDStructureElement td = new PDStructureElement("TD", tr);
+            td.setPage(page);
+            td.getCOSObject().setInt(COSName.K, 0);
+            tr.appendKid(td);
+
+            TableExtractor.Result r = assertDoesNotThrow(
+                    () -> TableExtractor.extract(doc, List.of(1), Map.of()),
+                    "a StackOverflowError escaping tagged extraction must be caught, not propagate");
+            assertTrue(r.truncated,
+                    "a StackOverflowError escaping tagged extraction must mark the result truncated, "
+                            + "so report.json's tablesTruncated warning isn't silently omitted");
         }
     }
 

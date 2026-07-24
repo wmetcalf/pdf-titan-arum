@@ -1559,6 +1559,15 @@ final class TableExtractor {
             // A pathologically deep (or cyclic-looking) structure/marked-content tree can still
             // overflow inside pdfbox's own traversal even with our depth guards in place; degrade
             // to "skip tagged, lattice still runs" rather than killing the worker thread.
+            //
+            // PR re-review P2 (trivial): this used to leave result.truncated FALSE -- unlike every
+            // sibling hostile-input cap in this class (RulingOverflowException just below,
+            // selectKeptTables'/renderKeptTables' own StackOverflowError catches, etc.), all of
+            // which set truncated so report.json's tablesTruncated warning surfaces the omission.
+            // A hostile/deep structure tree could silently OMIT every tagged table from
+            // report.json with NO truncation warning at all. Set it here too, before falling
+            // through to the (still-run) lattice fallback below.
+            result.truncated = true;
             System.err.println("WARNING: tagged table extraction overflowed the stack (skipped): " + e);
         } catch (RulingOverflowException e) {
             // PR re-review P2 (DoS): extractTagged's document-wide structure-traversal work
@@ -1962,9 +1971,20 @@ final class TableExtractor {
             // reads the /Pg dictionary reference, no MCID resolution / content-stream walk. A
             // hostile structure tree referencing thousands of out-of-scope pages is rejected
             // right here, before buildTaggedTable ever calls resolveCellText/glyphsFor.
-            PDPage earlyPage = firstCellPage(trs);
-            Integer pageNum = earlyPage == null ? null : pageNumbers.get(earlyPage);
-            if (pageNum == null || !pagesToProcess.contains(pageNum)) continue;
+            //
+            // PR re-review P2 (recall): this used to be firstCellPage(trs) -- the table's very
+            // FIRST cell's page, gating (and DROPPING) the WHOLE table whenever that one cell
+            // happened to be on an unselected page, even when a LATER cell of the SAME table
+            // resolved to a selected page (e.g. a table that begins on an unselected page and
+            // continues onto a selected one -- exactly the shape a noncontiguous page selection
+            // like "1-4,last" produces for a table starting mid-document and running to the final
+            // page). selectedCellPage instead scans every cell for the first one that IS in scope,
+            // so such a table survives as a page-scoped PARTIAL table (selected-page cells
+            // populated, unselected-page cells left empty by glyphsFor's own per-page gate --
+            // unchanged, see that method's doc) rather than being dropped outright.
+            PDPage earlyPage = selectedCellPage(trs, pageNumbers, pagesToProcess);
+            if (earlyPage == null) continue; // no cell of this table resolves to a page in scope
+            int pageNum = pageNumbers.get(earlyPage);
 
             if (tablesPerPage.getOrDefault(pageNum, 0) >= MAX_TABLES_PER_PAGE) {
                 result.truncated = true;
@@ -1998,18 +2018,36 @@ final class TableExtractor {
         }
     }
 
-    /** Cheap page lookup with NO content-stream access: first TD/TH (in row/cell order) whose
-     * /Pg resolves via {@link #resolveElementPageWithMcrFallback}. Used both to gate a table
-     * against pagesToProcess before any MCID work, and (by construction, same row/cell order as
-     * buildTaggedTable) to pick the table's own page. */
-    private static PDPage firstCellPage(List<PDStructureElement> trs) {
+    /** Cheap page lookup with NO content-stream access: the FIRST TD/TH (in row/cell order) whose
+     * /Pg resolves (via {@link #resolveElementPageWithMcrFallback}) to a page that IS in {@code
+     * pagesToProcess}. Used both to gate a table against pagesToProcess before any MCID work, and
+     * to pick the table's own page.
+     *
+     * <p>PR re-review P2 (recall): superseded {@code firstCellPage}, which looked ONLY at the
+     * table's very first cell -- gating (and dropping) the ENTIRE table whenever that one cell's
+     * page was out of scope, even when a LATER cell of the same table resolved to an in-scope
+     * page. Scanning every cell for the first one that IS in scope (rather than gating on the
+     * first cell period) lets a table spanning an unselected page and a selected page survive,
+     * with its selected-page cells populated and its unselected-page cells correctly left empty
+     * ({@link #glyphsFor}'s own per-page pagesToProcess gate, unchanged, is what produces that
+     * emptiness -- this method must not reintroduce the out-of-scope-page-walk DoS that gate
+     * fixed).
+     *
+     * <p>Returns null only when NO cell in the table resolves to an in-scope page (a fully
+     * out-of-scope table, correctly still skipped by the caller). Still cheap: only /Pg
+     * dictionary reads via resolveElementPageWithMcrFallback, no MCID resolution or
+     * content-stream access. */
+    private static PDPage selectedCellPage(List<PDStructureElement> trs, Map<PDPage, Integer> pageNumbers,
+                                           Set<Integer> pagesToProcess) {
         for (PDStructureElement tr : trs) {
             for (Object kid : tr.getKids()) {
                 if (kid instanceof PDStructureElement el) {
                     String st = el.getStandardStructureType();
                     if ("TD".equals(st) || "TH".equals(st)) {
                         PDPage page = resolveElementPageWithMcrFallback(el);
-                        if (page != null) return page;
+                        if (page == null) continue;
+                        Integer pn = pageNumbers.get(page);
+                        if (pn != null && pagesToProcess.contains(pn)) return page;
                     }
                 }
             }
@@ -2052,7 +2090,7 @@ final class TableExtractor {
      * kids' own /Pg, with no /Pg anywhere on the element or any ancestor at all (a third, equally
      * legal way ISO 32000 lets marked content be associated with a page). {@link #collectGlyphs}
      * (further down this class) already resolves glyphs correctly through exactly this path
-     * ({@code mcr.getPage()}) -- but that only runs AFTER {@link #firstCellPage}'s early, cheap
+     * ({@code mcr.getPage()}) -- but that only runs AFTER {@link #selectedCellPage}'s early, cheap
      * page-gate in {@code extractTagged}, so a table using ONLY this structure was silently
      * rejected before glyph resolution ever ran.
      *

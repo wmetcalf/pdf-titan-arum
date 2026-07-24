@@ -222,4 +222,36 @@ class StreamGutterTest {
         List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 0f, bandX1, 6f);
         assertEquals(cols - 1, g.size(), "expect cols-1 interior gutters for a " + rows + "x" + cols + " grid");
     }
+
+    /**
+     * Task 9e: an 11-column dense numeric grid whose inter-column gaps are only ~1-1.5x the
+     * median space width (medianSpace=6f here -> gutterW=8f, i.e. 1.33x), mimicking the real
+     * us-018 ICDAR failure (2 gutters found vs. ground truth's 11 columns / 10 interior
+     * gutters). Per-cell width has the same small, realistic jitter as {@link #uniformGrid}
+     * (4 distinct widths) rather than being byte-identical every row, so the search has to
+     * verify a handful of candidate boundaries per column -- exactly like real numeric-table
+     * PDF text -- before settling on each column's true safe interval. This directly locks in
+     * the fix for the dominant remaining defect measured against ground truth: findGutters
+     * under-splitting dense/narrow numeric column blocks.
+     */
+    @Test
+    void denseNumericTableYieldsAllColumns() {
+        int rows = 40, cols = 11;
+        float colSlot = 20f, gutterW = 8f, rowSpacing = 15f;
+        Random rnd = new Random(7);
+        List<StreamTableExtractor.Word> ws = new ArrayList<>();
+        for (int r = 0; r < rows; r++) {
+            float y = r * rowSpacing;
+            for (int c = 0; c < cols; c++) {
+                float x0 = c * (colSlot + gutterW);
+                float wordWidth = colSlot - rnd.nextInt(4) * 2f; // 14,16,18,20 -- stays inside the slot
+                ws.add(w(x0, x0 + wordWidth, y, String.valueOf((r * 31 + c * 7) % 97)));
+            }
+        }
+        List<StreamTableExtractor.Line> lines = StreamTableExtractor.buildLines(ws, 10f);
+        assertEquals(rows, lines.size());
+        float bandX1 = (cols - 1) * (colSlot + gutterW) + colSlot + 10f;
+        List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 0f, bandX1, 6f);
+        assertEquals(cols - 1, g.size(), "expect cols-1=10 interior gutters for an " + rows + "x" + cols + " dense numeric grid, got " + g.size());
+    }
 }

@@ -137,7 +137,19 @@ final class StreamTableExtractor {
         return lines;
     }
 
-    static final int  MAX_GUTTER_CANDIDATES = 16;
+    // Task 9e: raised from 16. A table needing K interior gutters needs K accepted rects, but
+    // (per the coveredByAccepted doc below) a normal table with real per-row cell-width variance
+    // legitimately produces MANY duplicate re-derivations of an already-known gutter before the
+    // search moves on to the next one -- e.g. an 11-column dense numeric grid (10 interior
+    // gutters, ~1.3x-medianSpace gutter width, the us-018 ICDAR shape) measured ~1,600 duplicates
+    // PER accepted gutter even after the firstObstacleInside pivot fix below, i.e. ~16,000 total
+    // before all 10 are found. 16 was nowhere near enough headroom for double-digit column
+    // counts: it was exhausted by duplicates alone before a SECOND gutter could ever be accepted,
+    // which is the direct mechanism behind the measured under-split (us-018: 2 gutters found vs.
+    // 11 ground-truth columns). 20,000 gives ~25% headroom above the measured worst case while
+    // MAX_GUTTER_SCAN_WORK (charged, not this count) remains the real DoS backstop -- see its own
+    // doc for why raising this alone does not weaken that bound.
+    static final int  MAX_GUTTER_CANDIDATES = 20_000;
     // Bounds the REAL cost of the branch-and-bound below, not the pop count: every surviving
     // pop runs an O(obstacles) linear scan (firstObstacleInside), so the true cost per pop is
     // obstacles.size(), and that's what gets charged.
@@ -273,11 +285,41 @@ final class StreamTableExtractor {
         return r.h() * Math.min(r.w(), 3f * medianSpace);
     }
 
+    // Task 9e root-cause fix. The ORIGINAL version of this method returned the FIRST obstacle
+    // found in obstacles' insertion order (line-by-line, i.e. row-major, top-to-bottom). That
+    // pivot choice is what made the search on a dense many-row/many-column table (e.g. the
+    // us-018 ICDAR shape: 11 columns, 40+ rows) combinatorially explode: splitting on a row-major
+    // "first" obstacle only ever excludes ONE row's worth of y-extent per split (a word obstacle
+    // is never taller than one row), so the "right" and "below" children of every pop stay nearly
+    // full-width/full-height and have to be peeled again one row at a time. Verified directly
+    // (temporarily instrumented, see task-9e report): an 11-col x 40-row dense numeric grid with
+    // realistic per-row cell-width jitter NEVER accepted a single gutter -- accepted=0,
+    // duplicatesSkipped=0, work=50,000,000,160 (100x the production MAX_GUTTER_SCAN_WORK) with
+    // 326 MILLION rects still queued -- i.e. genuine unbounded exponential blowup, not merely
+    // "narrow gutters lose the quality race" as originally hypothesized.
+    //
+    // The fix: among the obstacles that actually overlap r, pick the one whose CENTER (clamped
+    // to r) is CLOSEST to r's own x-center, instead of the first found. This turns horizontal
+    // narrowing into an approximately-balanced bisection (isolate each column's x-range in
+    // ~O(log cols) splits instead of ~O(cols) row-major peeling), which collapses the
+    // combinatorial blowup: the same 11x40 fixture went from never converging to accepted=11
+    // (10 interior + the implicit outer margin), work=10,379,600, in 38ms -- comfortably inside
+    // the existing MAX_GUTTER_SCAN_WORK budget. Cost per pop is unchanged (still a single
+    // O(obstacles) linear scan, so the existing work-charging above remains accurate); only
+    // WHICH obstacle gets returned changes, so this is a pure quality-of-search improvement, not
+    // a new cost.
     private static float[] firstObstacleInside(Rect r, List<float[]> obstacles) {
+        float cx = (r.x0 + r.x1) * 0.5f;
+        float[] best = null;
+        float bestDist = Float.MAX_VALUE;
         for (float[] o : obstacles) {
-            if (o[0] < r.x1 && o[2] > r.x0 && o[1] < r.y1 && o[3] > r.y0) return o;
+            if (o[0] < r.x1 && o[2] > r.x0 && o[1] < r.y1 && o[3] > r.y0) {
+                float ocx = (Math.max(o[0], r.x0) + Math.min(o[2], r.x1)) * 0.5f;
+                float dist = Math.abs(ocx - cx);
+                if (dist < bestDist) { bestDist = dist; best = o; }
+            }
         }
-        return null;
+        return best;
     }
 
     private static final float RESOLVED_EPS = 0.01f;

@@ -103,7 +103,18 @@ class StreamLogicalRowTest {
      * (all 3 columns populated -- the ONLY line with anchor-column content), line 2 is
      * (blank col0) "Type" "Detail" (a continuation of the Action/Result header labels, but
      * column 0 -- the anchor -- has NOTHING on this line). By the exact same rule that merges a
-     * wrapped DATA cell (no header special-casing), this must merge into ONE logical row.
+     * wrapped DATA cell, this must merge into ONE logical row.
+     *
+     * <p>Task 9g note: this test's ORIGINAL docstring claimed "no header special-casing needed" --
+     * that claim (from task 9f's brief) turned out to be wrong in general and caused a measured
+     * regression on us-018's genuinely hierarchical header (see {@link #stackedHeaderRowsAreNotFlattened}
+     * and the class-level fix doc on {@code StreamTableExtractor.groupLogicalRows}). This
+     * SPECIFIC test, however, needs NO code or assertion change: "Animal" (the anchor column)
+     * is already populated on line 1 -- the very FIRST physical line -- so there is no "leading
+     * run before the first anchor-populated line" here at all, and the fold-forward rule for
+     * line 2 applies exactly as before. It is kept as-is because it still correctly documents a
+     * real, common case (a single wrapped header row whose OWN anchor cell already sits on its
+     * first physical line), just not as a stand-in for every multi-line header shape.
      */
     @Test
     void multiLineHeaderMergesIntoOneRow() throws Exception {
@@ -151,6 +162,156 @@ class StreamLogicalRowTest {
                 "wrapped header fragments must be joined with a single space");
             assertEquals("Result Detail", t.rows.get(0).get(2));
             assertEquals("Cat", t.rows.get(1).get(0));
+        }
+    }
+
+    /**
+     * Task 9g regression test for defect 1. A 4-column Label | ColA | ColB | ColC table with a
+     * genuinely STACKED (hierarchical) 2-line header, mirroring us-018-str.xml's rowspan/colspan
+     * convention (its actual measured shape: a coarser group-label line populating columns
+     * {2,4,5,6}, followed by a finer sub-label line populating a DIFFERENT set, {2,5} -- see the
+     * class-level fix doc on {@code groupLogicalRows}). Here: header line 1 is a coarser
+     * group-label row populating columns 1 AND 3 only ("GroupX", "GroupY" -- skipping column 2),
+     * header line 2 is the finer sub-label row populating ALL THREE non-label columns ("A", "B",
+     * "C") -- a DIFFERENT column set than line 1. The label column (the anchor) is empty on BOTH
+     * header lines. Per the ICDAR evidence, ground truth models this as two SEPARATE rows, not
+     * one flattened row -- exactly what task 9f's original "no special-casing" rule got wrong (it
+     * would have folded line 2 into line 1 because line 2 has no anchor content either). Each
+     * header line populates >=2 DISTINCT columns so neither is mistaken for a single-column
+     * caption fragment by {@code trimEdgeLines}' own (unrelated) non-conformance check.
+     */
+    @Test
+    void stackedHeaderRowsAreNotFlattened() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(600, 400));
+            doc.addPage(page);
+            PDType1Font f = helv();
+            float[] colX = {40, 160, 280, 400};
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setFont(f, 11);
+                float pitch = 16f;
+                float y = 340;
+
+                // header line 1: (label empty) | "GroupX" | (empty) | "GroupY" -- coarser group
+                // labels, populate columns 1 and 3 only (skip column 2).
+                cs.beginText(); cs.newLineAtOffset(colX[1], y); cs.showText("GroupX"); cs.endText();
+                cs.beginText(); cs.newLineAtOffset(colX[3], y); cs.showText("GroupY"); cs.endText();
+                y -= pitch;
+                // header line 2: (label empty) | "A" | "B" | "C" -- finer sub-labels, populate
+                // ALL THREE non-label columns -- a DIFFERENT set than line 1's {1,3}.
+                cs.beginText(); cs.newLineAtOffset(colX[1], y); cs.showText("A"); cs.endText();
+                cs.beginText(); cs.newLineAtOffset(colX[2], y); cs.showText("B"); cs.endText();
+                cs.beginText(); cs.newLineAtOffset(colX[3], y); cs.showText("C"); cs.endText();
+                y -= pitch;
+
+                String[][] data = {
+                    {"X1", "10", "20", "30"},
+                    {"X2", "40", "50", "60"},
+                    {"X3", "70", "80", "90"},
+                    {"X4", "11", "12", "13"},
+                };
+                for (String[] row : data) {
+                    for (int c = 0; c < 4; c++) {
+                        cs.beginText(); cs.newLineAtOffset(colX[c], y); cs.showText(row[c]); cs.endText();
+                    }
+                    y -= pitch;
+                }
+            }
+            List<TextPosition> glyphs = TableTestPdfs.harvestGlyphs(doc, 0);
+            List<TableExtractor.TableHit> hits = StreamTableExtractor.extractPage(1, glyphs);
+            assertEquals(1, hits.size(), "expected one stream table");
+            TableExtractor.TableHit t = hits.get(0);
+            assertEquals(4, t.colCount);
+            assertEquals(6, t.rowCount,
+                "6 LOGICAL rows: the 2-line stacked header stays as TWO rows (not flattened into "
+                    + "one) + 4 data rows");
+            assertEquals("GroupX", t.rows.get(0).get(1), "header row 0 is the coarser group-label row alone");
+            assertEquals("", t.rows.get(0).get(0), "label column stays empty on the group-label row");
+            assertEquals("GroupY", t.rows.get(0).get(3));
+            assertEquals("A", t.rows.get(1).get(1), "header row 1 is the finer sub-label row, kept separate");
+            assertEquals("B", t.rows.get(1).get(2));
+            assertEquals("C", t.rows.get(1).get(3));
+            assertEquals("X1", t.rows.get(2).get(0), "first data row starts right after the 2-row header");
+        }
+    }
+
+    /**
+     * Task 9g test for defect 2 (anchor value on a record's second physical line). A record
+     * whose sibling-column content is drawn on its FIRST physical line while its anchor
+     * (label-column) value is drawn on its SECOND physical line -- e.g. "90" (Score) alone on
+     * line k, then "Carol" (Name, the anchor) plus "B" (Grade) on line k+1.
+     *
+     * <p><b>This test is currently RED and intentionally left {@code @Disabled}.</b> The natural
+     * fix -- reattach the isolated line to the anchor line AFTER it instead of leaving it folded
+     * into whatever preceded it -- was implemented and measured, then reverted: it is
+     * irreconcilable with {@link #multiLineHeaderMergesIntoOneRow}'s "Type"/"Detail" line, which
+     * has the EXACT SAME physical shape (one non-anchor line between two anchor-populated lines)
+     * but must fold BACKWARD into the header line before it, not defer to the row after it --
+     * the shape alone cannot tell the two cases apart, and there is no other signal available
+     * from word geometry alone that does. Every safe restriction tried collapses to a no-op (see
+     * the "Task 9g defect 2" note on {@code StreamTableExtractor.groupLogicalRows} for the proof
+     * and task-9g-header-and-trim-report.md for the measured evidence: enabling ANY reachable
+     * form of this join breaks the test above, and restricting it enough to avoid that leaves it
+     * provably dead code). Kept here (disabled, not deleted) as the RED evidence the task asked
+     * for, and so a future attempt with a genuinely new distinguishing signal has a ready
+     * regression test to check against.
+     */
+    @org.junit.jupiter.api.Disabled(
+        "defect 2 (backwards join) is not implemented -- see javadoc: irreconcilable with "
+            + "multiLineHeaderMergesIntoOneRow's identical physical shape")
+    @Test
+    void anchorOnSecondLineJoinsBackwards() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(600, 400));
+            doc.addPage(page);
+            PDType1Font f = helv();
+            float[] colX = {40, 200, 400};
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setFont(f, 11);
+                float pitch = 16f;
+                float y = 340;
+
+                // header (1 physical line, anchor col0 populated -> no leading run at all)
+                String[] header = {"Name", "Score", "Grade"};
+                for (int c = 0; c < 3; c++) {
+                    cs.beginText(); cs.newLineAtOffset(colX[c], y); cs.showText(header[c]); cs.endText();
+                }
+                y -= pitch;
+
+                // row1: Alice | 90 | A (1 physical line, ordinary record)
+                String[] row1 = {"Alice", "90", "A"};
+                for (int c = 0; c < 3; c++) {
+                    cs.beginText(); cs.newLineAtOffset(colX[c], y); cs.showText(row1[c]); cs.endText();
+                }
+                y -= pitch;
+
+                // row2: split across 2 physical lines -- Score ("85") drawn FIRST, with the
+                // anchor (Name="Carol") and Grade ("B") drawn on the SECOND physical line.
+                cs.beginText(); cs.newLineAtOffset(colX[1], y); cs.showText("85"); cs.endText();
+                y -= pitch;
+                cs.beginText(); cs.newLineAtOffset(colX[0], y); cs.showText("Carol"); cs.endText();
+                cs.beginText(); cs.newLineAtOffset(colX[2], y); cs.showText("B"); cs.endText();
+                y -= pitch;
+
+                // row3: Dan | 70 | C (1 physical line, ordinary record, so row2's split doesn't
+                // just coincidentally look like the LAST row of the table)
+                String[] row3 = {"Dan", "70", "C"};
+                for (int c = 0; c < 3; c++) {
+                    cs.beginText(); cs.newLineAtOffset(colX[c], y); cs.showText(row3[c]); cs.endText();
+                }
+            }
+            List<TextPosition> glyphs = TableTestPdfs.harvestGlyphs(doc, 0);
+            List<TableExtractor.TableHit> hits = StreamTableExtractor.extractPage(1, glyphs);
+            assertEquals(1, hits.size(), "expected one stream table");
+            TableExtractor.TableHit t = hits.get(0);
+            assertEquals(3, t.colCount);
+            assertEquals(4, t.rowCount,
+                "4 LOGICAL rows (header + Alice + Carol + Dan): the split Score/Carol/Grade "
+                    + "lines must join into ONE row for Carol, not two");
+            assertEquals("Carol", t.rows.get(2).get(0));
+            assertEquals("85", t.rows.get(2).get(1), "Score drawn on the FIRST physical line must still land in Carol's row");
+            assertEquals("B", t.rows.get(2).get(2));
+            assertEquals("Dan", t.rows.get(3).get(0));
         }
     }
 

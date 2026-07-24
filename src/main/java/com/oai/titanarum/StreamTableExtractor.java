@@ -561,11 +561,38 @@ final class StreamTableExtractor {
 
     // Step C: cap non-conforming-edge trimming at this many lines per end (front/back each),
     // so a pathological block (e.g. many consecutive non-conforming lines) can't be trimmed
-    // down to nothing one line at a time in an unbounded loop. A real title/caption or
-    // footnote is essentially always 1-3 physical lines (a wrapped 2-3 line caption at most,
-    // per the us-007/us-020 samples in the task-9c report); 3 gives headroom above that
-    // without allowing trimming to eat meaningfully into real table rows.
+    // down to nothing one line at a time in an unbounded loop. A real title/caption is
+    // essentially always 1-3 physical lines (a wrapped 2-3 line caption at most, per the
+    // us-007/us-020 samples in the task-9c report); 3 gives headroom above that without
+    // allowing trimming to eat meaningfully into real table rows.
+    //
+    // Task 9g measured that simply RAISING this shared cap to reach a real 10-line footnote
+    // block (us-007) is a net loss: several of us-018's OWN tables have their genuine LAST
+    // data/summary rows sit close enough to this same "few non-conforming-looking lines" bar
+    // that a cap of just 5 already starts eating them (measured: us-018 F1 0.190 -> 0.041 at
+    // cap=5, vs. 0.352 for us-007 at the same cap -- a bad trade against the higher-priority
+    // fixture). See {@link #stripTrailingFootnoteBlock} for the targeted fix used instead,
+    // which does not touch this cap at all.
     static final int MAX_EDGE_TRIM_ITERATIONS = 3;
+
+    // Bounds the footnote-marker scan below: how many of the block's OWN trailing lines (after
+    // the ordinary capped trim above has already run) get examined for a footnote/legend-start
+    // marker. Generous (a real footnote block is rarely more than a handful of lines, but this
+    // gives headroom) while remaining a small, explicit, O(block size) constant -- the scan
+    // itself is a single linear pass, so this only bounds how far into the block it may reach,
+    // not the cost per line examined.
+    static final int MAX_FOOTNOTE_MARKER_SCAN = 40;
+
+    // A footnote/legend block's own first line is reliably introduced by a short, ALL-CAPS
+    // "label:" token used nowhere else in real tabular data in this corpus -- "KEY:", "NOTE:",
+    // "SOURCE:" (see us-007's and us-018's own fixtures). Once such a line is found near a
+    // block's tail, everything from it to the end of the block is the footnote -- true
+    // regardless of whether each individual trailing line would, on its own, straddle a gutter
+    // or look single-column (several of us-007's legend lines wrap onto a second physical line
+    // and populate 2+ columns, so {@link #isNonConformingEdge} alone under-trims them one at a
+    // time; this marker instead removes the whole block in one decisive cut).
+    private static final java.util.regex.Pattern FOOTNOTE_MARKER =
+        java.util.regex.Pattern.compile("^[A-Z]{2,}:$");
 
     // Step D: bounds the TOTAL per-page cost of per-block detection (gutter search +
     // gridness scoring + edge trimming) summed across every candidate block on one page.
@@ -641,7 +668,30 @@ final class StreamTableExtractor {
             if (!isNonConformingEdge(cur.get(cur.size() - 1), cur, bounds, gutters)) break;
             cur.remove(cur.size() - 1);
         }
-        return cur;
+        return stripTrailingFootnoteBlock(cur);
+    }
+
+    /**
+     * Task 9g fix for defect 3 (the dominant remaining defect on us-007): find the FIRST line,
+     * within the last {@link #MAX_FOOTNOTE_MARKER_SCAN} lines of {@code lines}, whose first word
+     * matches {@link #FOOTNOTE_MARKER} (e.g. "KEY:", "NOTE:", "SOURCE:"), and drop it and every
+     * line after it -- a footnote/legend block, once it starts, runs to the end of the block. If
+     * no marker is found, {@code lines} is returned unchanged. Never trims below 3 lines (a
+     * conforming table needs at least that many to be worth keeping at all -- matches the
+     * pre-existing {@code size() > 1} guards above and the {@code trimmed.size() < 3} reject in
+     * {@code extractPage}).
+     */
+    private static List<Line> stripTrailingFootnoteBlock(List<Line> lines) {
+        int scanFrom = Math.max(0, lines.size() - MAX_FOOTNOTE_MARKER_SCAN);
+        for (int i = scanFrom; i < lines.size(); i++) {
+            List<Word> words = lines.get(i).words;
+            if (words.isEmpty()) continue;
+            if (i < 3) continue;                           // never truncate down to <3 real rows
+            if (FOOTNOTE_MARKER.matcher(words.get(0).text).matches()) {
+                return new ArrayList<>(lines.subList(0, i));
+            }
+        }
+        return lines;
     }
 
     private static float[] colBoundsOf(List<Gutter> gutters, float bandX0, float bandX1) {
@@ -756,8 +806,18 @@ final class StreamTableExtractor {
     // multi-line header, the FIRST header cell's own column) starts each new logical row; a
     // continuation line of a wrapped cell in some OTHER column leaves that anchor column empty.
     // Walking lines top-to-bottom, a line with anchor content starts a new row; a line without it
-    // is folded into the row above. This handles wrapped data cells and multi-line headers with
-    // the exact same rule -- no special-casing needed for headers.
+    // is folded into the row above.
+    //
+    // Task 9g correction (see .superpowers/sdd/task-9g-header-and-trim-report.md): task 9f's own
+    // comment above used to end "...This handles wrapped data cells and multi-line headers with
+    // the exact same rule -- no special-casing needed for headers." THAT premise was wrong and is
+    // the direct cause of a measured regression (us-018 F1 0.190 -> 0.070). Verified in the ICDAR
+    // structure XML itself (us-018-str.xml): a stacked/hierarchical header is annotated with
+    // start-row='1', '2', '3' -- i.e. ground truth treats each physical header line as a
+    // GENUINELY SEPARATE row, not one flattened logical row. Blindly folding every anchor-empty
+    // line into the row above (as task 9f did) collapses that 3-row header into 1, desyncing
+    // every subsequent row index for the rest of the table. The leading run of lines BEFORE the
+    // first anchor-populated line must instead each stay their own row (see groupLogicalRows).
 
     // Anchor column = the LEFTMOST column populated on at least this fraction of the block's
     // lines. 0.6 (not e.g. 0.5) deliberately requires a clear majority-plus-margin: a column
@@ -793,14 +853,69 @@ final class StreamTableExtractor {
         return -1;
     }
 
+    private static boolean isAnchorPopulated(Line l, int anchorCol, float[] colBounds) {
+        for (Word w : l.words) if (colOf(w.cx(), colBounds) == anchorCol) return true;
+        return false;
+    }
+
+    /** The set of distinct column indices {@code l} has any word in. */
+    private static java.util.Set<Integer> populatedColumns(Line l, float[] colBounds) {
+        java.util.Set<Integer> cols = new java.util.HashSet<>();
+        for (Word w : l.words) cols.add(colOf(w.cx(), colBounds));
+        return cols;
+    }
+
     /**
      * Groups {@code lines} (top-to-bottom, as produced by {@link #buildLines}) into logical
-     * rows. A line starts a NEW logical row if its anchor-column cell is non-empty; otherwise it
-     * is a CONTINUATION of the current logical row (its content gets appended into whichever
-     * column(s) it populates when the group is later flattened into cells). If the very first
-     * line has no anchor content, it still starts a row on its own (there is no prior row to
-     * continue). If {@link #findAnchorColumn} finds no qualifying column, falls back to one
-     * logical row per display line -- i.e. the pre-Task-9f behavior -- for this block.
+     * rows, in two parts:
+     *
+     * <ol>
+     *   <li><b>Leading run (task 9g fix for the header-flattening regression):</b> lines BEFORE
+     *       the first anchor-populated line are never folded into the row that comes after them
+     *       (that would blur a stacked header into the first data/anchor row), but they DO still
+     *       fold into EACH OTHER when consecutive leading-run lines populate the exact same set
+     *       of (non-anchor) columns -- that is the signature of ordinary wrapped multi-column
+     *       header text (each physical line contributes another line of the SAME cells' labels,
+     *       e.g. "Number of" / "participants (*)" both landing in the same two columns). Two
+     *       consecutive leading-run lines populating DIFFERENT column sets, by contrast, is the
+     *       signature of a genuinely hierarchical/spanned header (ICDAR's own convention: see
+     *       the class-level comment above and us-018-str.xml's start-row='1','2' cells) -- a
+     *       coarser group-label line ("Number of teachers" / "Number of new teacher hires",
+     *       columns {2,4,5,6}) followed by a finer sub-label line ("Control" / "Control",
+     *       columns {2,5}) is NOT the same set, so it starts a new row instead of merging.
+     *       Measured: this exact-set-equality test is what keeps a plain 2-line wrapped header
+     *       (eu-013, us-007: identical column sets on both physical lines) merging into one row
+     *       while us-018's rowspan header (different column sets line-to-line) stays split --
+     *       a cruder "no line before the anchor may ever merge with another" rule was measured
+     *       to fix us-018 but broke the corpus broadly (aggregate breuel microF1 0.224 -> 0.153,
+     *       collateral damage on eu-004/eu-005/eu-013/eu-021/us-017/us-025/etc., all plain
+     *       wrapped-header tables it wrongly split into desynced extra rows).</li>
+     *   <li><b>From the first anchor-populated line onward:</b> the original task-9f rule -- a
+     *       line with anchor content starts a new row, a line without it folds into the row
+     *       above. This is what correctly merges a wrapped DATA cell (the wrapped-cell case
+     *       {@code wrappedCellMergesIntoOneLogicalRow} exercises) and a header whose OWN anchor
+     *       cell already sits on the very first physical line ({@code
+     *       multiLineHeaderMergesIntoOneRow}: "Animal" is populated on line 1, so there is no
+     *       leading run at all, and the fold-forward rule applies unchanged from line 1).</li>
+     * </ol>
+     *
+     * <p><b>Task 9g defect 2 (anchor value on a record's second physical line) was attempted and
+     * deliberately NOT shipped.</b> The natural fix -- a bounded backwards join that reattaches
+     * an isolated non-anchor line to the anchor-populated line AFTER it instead of leaving it
+     * folded into whatever came before -- is irreconcilable with the fold-forward rule in part
+     * (2) above for the exact same physical shape (one non-anchor line between two
+     * anchor-populated ones): {@code multiLineHeaderMergesIntoOneRow}'s "Type"/"Detail" line
+     * has that identical shape and MUST stay folded into the header line before it, not deferred
+     * to the data row after it. Every variant tried (lookback at the join point, lookahead
+     * before folding) either reached that same ambiguous shape and broke the existing (correct)
+     * behavior, or -- once restricted enough to never reach it -- was PROVABLY a no-op (a
+     * non-anchor line in the post-leading-run region always folds forward before any join check
+     * could run, so no line is ever left as a "lone orphan" for a lookback to find). See
+     * task-9g-header-and-trim-report.md for the measured evidence. us-007's and us-020's
+     * corresponding residual row(s) remain unresolved as a result.</p>
+     *
+     * If {@link #findAnchorColumn} finds no qualifying column, falls back to one logical row per
+     * display line -- i.e. the pre-Task-9f behavior -- for this block.
      */
     static List<List<Line>> groupLogicalRows(List<Line> lines, float[] colBounds) {
         List<List<Line>> groups = new ArrayList<>();
@@ -809,17 +924,35 @@ final class StreamTableExtractor {
             for (Line l : lines) groups.add(List.of(l));      // fallback: one row per display line
             return groups;
         }
-        List<Line> cur = null;
-        for (Line l : lines) {
-            boolean anchorPopulated = false;
-            for (Word w : l.words) {
-                if (colOf(w.cx(), colBounds) == anchorCol) { anchorPopulated = true; break; }
+
+        int n = lines.size();
+        boolean[] anchorPop = new boolean[n];
+        for (int i = 0; i < n; i++) anchorPop[i] = isAnchorPopulated(lines.get(i), anchorCol, colBounds);
+
+        int firstAnchorIdx = n;                                // no anchor line at all -> whole block is "leading run"
+        for (int i = 0; i < n; i++) if (anchorPop[i]) { firstAnchorIdx = i; break; }
+
+        for (int i = 0; i < n; i++) {
+            Line l = lines.get(i);
+            boolean inLeadingRun = i < firstAnchorIdx;
+            boolean startsNewRow;
+            if (inLeadingRun) {
+                // Fold into the previous leading-run line only if it populates the EXACT same
+                // column set -- see the class doc above for why exact-set-equality (not mere
+                // overlap) is the signal that discriminates a wrapped header from a hierarchical
+                // one, and why it must compare against the immediately preceding PHYSICAL line
+                // (not the accumulated group) so a chain of equal-set lines still folds together.
+                startsNewRow = groups.isEmpty()
+                    || !populatedColumns(l, colBounds).equals(populatedColumns(lines.get(i - 1), colBounds));
+            } else {
+                startsNewRow = groups.isEmpty() || anchorPop[i];
             }
-            if (cur == null || anchorPopulated) {
-                cur = new ArrayList<>();
-                groups.add(cur);
+
+            if (startsNewRow) {
+                groups.add(new ArrayList<>(List.of(l)));
+            } else {
+                groups.get(groups.size() - 1).add(l);
             }
-            cur.add(l);
         }
         return groups;
     }

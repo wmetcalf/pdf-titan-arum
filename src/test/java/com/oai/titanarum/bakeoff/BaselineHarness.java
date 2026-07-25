@@ -9,9 +9,11 @@
 // PURPOSE. This harness removes the two CONFIRMED MEASUREMENT ARTIFACTS from the project's reference
 // baseline and re-reports every configuration under the corrected protocol. It changes NOTHING about
 // extraction -- no file under src/main is touched by the change that added it -- and it changes
-// nothing about the definition of a relation or of adjacency matching (that definition was validated
-// to within 3 relations of an independent port of the official ICDAR 2013 evaluator: 156 tables /
-// 25,317 relations vs the port's 25,320). What it changes is PROTOCOL and ground-truth HYGIENE:
+// nothing about the definition of a relation or of adjacency matching (that definition is validated
+// against the OFFICIAL ICDAR 2013 evaluator's own printed output: 156 tables / 25,320 relations,
+// agreeing exactly, per document, with the `GT size:` lines the official JAR emits on this corpus,
+// and with an independent Python port of the same algorithm). What it changes is PROTOCOL and
+// ground-truth HYGIENE:
 //
 //   ARTIFACT 1 -- 1:1 greedy table pairing. Every previous harness paired each ground-truth table to
 //   at most one detected table (greedily, by exact-cell F1), counted unpaired ground-truth tables as
@@ -88,6 +90,20 @@ class BaselineHarness {
     private static final String P_POOL = "POOLED";
     /** Secondary protocol, retained for reproducibility: greedy 1:1 table pairing on exact-cell F1. */
     private static final String P_PAIR = "1:1";
+    /**
+     * The OFFICIAL 1:1 protocol: greedy per-page pairing on CORRECT ADJACENCY RELATIONS, transcribed
+     * from the ICDAR 2013 evaluator's own source. This is the row that is comparable to the published
+     * end-to-end column; {@link #P_PAIR} is the same shape with a foreign pairing criterion.
+     * @see #e2ePairedOfficial
+     */
+    private static final String P_PAIR_OFF = "1:1off";
+    /**
+     * MEASUREMENT ONLY, never a headline: {@link #P_PAIR_OFF} plus the reference pipeline's free pass
+     * for a ground-truth table that has no candidate on its page. Reported by
+     * {@link #printOfficialLeniency} so the size of the leniency we DECLINE is on the record, and
+     * excluded from {@link #PROTOCOL_ORDER} so it can never be mistaken for a baseline row.
+     */
+    private static final String P_LENIENT = "1:1off-lenient";
 
     /** PRIMARY ground truth: duplicate annotations of the same physical table removed. */
     private static final String G_DEDUP = "dedup";
@@ -126,10 +142,12 @@ class BaselineHarness {
     /** The order every table in this report lists its four (protocol, ground-truth) combinations in:
      *  the primary first, the pre-correction baseline last. */
     private static final List<String[]> PROTOCOL_ORDER = List.of(
-            new String[]{P_POOL, G_DEDUP},   // PRIMARY -- both artifacts removed
-            new String[]{P_POOL, G_RAW},     // pooling only
-            new String[]{P_PAIR, G_DEDUP},   // dedup only
-            new String[]{P_PAIR, G_RAW});    // neither -- reproduces the pre-correction numbers
+            new String[]{P_POOL, G_DEDUP},       // PRIMARY -- both artifacts removed
+            new String[]{P_POOL, G_RAW},         // pooling only
+            new String[]{P_PAIR_OFF, G_DEDUP},   // official 1:1 (the published-comparable row)
+            new String[]{P_PAIR_OFF, G_RAW},
+            new String[]{P_PAIR, G_DEDUP},       // dedup only
+            new String[]{P_PAIR, G_RAW});        // neither -- reproduces the pre-correction numbers
 
     private static String key(String config, String mode, String protocol, String gtSet) {
         return config + " | " + mode + " | " + protocol + " | " + gtSet;
@@ -179,7 +197,7 @@ class BaselineHarness {
     // ------------------------------------------------------------------------------ accumulators
 
     /** One document's (matched, detected, gt) for one key. */
-    private static final class Tally {
+    static final class Tally {
         long matched, detected, gt;
         int tables;
         boolean covered;
@@ -200,12 +218,16 @@ class BaselineHarness {
     private static final class Acc {
         long matched, detected, gt;
         final List<Double> perDocF1 = new ArrayList<>();
+        final List<Double> perDocP = new ArrayList<>();
+        final List<Double> perDocR = new ArrayList<>();
         int docs, covered, scoredTables;
 
         void addDoc(Tally t) {
             matched += t.matched; detected += t.detected; gt += t.gt;
             double p = t.detected == 0 ? 0.0 : (double) t.matched / t.detected;
             double r = t.gt == 0 ? 0.0 : (double) t.matched / t.gt;
+            perDocP.add(p);
+            perDocR.add(r);
             perDocF1.add(t.matched == 0 ? 0.0 : 2 * p * r / (p + r));
             docs++;
             if (t.covered) covered++;
@@ -220,6 +242,32 @@ class BaselineHarness {
         double macroF1() {
             return perDocF1.isEmpty() ? 0.0
                     : perDocF1.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+        }
+        private static double mean(List<Double> xs) {
+            return xs.isEmpty() ? 0.0 : xs.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+        }
+        double macroP() { return mean(perDocP); }
+        double macroR() { return mean(perDocR); }
+
+        /**
+         * The MACRO F1 the published ICDAR 2013 per-document averages actually are: the harmonic mean
+         * of the mean per-document precision and the mean per-document recall, NOT the mean of the
+         * per-document F1 scores. Verified against the reference pipeline's own printed output
+         * ({@code mnamysl/tabrec-sncs}, {@code evaluation/ICDAR2013/eval.py} lines 151-156:
+         * {@code Precision = perdoc_precision/num_docs; Recall = perdoc_recall/num_docs;
+         * F1 = 2PR/(P+R)}), whose logged run prints
+         * {@code Precision: 0.8714227705826723; Recall: 0.8467831413095247; F1: 0.8589262858140391}
+         * -- and 2*0.87142277*0.84678314/(0.87142277+0.84678314) = 0.85893, which is that F1 to 5
+         * decimal places, while the mean of the per-document F1 values is a different number.
+         *
+         * <p>{@link #macroF1} (mean of per-document F1) is what every figure this project has
+         * published used. Both are printed side by side; neither is silently substituted for the
+         * other, because F1-of-means is systematically the LARGER of the two whenever per-document
+         * precision and recall are anti-correlated, and that difference flatters us.
+         */
+        double macroF1Official() {
+            double p = macroP(), r = macroR();
+            return (p + r) == 0 ? 0.0 : 2 * p * r / (p + r);
         }
     }
 
@@ -260,6 +308,8 @@ class BaselineHarness {
         /** config -> how many table hits that configuration produced on this document. Used only by
          *  #printPoolingMechanism, to check that the pooled/1:1 gap really is a segmentation effect. */
         final Map<String, Integer> hitCounts = new LinkedHashMap<>();
+        /** config -> the {@link PairAudit} of the CURRENT 1:1 rule on this document, dedup GT. */
+        final Map<String, PairAudit> audits = new LinkedHashMap<>();
     }
 
     /** One ground-truth view of a document: the tables to score against, and their RAW indices
@@ -286,16 +336,62 @@ class BaselineHarness {
     // -------------------------------------------------------------------------------- END-TO-END
 
     /**
-     * END-TO-END, 1:1 GREEDY PAIRING (the pre-correction protocol, retained verbatim). Each expected
-     * table is paired with whichever remaining hit maximises EXACT-CELL F1 and scored against it;
-     * expected tables left unpaired contribute their whole relation count as recall loss, and hits
-     * left over contribute theirs as precision loss.
+     * One detected-table candidate, reduced to exactly what a correspondence rule may look at: the
+     * page it sits on, its text grid (what the legacy exact-cell pairing rule scores) and its cells
+     * with spans (what the adjacency metric scores). Introduced so the SAME pairing code can be fed
+     * real extractor output and the synthetic/degraded detectors of {@link #printPairingControls} --
+     * a protocol cannot be validated against a deliberately-bad detector if the protocol is welded
+     * to {@code TableExtractor.TableHit}.
      */
-    private static Tally e2ePaired(List<TableExtractor.TableHit> hits,
-                                    List<GroundTruth.Table> expected) {
+    record Cand(int page, List<List<String>> rows, List<TableScore.GridCell> cells) {
+        static Cand of(TableExtractor.TableHit h) {
+            return new Cand(h.page, h.rows, MetricFixHarness.cellsOf(h));
+        }
+        static List<Cand> of(List<TableExtractor.TableHit> hits) {
+            List<Cand> out = new ArrayList<>(hits.size());
+            for (TableExtractor.TableHit h : hits) out.add(of(h));
+            return out;
+        }
+    }
+
+    /**
+     * The page a ground-truth table is annotated on, as the OFFICIAL evaluator reads it: the
+     * {@code page} attribute of the table's FIRST {@code <region>} element
+     * ({@code Table.java:38}, {@code pageNo = parseInt(regionElement.getAttribute("page"))}).
+     * Our {@code GroundTruth.Cell} carries that attribute per cell, so the first cell that declares
+     * a positive page is the same value.
+     *
+     * <p>Returns {@link #PAGE_UNKNOWN} for CSV-sourced ground truth, which has no page attribute at
+     * all; {@link #e2ePairedOfficial} then declines to apply the page filter for that table rather
+     * than inventing a page number.
+     */
+    private static final int PAGE_UNKNOWN = 0;
+
+    private static int gtPageOf(GroundTruth.Table t) {
+        for (GroundTruth.Cell c : t.cells()) {
+            if (c.page() > 0) return c.page();
+        }
+        return PAGE_UNKNOWN;
+    }
+
+    /**
+     * END-TO-END, 1:1 GREEDY PAIRING ON EXACT-CELL F1 (the pre-correction protocol, retained
+     * verbatim so every previously published figure stays reproducible). Each expected table is
+     * paired with whichever remaining hit maximises EXACT-CELL F1 and scored against it; expected
+     * tables left unpaired contribute their whole relation count as recall loss, and hits left over
+     * contribute theirs as precision loss.
+     *
+     * <p><b>This rule is NOT the official one</b> -- see {@link #e2ePairedOfficial}. Exact-cell F1
+     * appears nowhere in the official evaluator, and because it is a position-identified metric it
+     * returns 0 for every candidate whose row/column indices are offset from the annotator's, which
+     * makes the {@code f1 > bestF1} comparison degenerate into "keep the first hit in enumeration
+     * order" exactly on the documents where the correspondence matters most. Kept as a measured
+     * secondary, not as a claim about the published protocol.
+     */
+    static Tally e2ePaired(List<Cand> hits, List<GroundTruth.Table> expected) {
         Tally t = new Tally();
         t.covered = !hits.isEmpty();
-        List<TableExtractor.TableHit> available = new ArrayList<>(hits);
+        List<Cand> available = new ArrayList<>(hits);
         for (GroundTruth.Table exp : expected) {
             List<TableScore.GridCell> gtCells = TableScore.gridCellsFromGroundTruth(exp);
             if (available.isEmpty()) {
@@ -303,21 +399,156 @@ class BaselineHarness {
                         TableScore.Semantics.MULTISET));
                 continue;
             }
-            TableExtractor.TableHit best = null;
+            Cand best = null;
             double bestF1 = -1;
-            for (TableExtractor.TableHit h : available) {
-                double f1 = TableScore.score(exp, h.rows).f1();
+            for (Cand h : available) {
+                double f1 = TableScore.score(exp, h.rows()).f1();
                 if (f1 > bestF1) { bestF1 = f1; best = h; }
             }
             available.remove(best);
-            t.add(compare(rels(gtCells), rels(MetricFixHarness.cellsOf(best))));
+            t.add(compare(rels(gtCells), rels(best.cells())));
             t.tables++;
         }
-        for (TableExtractor.TableHit h : available) {
-            t.addDetOnly(TableScore.officialRelationCount(MetricFixHarness.cellsOf(h), false,
+        for (Cand h : available) {
+            t.addDetOnly(TableScore.officialRelationCount(h.cells(), false,
                     TableScore.Semantics.MULTISET));
         }
         return t;
+    }
+
+    /**
+     * END-TO-END, 1:1 GREEDY PAIRING EXACTLY AS THE OFFICIAL ICDAR 2013 EVALUATOR DOES IT.
+     *
+     * <p>Transcribed from {@code MeasureRecognitionPerformance.evaluateResultStr} in
+     * {@code github.com/tamirhassan/dataset-tools} (Apache-2.0, "as used in the ICDAR 2013 Table
+     * Competition"), read from a local clone rather than reconstructed from prose. The four rules
+     * that differ from {@link #e2ePaired} are, verbatim from that source:
+     *
+     * <ol>
+     *   <li><b>The correspondence is scored on CORRECT ADJACENCY RELATIONS, not on exact-cell F1.</b>
+     *       {@code int corrDec = compareARs(gtAR, resultAR, false, normRule);
+     *       if (corrDec > highestCorr) { highestCorr = corrDec; matchingResult = resultAR; }} --
+     *       i.e. argmax over the count {@code compareARs} returns, which is the same multiset
+     *       intersection {@link #compare} computes as {@code AdjResult#matched}. Unnormalised: a
+     *       larger candidate with more correct relations beats a smaller, cleaner one, and this
+     *       harness reproduces that rather than "improving" it to argmax-F1.</li>
+     *   <li><b>Candidates are restricted to the ground-truth table's own PAGE</b>, by default:
+     *       {@code if (!pageCheck || resultTable.pageNo == gtTable.pageNo) resultsOnPage.add(...)}
+     *       with {@code boolean pageCheck = true} unless {@code -nopage} is passed
+     *       ({@code MeasureRecognitionPerformance.java:96,119,677}).</li>
+     *   <li><b>{@code highestCorr} starts at -1</b>, so the first candidate on the page is paired
+     *       even when it has ZERO correct relations. {@link #e2ePaired}'s {@code bestF1 = -1} has the
+     *       same effect, so this is the one property the two rules share.</li>
+     *   <li><b>Ties keep the FIRST candidate</b> ({@code >}, not {@code >=}) -- reproduced. The
+     *       official tool counts ties in {@code numHighest} and then ignores the count; so does this,
+     *       except that {@link #printPairingDegeneracy} reports how often a tie decided the pairing,
+     *       because an unreported tie-break is how the artifact under investigation hid.</li>
+     * </ol>
+     *
+     * <p>{@code lenientMissedTables} selects the one remaining behaviour of the official
+     * MEASUREMENT PIPELINE that this harness does NOT adopt for any headline figure. When a
+     * ground-truth table has no candidate on its page, the tool prints {@code "no matching result
+     * found"} with no numbers, and the reference aggregation script ({@code mnamysl/tabrec-sncs},
+     * {@code evaluation/ICDAR2013/eval.py}) sums only the {@code Table n:} lines -- so that table
+     * contributes NOTHING to the recall denominator and a completely missed table is not penalised
+     * at all. {@code false} (used everywhere except the explicit measurement in
+     * {@link #printOfficialLeniency}) charges it, as every other protocol in this harness does.
+     * The reason for declining it is in that method: it makes emitting nothing on a page score
+     * strictly better than emitting something wrong, which is a perverse incentive, not a metric.
+     */
+    static Tally e2ePairedOfficial(List<Cand> hits, List<GroundTruth.Table> expected,
+                                            boolean lenientMissedTables) {
+        Tally t = new Tally();
+        t.covered = !hits.isEmpty();
+        List<Cand> remaining = new ArrayList<>(hits);
+        for (GroundTruth.Table exp : expected) {
+            List<TableScore.GridCell> gtCells = TableScore.gridCellsFromGroundTruth(exp);
+            List<TableScore.Relation> gtRel = rels(gtCells);
+            int gtPage = gtPageOf(exp);
+            Cand best = null;
+            int bestCorr = -1;                       // official: highestCorr = -1
+            for (Cand h : remaining) {
+                if (gtPage != PAGE_UNKNOWN && h.page() != gtPage) continue;
+                int corr = compare(gtRel, rels(h.cells())).matched();
+                if (corr > bestCorr) { bestCorr = corr; best = h; }
+            }
+            if (best == null) {                      // official: "no matching result found"
+                if (!lenientMissedTables) t.addGtOnly(gtRel.size());
+                continue;                            // no `Table n:` line -> not a scored table
+            }
+            remaining.remove(best);
+            t.add(compare(gtRel, rels(best.cells())));
+            t.tables++;
+        }
+        for (Cand h : remaining) {                   // official: "FP table with N adjacency relations"
+            t.addDetOnly(TableScore.officialRelationCount(h.cells(), false,
+                    TableScore.Semantics.MULTISET));
+        }
+        return t;
+    }
+
+    /**
+     * PER-DOCUMENT DIAGNOSIS of the CURRENT ({@link #P_PAIR}) correspondence rule -- the audit that
+     * decides whether the reported degeneracy is real and how widespread it is. Walks exactly the same
+     * greedy loop {@link #e2ePaired} walks and, at each step, records what the exact-cell-F1 argmax
+     * did against what the count of correct adjacency relations says about the SAME availability set.
+     *
+     * <p>Two degenerate outcomes are counted separately because they are different failures:
+     *
+     * <ul>
+     *   <li><b>tie at zero</b> -- two or more candidates were available and EVERY one of them scored
+     *       exact-cell F1 = 0.0, so {@code f1 > bestF1} never fired after the first candidate and the
+     *       pairing was decided by enumeration order alone. Exact-cell F1 is position-identified, so
+     *       any candidate whose row/column indices are offset from the annotator's scores 0 no matter
+     *       how much content it recovered; a whole page of good candidates can tie at zero.</li>
+     *   <li><b>mis-assignment</b> -- the candidate actually chosen has strictly FEWER correct
+     *       adjacency relations than another candidate that was still available at that step. This is
+     *       the "left a clearly-better candidate unpaired" case, and {@code lostRelations} is how many
+     *       correct relations the choice cost, summed over the document.</li>
+     * </ul>
+     *
+     * <p>Deliberately measured over the SAME candidate set the current rule saw -- no page filter --
+     * so that what is being isolated is the CRITERION, not the page restriction the official rule
+     * also applies. The two effects are separated again in the report.
+     */
+    static final class PairAudit {
+        int gtTables, tieAtZeroTables, misassignedTables, lostRelations;
+        int currentCorr, bestStepwiseCorr;
+
+        boolean degenerate() { return tieAtZeroTables > 0 || misassignedTables > 0; }
+    }
+
+    static PairAudit auditPairing(List<Cand> hits, List<GroundTruth.Table> expected) {
+        PairAudit a = new PairAudit();
+        List<Cand> available = new ArrayList<>(hits);
+        for (GroundTruth.Table exp : expected) {
+            a.gtTables++;
+            if (available.isEmpty()) continue;
+            List<TableScore.Relation> gtRel = rels(TableScore.gridCellsFromGroundTruth(exp));
+
+            Cand chosen = null;
+            double bestF1 = -1;
+            int nonZeroF1 = 0;
+            for (Cand h : available) {
+                double f1 = TableScore.score(exp, h.rows()).f1();
+                if (f1 > 0) nonZeroF1++;
+                if (f1 > bestF1) { bestF1 = f1; chosen = h; }
+            }
+            int bestCorr = -1;
+            for (Cand h : available) {
+                bestCorr = Math.max(bestCorr, compare(gtRel, rels(h.cells())).matched());
+            }
+            int chosenCorr = compare(gtRel, rels(chosen.cells())).matched();
+            a.currentCorr += chosenCorr;
+            a.bestStepwiseCorr += Math.max(bestCorr, 0);
+            if (available.size() > 1 && nonZeroF1 == 0) a.tieAtZeroTables++;
+            if (bestCorr > chosenCorr) {
+                a.misassignedTables++;
+                a.lostRelations += bestCorr - chosenCorr;
+            }
+            available.remove(chosen);
+        }
+        return a;
     }
 
     /**
@@ -332,14 +563,13 @@ class BaselineHarness {
      * Missed tables are still fully charged: their relations sit in the ground-truth multiset
      * unmatched.
      */
-    private static Tally e2ePooled(List<TableExtractor.TableHit> hits,
-                                    List<GroundTruth.Table> expected) {
+    private static Tally e2ePooled(List<Cand> hits, List<GroundTruth.Table> expected) {
         Tally t = new Tally();
         t.covered = !hits.isEmpty();
         List<TableScore.Relation> gt = new ArrayList<>();
         for (GroundTruth.Table exp : expected) gt.addAll(gtRels(exp));
         List<TableScore.Relation> det = new ArrayList<>();
-        for (TableExtractor.TableHit h : hits) det.addAll(rels(MetricFixHarness.cellsOf(h)));
+        for (Cand h : hits) det.addAll(rels(h.cells()));
         t.add(compare(gt, det));
         t.tables = expected.size();
         return t;
@@ -694,11 +924,17 @@ class BaselineHarness {
 
             for (Cfg cfg : cfgs) {
                 d.hitCounts.put(cfg.name(), cfg.hits().size());
+                List<Cand> cands = Cand.of(cfg.hits());
+                d.audits.put(cfg.name(), auditPairing(cands, keptTables));
                 for (GtView gt : gtViews) {
                     d.tallies.put(key(cfg.name(), M_E2E, P_PAIR, gt.name()),
-                            e2ePaired(cfg.hits(), gt.tables()));
+                            e2ePaired(cands, gt.tables()));
+                    d.tallies.put(key(cfg.name(), M_E2E, P_PAIR_OFF, gt.name()),
+                            e2ePairedOfficial(cands, gt.tables(), false));
                     d.tallies.put(key(cfg.name(), M_E2E, P_POOL, gt.name()),
-                            e2ePooled(cfg.hits(), gt.tables()));
+                            e2ePooled(cands, gt.tables()));
+                    d.tallies.put(key(cfg.name(), M_E2E, P_LENIENT, gt.name()),
+                            e2ePairedOfficial(cands, gt.tables(), true));
                     d.tallies.put(key(cfg.name(), M_REGION, P_PAIR, gt.name()),
                             regionPaired(cfg.hits(), gt, cropByPage));
                     d.tallies.put(key(cfg.name(), M_REGION, P_POOL, gt.name()),
@@ -785,6 +1021,12 @@ class BaselineHarness {
         printPageScope(docs, shipDocs);
         printClassification(docs);
         printHeadline(byScope);
+        printOfficialProtocolFinding();
+        printPairingDegeneracy(docs);
+        printPairingFixEffect(byScope);
+        printPublishedComparable(byScope);
+        printOfficialLeniency(byScope);
+        printPairingControls(units);
         printShippingDelta(byScope);
         printFullTable(byScope);
         printDeltas(docs);
@@ -905,10 +1147,19 @@ class BaselineHarness {
                 .mapToInt(d -> d.gtTablesDedup).sum();
         int icdarR = all.stream().filter(d -> !d.source.equals("csv"))
                 .mapToInt(d -> d.gtRelDedup).sum();
+        // PIN: 156 tables / 25,320 relations. This is no longer merely "our number" -- it is the
+        // number the OFFICIAL evaluator itself prints on this corpus. The reference run logged in
+        // mnamysl/tabrec-sncs (results/icdar2013/eval_ours_ctn_thresh=0.85.log) emits a
+        // `GT size: n` per table; summing those gives 26,036 over all 163 annotated tables and
+        // 25,320 once the four *b-str.xml duplicate-annotation files (716 relations) are removed,
+        // and an independent Python port of the algorithm reports 25,320 too. Every one of the 67
+        // ICDAR documents now agrees with the official tool's per-document total EXACTLY (the last
+        // disagreement was us-019, 3 relations, fixed in GroundTruth#scanCellsInto -- see its
+        // comment on negative start-row plus region row-increment).
         line("  ICDAR subset, de-duplicated: %d tables / %d relations  %s",
-                icdarT, icdarR, icdarT == 156 && icdarR == 25317
-                        ? "== the pinned reference (156 / 25,317)"
-                        : "*** MOVED from the pinned 156 / 25,317 -- the relation definition or GT "
+                icdarT, icdarR, icdarT == 156 && icdarR == 25320
+                        ? "== the pinned reference (156 / 25,320 -- the official tool's own total)"
+                        : "*** MOVED from the pinned 156 / 25,320 -- the relation definition or GT "
                           + "loading changed and this report is NOT comparable ***");
     }
 
@@ -992,7 +1243,8 @@ class BaselineHarness {
         line("  Cross-check: the four *b-str.xml duplicate-annotation files contribute exactly 7");
         line("  tables / 716 relations (see MetricFixHarness#printPortReconciliation), and removing");
         line("  them lands the ICDAR inventory on the independent evaluator port's 156 tables /");
-        line("  25,320 relations to within 3 relations.");
+        line("  25,320 relations EXACTLY -- and on the official evaluator's own printed total, which");
+        line("  is 26,036 over all 163 annotated tables and 25,320 with those four files removed.");
     }
 
     private void printGtInventory(List<DocResult> docs) {
@@ -1273,6 +1525,365 @@ class BaselineHarness {
                 older.microF1(), newer.microF1(), dMicro);
     }
 
+    // ============================================================ PAIRING-PROTOCOL INVESTIGATION ==
+
+    /**
+     * WHAT THE OFFICIAL EVALUATOR ACTUALLY DOES, and which of our deviations from it this harness
+     * adopts. Printed rather than left in a comment because every number below depends on it.
+     */
+    private void printOfficialProtocolFinding() {
+        line("");
+        rule();
+        line("THE OFFICIAL ICDAR 2013 PROTOCOL, READ FROM ITS OWN SOURCE");
+        rule();
+        line("Source: github.com/tamirhassan/dataset-tools (Apache-2.0, \"as used in the ICDAR 2013");
+        line("Table Competition\"), MeasureRecognitionPerformance.evaluateResultStr + Table.java, read");
+        line("from a local clone. Aggregation: github.com/mnamysl/tabrec-sncs evaluation/ICDAR2013/");
+        line("eval.py, the published script that drives that JAR and reproduces Namysl et al.'s table.");
+        line("");
+        line("  #  official rule (verbatim behaviour)                     ours before   ours now");
+        line("  -  -----------------------------------------------------  ------------  --------");
+        line("  1  correspondence = argmax over CORRECT ADJACENCY");
+        line("     RELATIONS: `int corrDec = compareARs(gtAR, resultAR..);");
+        line("     if (corrDec > highestCorr) {..matchingResult=resultAR;}` exact-cell F1  ADOPTED");
+        line("  2  candidates restricted to the GT table's own PAGE:");
+        line("     `if (!pageCheck || resultTable.pageNo == gtTable.pageNo)`");
+        line("     with `boolean pageCheck = true` unless -nopage        no page filter  ADOPTED");
+        line("  3  highestCorr starts at -1, so the FIRST candidate on");
+        line("     the page pairs even at zero correct relations         same (bestF1=-1) same");
+        line("  4  ties keep the FIRST candidate (`>` not `>=`)          same            same");
+        line("  5  a GT table with no candidate on its page prints");
+        line("     \"no matching result found\" with NO numbers, and");
+        line("     eval.py sums only the `Table n:` lines -> it is");
+        line("     absent from the recall denominator entirely          charged         STILL CHARGED");
+        line("  6  headline MACRO = 2*mean(P)*mean(R)/(mean(P)+mean(R)),");
+        line("     i.e. F1 OF THE MEANS, not the mean of per-doc F1     mean of F1      BOTH PRINTED");
+        line("");
+        line("  Rules 1 and 2 are adopted: they are the correspondence rule, they are what the defect");
+        line("  report was about, and exact-cell F1 appears NOWHERE in the official tool -- there is no");
+        line("  reading of the source under which our old criterion was the published one.");
+        line("");
+        line("  Rule 5 is DECLINED even though it is what the reference pipeline does, and declining it");
+        line("  costs us score. Reason in #printOfficialLeniency: adopting it would make emitting");
+        line("  NOTHING on a page score strictly better than emitting something wrong, so it rewards");
+        line("  under-detection. Its size is measured there so the conservatism is quantified, not hidden.");
+        line("");
+        line("  Rule 6 is printed alongside ours, never substituted for it. F1-of-means is the LARGER");
+        line("  of the two here, so quoting it would flatter us; it is nonetheless the formula the");
+        line("  published column was computed with, so a comparison against Nurminen et al. must use it.");
+        line("");
+        line("  Verification that rule 6 is read correctly: eval.py's own logged run prints");
+        line("  `Precision: 0.8714227705826723; Recall: 0.8467831413095247; F1: 0.8589262858140391`,");
+        line("  and 2PR/(P+R) on those two means = 0.858926..., matching to 6 decimal places.");
+        line("  Its bulk line `Num of GT: 25319; DET: 24097; CORR: 22722` reproduces its own micro");
+        line("  F1 0.9196211753278292 exactly, which pins the micro formula too.");
+    }
+
+    /**
+     * IS THE DEGENERACY REAL, AND HOW WIDESPREAD? Per-document audit of the CURRENT exact-cell-F1
+     * correspondence rule, from {@link #auditPairing}. This is the evidence for (or against) the
+     * defect report, and it is deliberately reported BEFORE any corrected score, so the claim can be
+     * judged on the mechanism rather than on the number it produces.
+     */
+    private void printPairingDegeneracy(List<DocResult> docs) {
+        line("");
+        rule();
+        line("DEGENERACY AUDIT OF THE CURRENT 1:1 RULE (all-pages, dedup GT, per document)");
+        rule();
+        line("Walks the SAME greedy loop #e2ePaired walks. At each step, over the SAME availability set");
+        line("(no page filter -- this isolates the CRITERION, not the official page restriction):");
+        line("  tie@0  = >=2 candidates available and EVERY one scored exact-cell F1 = 0.0, so the");
+        line("           pairing was decided purely by enumeration order.");
+        line("  misasg = the chosen candidate has strictly FEWER correct adjacency relations than");
+        line("           another candidate still available at that step (\"better candidate left");
+        line("           unpaired\"), and lostRel is how many correct relations that cost.");
+        line("");
+        for (String config : List.of(C_FULL_ARB, C_FULL, C_STREAM, C_LT)) {
+            int degen = 0, tieDocs = 0, misDocs = 0, tie = 0, mis = 0, lost = 0, corr = 0, best = 0;
+            int gtTables = 0;
+            for (DocResult d : docs) {
+                PairAudit a = d.audits.get(config);
+                if (a == null) continue;
+                gtTables += a.gtTables;
+                tie += a.tieAtZeroTables;
+                mis += a.misassignedTables;
+                lost += a.lostRelations;
+                corr += a.currentCorr;
+                best += a.bestStepwiseCorr;
+                if (a.tieAtZeroTables > 0) tieDocs++;
+                if (a.misassignedTables > 0) misDocs++;
+                if (a.degenerate()) degen++;
+            }
+            line("  %-26s docs with a degenerate pairing: %2d / %d", trim(config, 26), degen, docs.size());
+            line("  %-26s   tie@0 : %2d docs, %3d of %3d GT tables", "", tieDocs, tie, gtTables);
+            line("  %-26s   misasg: %2d docs, %3d of %3d GT tables, %d correct relations lost",
+                    "", misDocs, mis, gtTables, lost);
+            line("  %-26s   correct relations kept by current rule %d vs %d if each step had taken",
+                    "", corr, best);
+            line("  %-26s   the max-correct candidate = %.1f%% of the stepwise ceiling",
+                    "", best == 0 ? 100.0 : 100.0 * corr / best);
+        }
+        line("");
+        line("  WORST DOCUMENTS for %s (by correct relations lost to the criterion):", C_FULL_ARB);
+        line("    %-26s %5s %6s %7s %8s %9s %9s",
+                "document", "gtTbl", "tie@0", "misasg", "lostRel", "curCorr", "bestCorr");
+        docs.stream()
+                .filter(d -> d.audits.get(C_FULL_ARB) != null
+                        && d.audits.get(C_FULL_ARB).degenerate())
+                .sorted((x, y) -> Integer.compare(y.audits.get(C_FULL_ARB).lostRelations,
+                        x.audits.get(C_FULL_ARB).lostRelations))
+                .forEach(d -> {
+                    PairAudit a = d.audits.get(C_FULL_ARB);
+                    line("    %-26s %5d %6d %7d %8d %9d %9d", trim(shortId(d.id), 26),
+                            a.gtTables, a.tieAtZeroTables, a.misassignedTables,
+                            a.lostRelations, a.currentCorr, a.bestStepwiseCorr);
+                });
+    }
+
+    /**
+     * THE EFFECT OF THE PAIRING FIX ON EVERY CONFIGURATION, INCLUDING WHERE IT LOWERS THE SCORE.
+     * {@link #P_PAIR} -> {@link #P_PAIR_OFF} at fixed page scope, mode and ground-truth view, so the
+     * only thing that changed is the correspondence rule (criterion + page filter).
+     */
+    private void printPairingFixEffect(Map<String, List<DocResult>> byScope) {
+        line("");
+        rule();
+        line("EFFECT OF THE PAIRING FIX -- EVERY CONFIGURATION, BOTH SCOPES, BOTH GT VIEWS");
+        rule();
+        line("1:1 = exact-cell-F1 correspondence (the old rule). 1:1off = the official rule.");
+        line("Nothing else differs. Negative deltas are printed, not filtered.");
+        line("");
+        line("  %-26s %-13s %-5s %9s %9s %8s %9s %9s %8s",
+                "config", "page scope", "GT", "1:1 MAC", "off MAC", "dMACRO",
+                "1:1 mic", "off mic", "dmicro");
+        for (String config : reportConfigs()) {
+            for (String scope : SCOPES) {
+                for (String gt : List.of(G_DEDUP, G_RAW)) {
+                    List<DocResult> sel = byScope.get(scope);
+                    Acc old = aggregate(sel, key(config, M_E2E, P_PAIR, gt));
+                    Acc neo = aggregate(sel, key(config, M_E2E, P_PAIR_OFF, gt));
+                    if (old.docs == 0 || neo.docs == 0) continue;
+                    line("  %-26s %-13s %-5s %9.4f %9.4f %+8.4f %9.4f %9.4f %+8.4f",
+                            trim(config, 26), scope, gt,
+                            old.macroF1(), neo.macroF1(), neo.macroF1() - old.macroF1(),
+                            old.microF1(), neo.microF1(), neo.microF1() - old.microF1());
+                }
+            }
+        }
+        line("");
+        line("  REGION-GIVEN and REGION-GIVEN-RERUN modes are absent by construction, not omitted:");
+        line("  being handed the region FIXES the correspondence, so there is no pairing rule left to");
+        line("  change and those rows are numerically identical to the ones already reported.");
+    }
+
+    /**
+     * THE ONE TABLE THAT IS COMPARABLE TO PUBLISHED WORK, with every aggregation spelled out. The
+     * published ICDAR 2013 end-to-end column is a per-document average computed as F1-of-means over a
+     * 1:1 per-page correspondence, so the comparable cell is (end-to-end, 1:1off, MACROoff).
+     */
+    private void printPublishedComparable(Map<String, List<DocResult>> byScope) {
+        line("");
+        rule();
+        line("PUBLISHED-COMPARABLE FIGURE, ALL AGGREGATIONS SIDE BY SIDE (end-to-end, dedup GT)");
+        rule();
+        line("MACRO    = mean of per-document F1 (what this project has always reported).");
+        line("MACROoff = 2*mean(P)*mean(R)/(mean(P)+mean(R)) -- the formula eval.py uses and therefore");
+        line("           the one the published column was computed with. Larger here; reported for");
+        line("           comparability, and NOT used as this project's headline.");
+        line("");
+        line("  %-26s %-13s %-8s %8s %9s %8s %8s %8s",
+                "config", "page scope", "protocol", "MACRO", "MACROoff", "macroP", "macroR", "microF1");
+        for (String config : List.of(C_FULL_ARB, C_FULL, C_LT, C_STREAM)) {
+            for (String scope : SCOPES) {
+                for (String proto : List.of(P_PAIR, P_PAIR_OFF, P_POOL)) {
+                    Acc a = aggregate(byScope.get(scope), key(config, M_E2E, proto, G_DEDUP));
+                    if (a.docs == 0) continue;
+                    line("  %-26s %-13s %-8s %8.4f %9.4f %8.4f %8.4f %8.4f",
+                            trim(config, 26), scope, proto, a.macroF1(), a.macroF1Official(),
+                            a.macroP(), a.macroR(), a.microF1());
+                }
+            }
+        }
+        line("");
+        line("  Published end-to-end (per-document averages): KYTHE 0.5220, pdf2table 0.5850,");
+        line("  TABFIND 0.6962, Nitro 0.7535, Acrobat 0.7685, TEXUS 0.8259, Nurminen 0.8374,");
+        line("  OmniPage 0.8420, FineReader 0.8772, GTE 0.9350. Those numbers ALSO carry the rule-5");
+        line("  leniency we decline (see below), so even the MACROoff column understates the gap");
+        line("  closure relative to a like-for-like reference run.");
+    }
+
+    /**
+     * THE SIZE OF THE OFFICIAL LENIENCY WE DECLINE (rule 5), and why declining it is not timidity.
+     *
+     * <p>Under the reference pipeline a ground-truth table with no candidate on its page vanishes from
+     * the recall denominator. That produces a strict perverse ordering: on a page holding one
+     * annotated table, emitting NOTHING costs zero recall, while emitting one wrong table pairs (rule
+     * 3 pairs the first candidate at zero correct) and charges that table's whole relation count. So
+     * a detector that gives up on hard pages outscores an identical detector that guesses. A protocol
+     * with that property cannot be used to rank detectors, which is what a benchmark is for.
+     */
+    private void printOfficialLeniency(Map<String, List<DocResult>> byScope) {
+        line("");
+        rule();
+        line("THE OFFICIAL LENIENCY THIS HARNESS DECLINES, MEASURED (end-to-end, dedup GT)");
+        rule();
+        line("1:1off        = official pairing, missed GT tables STILL CHARGED (what we report).");
+        line("1:1off-lenient= official pairing + the reference pipeline's free pass for a GT table with");
+        line("                no candidate on its page (what eval.py over the official JAR computes).");
+        line("The gap is how much of our reported number is us declining a leniency, not extraction.");
+        line("");
+        line("  %-26s %-13s %9s %9s %8s %9s %9s",
+                "config", "page scope", "1:1off", "lenient", "dMACRO", "off micR", "len micR");
+        for (String config : reportConfigs()) {
+            for (String scope : SCOPES) {
+                List<DocResult> sel = byScope.get(scope);
+                Acc strict = aggregate(sel, key(config, M_E2E, P_PAIR_OFF, G_DEDUP));
+                Acc len = aggregate(sel, key(config, M_E2E, P_LENIENT, G_DEDUP));
+                if (strict.docs == 0) continue;
+                line("  %-26s %-13s %9.4f %9.4f %+8.4f %9.4f %9.4f",
+                        trim(config, 26), scope, strict.macroF1(), len.macroF1(),
+                        len.macroF1() - strict.macroF1(), strict.microR(), len.microR());
+            }
+        }
+        line("");
+        line("  The lenient column is NOT a figure this project reports anywhere. It is here so that");
+        line("  the direction and size of our remaining conservatism against the published pipeline is");
+        line("  on the record: every published end-to-end number in the calibration table was produced");
+        line("  by a pipeline with this leniency, so our comparable figure is understated by roughly");
+        line("  the dMACRO column and we are choosing not to claim it.");
+    }
+
+    /**
+     * MANDATORY ADVERSARIAL SELF-CHECK. A protocol change that raises our own score is only
+     * defensible if it does NOT also raise the score of a detector that is objectively worse. So the
+     * three protocols are re-run against five SYNTHETIC detectors built from the ground truth itself,
+     * whose quality ordering is known a priori and independent of any metric:
+     *
+     * <ol>
+     *   <li><b>perfect</b> -- ground truth as its own detector. Any protocol worth using must return
+     *       1.0 here; anything less is the protocol failing, not the detector.</li>
+     *   <li><b>drop-last-row</b> -- every table minus its final row. Strictly less content, same
+     *       segmentation. Must score below perfect under every protocol.</li>
+     *   <li><b>split-every-table</b> -- every table cut in half by row. Content complete, segmentation
+     *       destroyed. This is the control that exposes a segmentation-blind protocol.</li>
+     *   <li><b>merge-all-on-page</b> -- every table on a page stacked into one candidate. Content
+     *       complete, segmentation destroyed the other way.</li>
+     *   <li><b>drop-one-table</b> -- the first annotated table of each document simply not emitted.
+     *       Strictly less content. The control for the leniency of rule 5.</li>
+     * </ol>
+     *
+     * <p>The test the new protocol has to pass: it must not RE-ORDER these against the old protocol in
+     * a way that promotes a worse detector, and it must not compress the perfect/degraded gap to the
+     * point that degradation stops being visible.
+     */
+    private void printPairingControls(List<BakeOffHarness.ScoreUnit> units) {
+        line("");
+        rule();
+        line("ADVERSARIAL CONTROL -- SYNTHETIC DETECTORS OF KNOWN QUALITY, ALL THREE PROTOCOLS");
+        rule();
+        line("Detectors are built from the DE-DUPLICATED ground truth of the same 77 documents and");
+        line("scored against that same ground truth, so extraction is out of the picture entirely and");
+        line("only the protocol is under test. A protocol that ranks a degraded detector above");
+        line("`perfect`, or that cannot separate `perfect` from `split`/`merge`, is disqualified.");
+        line("");
+        line("  %-20s %-8s %9s %9s %9s %9s %9s",
+                "detector", "protocol", "MACRO", "MACROoff", "microP", "microR", "microF1");
+        for (String det : List.of("perfect", "drop-last-row", "drop-one-table",
+                "split-every-table", "merge-all-on-page")) {
+            for (String proto : List.of(P_PAIR, P_PAIR_OFF, P_LENIENT, P_POOL)) {
+                Acc a = new Acc();
+                for (BakeOffHarness.ScoreUnit u : units) {
+                    List<GroundTruth.Table> exp =
+                            GtDedup.dedup(u.expected()).kept();
+                    List<Cand> cands = syntheticDetector(det, exp);
+                    Tally t = switch (proto) {
+                        case P_PAIR -> e2ePaired(cands, exp);
+                        case P_PAIR_OFF -> e2ePairedOfficial(cands, exp, false);
+                        case P_LENIENT -> e2ePairedOfficial(cands, exp, true);
+                        default -> e2ePooled(cands, exp);
+                    };
+                    if (t.gt == 0 && t.detected == 0 && t.tables == 0) continue;
+                    a.addDoc(t);
+                }
+                line("  %-20s %-8s %9.4f %9.4f %9.4f %9.4f %9.4f",
+                        det, proto, a.macroF1(), a.macroF1Official(),
+                        a.microP(), a.microR(), a.microF1());
+            }
+        }
+    }
+
+    /**
+     * Builds one synthetic detector's candidate list for a document from its ground-truth tables.
+     * Every candidate carries the ground truth's own page number, so the official rule's page filter
+     * is exercised rather than bypassed.
+     */
+    private static List<Cand> syntheticDetector(String kind, List<GroundTruth.Table> expected) {
+        List<Cand> out = new ArrayList<>();
+        switch (kind) {
+            case "perfect" -> {
+                for (GroundTruth.Table t : expected) out.add(candOf(t, 0, Integer.MAX_VALUE));
+            }
+            case "drop-last-row" -> {
+                for (GroundTruth.Table t : expected) {
+                    int rows = t.rowCount();
+                    out.add(candOf(t, 0, Math.max(0, rows - 2)));
+                }
+            }
+            case "drop-one-table" -> {
+                for (int i = 1; i < expected.size(); i++) {
+                    out.add(candOf(expected.get(i), 0, Integer.MAX_VALUE));
+                }
+            }
+            case "split-every-table" -> {
+                for (GroundTruth.Table t : expected) {
+                    int rows = t.rowCount();
+                    int mid = rows / 2;
+                    if (rows < 2) { out.add(candOf(t, 0, Integer.MAX_VALUE)); continue; }
+                    out.add(candOf(t, 0, mid - 1));
+                    out.add(candOf(t, mid, Integer.MAX_VALUE));
+                }
+            }
+            default -> {   // merge-all-on-page
+                Map<Integer, List<GroundTruth.Table>> byPage = new TreeMap<>();
+                for (GroundTruth.Table t : expected) {
+                    byPage.computeIfAbsent(gtPageOf(t), k -> new ArrayList<>()).add(t);
+                }
+                for (Map.Entry<Integer, List<GroundTruth.Table>> e : byPage.entrySet()) {
+                    List<TableScore.GridCell> merged = new ArrayList<>();
+                    List<List<String>> mergedRows = new ArrayList<>();
+                    int rowOffset = 0;
+                    for (GroundTruth.Table t : e.getValue()) {
+                        for (TableScore.GridCell c : TableScore.gridCellsFromGroundTruth(t)) {
+                            merged.add(new TableScore.GridCell(c.startRow() + rowOffset,
+                                    c.startCol(), c.endRow() + rowOffset, c.endCol(), c.text()));
+                        }
+                        mergedRows.addAll(t.rows());
+                        rowOffset += Math.max(1, t.rowCount());
+                    }
+                    out.add(new Cand(e.getKey(), mergedRows, merged));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** One ground-truth table, restricted to grid rows {@code [rowFrom, rowTo]} and re-based to 0. */
+    private static Cand candOf(GroundTruth.Table t, int rowFrom, int rowTo) {
+        List<TableScore.GridCell> cells = new ArrayList<>();
+        for (TableScore.GridCell c : TableScore.gridCellsFromGroundTruth(t)) {
+            int r0 = Math.max(c.startRow(), rowFrom);
+            int r1 = Math.min(c.endRow(), rowTo);
+            if (r1 < r0) continue;
+            cells.add(new TableScore.GridCell(r0 - rowFrom, c.startCol(), r1 - rowFrom,
+                    c.endCol(), c.text()));
+        }
+        List<List<String>> rows = new ArrayList<>();
+        for (int r = rowFrom; r <= Math.min(rowTo, t.rows().size() - 1); r++) {
+            rows.add(t.rows().get(r));
+        }
+        return new Cand(gtPageOf(t), rows, cells);
+    }
+
     /**
      * WHERE THE POOLING GAIN COMES FROM. The pooled/1:1 gap is large for the end-to-end
      * configurations (full pipeline: +0.10 MACRO, +0.20 micro), which is exactly the size of claim
@@ -1356,6 +1967,8 @@ class BaselineHarness {
         line("PROTOCOL SELF-CHECK (page scope %s)", docs.isEmpty() ? "?" : docs.get(0).scope);
         rule();
         int checked = 0, denomMismatch = 0, aliasMismatch = 0;
+        int offChecked = 0, offDenomMismatch = 0;
+        long lenientGt = 0, strictGt = 0;
         List<String> configs = new ArrayList<>(List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM));
         for (String f : FINDER_NAMES) configs.add(C_STREAM + ":" + f);
         for (DocResult d : docs) {
@@ -1365,6 +1978,30 @@ class BaselineHarness {
                     for (String gt : List.of(G_DEDUP, G_RAW)) {
                         Tally pool = d.tallies.get(key(config, mode, P_POOL, gt));
                         Tally pair = d.tallies.get(key(config, mode, P_PAIR, gt));
+                        // Same invariant for the OFFICIAL pairing: a correspondence rule may move only
+                        // the MATCHED count. Under 1:1off every GT table's relations land in `gt`
+                        // (paired or charged as a miss) and every candidate's relations land in
+                        // `detected` (paired or charged as an FP table), so both denominators must
+                        // equal the pooled ones exactly. If the page filter or the argmax ever dropped
+                        // a candidate silently, this is the check that catches it.
+                        Tally off = d.tallies.get(key(config, mode, P_PAIR_OFF, gt));
+                        if (pool != null && off != null) {
+                            offChecked++;
+                            if (pool.gt != off.gt || pool.detected != off.detected) {
+                                offDenomMismatch++;
+                                if (offDenomMismatch <= 5) {
+                                    line("  1:1off DENOMINATOR MISMATCH %s %s/%s/%s: pooled gt=%d "
+                                                    + "det=%d vs 1:1off gt=%d det=%d",
+                                            d.id, config, mode, gt,
+                                            pool.gt, pool.detected, off.gt, off.detected);
+                                }
+                            }
+                        }
+                        Tally len = d.tallies.get(key(config, mode, P_LENIENT, gt));
+                        if (off != null && len != null) {
+                            strictGt += off.gt;
+                            lenientGt += len.gt;
+                        }
                         if (pool == null || pair == null) continue;
                         checked++;
                         if (pool.gt != pair.gt || pool.detected != pair.detected) {
@@ -1393,6 +2030,13 @@ class BaselineHarness {
                         ? "(as required -- pooling moves only the MATCHED count)" : "*** BUG ***");
         line("  stream vs stream:breuel tally mismatches                : %d  %s",
                 aliasMismatch, aliasMismatch == 0 ? "(identical, as expected)" : "*** BUG ***");
+        line("  tallies compared, POOLED vs 1:1off                      : %d", offChecked);
+        line("  denominator mismatches between POOLED and 1:1off        : %d  %s",
+                offDenomMismatch, offDenomMismatch == 0
+                        ? "(as required -- the official pairing moves only MATCHED)" : "*** BUG ***");
+        line("  GT relations in denominator, 1:1off strict vs lenient   : %d vs %d (%.2f%% of GT is",
+                strictGt, lenientGt, strictGt == 0 ? 0.0 : 100.0 * (strictGt - lenientGt) / strictGt);
+        line("    forgiven by the reference pipeline's rule-5 free pass and is NOT forgiven here)");
     }
 
     /**
@@ -1559,6 +2203,12 @@ class BaselineHarness {
         line("  CAVEAT that pooling does not fix: pooling makes the metric blind to table");
         line("  SEGMENTATION quality. If segmentation ever becomes a product requirement it needs a");
         line("  separate measurement; the 1:1 rows above are the closest available proxy.");
+    }
+
+    /** Last path segment of a corpus id, so the per-document audit table stays readable. */
+    private static String shortId(String id) {
+        int slash = id.lastIndexOf('/');
+        return slash < 0 ? id : id.substring(slash + 1);
     }
 
     private static String trim(String s, int n) {

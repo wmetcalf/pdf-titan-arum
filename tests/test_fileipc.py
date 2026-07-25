@@ -169,3 +169,51 @@ def test_stream_tables_default_off():
 def test_stream_tables_unset_is_not_injected(monkeypatch):
     monkeypatch.delenv("TITANARUM_STREAM_TABLES", raising=False)
     assert "stream_tables" not in eng._env_param_overrides()
+
+
+def test_stream_tables_falsey_env_values_are_off_exactly_like_its_siblings(monkeypatch):
+    # An env flag that read TRUTHY for "false" / "0" would be a trap: the dispatcher forwards
+    # whatever string the client sent, and an operator writing TITANARUM_STREAM_TABLES=false to
+    # DISABLE the path would have silently enabled it. Pin the whole falsey vocabulary AND pin
+    # that stream_tables is parsed by the same _flag helper as a sibling toggle, so the two can
+    # never drift apart (they'd drift only if someone gave stream_tables its own parser).
+    sibling = "TITANARUM_SKIP_IMAGES"
+    for value in ("0", "false", "FALSE", "no", "off", "garbage"):
+        monkeypatch.setenv("TITANARUM_STREAM_TABLES", value)
+        monkeypatch.setenv(sibling, value)
+        over = eng._env_param_overrides()
+        assert over["stream_tables"] is False, f"{value!r} must be OFF"
+        assert over["stream_tables"] is over["skip_images"], f"{value!r} must parse like siblings"
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("TITANARUM_STREAM_TABLES", value)
+        monkeypatch.setenv(sibling, value)
+        over = eng._env_param_overrides()
+        assert over["stream_tables"] is True, f"{value!r} must be ON"
+        assert over["stream_tables"] is over["skip_images"], f"{value!r} must parse like siblings"
+    # Empty string = "operator set the compose variable but left it blank" -> not injected at all,
+    # so _DEFAULT_JOB's False applies. Same for the sibling.
+    monkeypatch.setenv("TITANARUM_STREAM_TABLES", "")
+    monkeypatch.setenv(sibling, "")
+    over = eng._env_param_overrides()
+    assert "stream_tables" not in over
+    assert "skip_images" not in over
+
+
+def test_stream_tables_reaches_the_job_json_the_worker_reads(monkeypatch):
+    # _env_param_overrides alone proves nothing: the value has to survive the _DEFAULT_JOB merge
+    # and the json.dumps that writes control/job.json, under the key the Java JobDescriptor binds
+    # (@JsonProperty("stream_tables")). Assert on the SERIALIZED job, not the dict.
+    for key in ("TITANARUM_SKIP_TABLES", "TITANARUM_SKIP_IMAGES"):
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.delenv("TITANARUM_STREAM_TABLES", raising=False)
+    job = json.loads(json.dumps(eng._build_job(Path("/in.pdf"), Path("/out"), "a" * 64)))
+    assert job["stream_tables"] is False, "unset env must serialize the OFF default"
+
+    monkeypatch.setenv("TITANARUM_STREAM_TABLES", "1")
+    job = json.loads(json.dumps(eng._build_job(Path("/in.pdf"), Path("/out"), "a" * 64)))
+    assert job["stream_tables"] is True, "TITANARUM_STREAM_TABLES=1 must reach job.json"
+
+    monkeypatch.setenv("TITANARUM_STREAM_TABLES", "0")
+    job = json.loads(json.dumps(eng._build_job(Path("/in.pdf"), Path("/out"), "a" * 64)))
+    assert job["stream_tables"] is False, "TITANARUM_STREAM_TABLES=0 must reach job.json as false"

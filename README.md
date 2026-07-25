@@ -44,6 +44,13 @@ mvn package
 mvn package -Pserver
 ```
 
+No prebuilt JAR ships in this repo — **build it**. `mvn package` also drops a convenience copy
+in `dist/` (the `copy-to-dist` antrun execution), which is a build output and is gitignored;
+`target/…` is the path every command below, and every `deploy/` Dockerfile, actually uses. Two
+builds of identical source are not byte-identical (the shade plugin stamps entry timestamps), so
+a committed JAR could never be verified against source anyway — treat any `dist/` JAR you find as
+being exactly as old as your last `mvn package`.
+
 ---
 
 ## Quick Start
@@ -287,6 +294,13 @@ they are missing from the `POST /api/jobs` field list above, not merely undocume
 ways to enable borderless (stream) table extraction are the CLI's `--stream-tables` flag or a blastbox
 job.json's `stream_tables` field (see [Borderless tables are opt-in — and why](#borderless-tables-are-opt-in--and-why)); there is no REST-facing equivalent yet.
 
+The REST worker (`WorkerPool.processJob`) calls `setSkipTables` but never `setStreamTables`, so REST
+jobs always run on the **field-initializer** default rather than the CLI's `@Option defaultValue` —
+three surfaces, three independent copies of "off" (CLI annotation, Java field initializer / REST,
+`job.json` absent-key, plus `titanarum/engine.py`'s `_DEFAULT_JOB`). Flipping the default would have
+to move all of them together; `StreamTablesSurfaceTest.everySurfaceAgreesOnTheDefault` fails if it
+is flipped in only one.
+
 ---
 
 ## Blastbox fleet engine
@@ -423,7 +437,15 @@ keys are dropped before the allowlist). They map onto the same knobs as the CLI 
 `TITANARUM_DPI`, `TITANARUM_PAGES`, `TITANARUM_STREAM_TABLES`, `TITANARUM_SKIP_TABLES` **by default**
 (`BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS` in `docker-compose.yml` / `.env`). To forward any other row
 above, add its key to that allowlist — unlisted (and any lowercase) keys are dropped before they
-reach the worker, SILENTLY (no error, no rejected job — the job just runs without that knob).
+reach the worker, SILENTLY (no error, no rejected job — the job just runs without that knob; the
+dispatcher logs one `dropping non-allowlisted extra_env key` warning, which is the only trace).
+
+> **Upgrading an existing deploy:** the compose files spell the allowlist
+> `${BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS:-<default>}`, so an **`.env` you created earlier wins over
+> the default above**. `TITANARUM_STREAM_TABLES` / `TITANARUM_SKIP_TABLES` were added to the default
+> set after the first deploys; if your `deploy/docker/.env` still pins the older four-key value, the
+> table knobs are dropped and borderless extraction stays off no matter what a job asks for. Diff
+> your `.env` against `deploy/docker/.env.example` after pulling.
 
 Stack-level env (`deploy/docker/.env.example`): `POSTGRES_PASSWORD` (required), `TITANARUM_PORT`
 (8004), `TITANARUM_BIND_ADDR` (set `127.0.0.1` to keep it off the network — **the api does not

@@ -75,7 +75,14 @@ class BakeOffHarness {
 
     /** One PDF to score, with the ground-truth table(s) expected on it (possibly >1, e.g. an
      *  ICDAR "a"+"b" structure-XML pair annotating the same underlying PDF). */
-    private record ScoreUnit(String id, Path pdf, List<GroundTruth.Table> expected) {}
+    // Task 9j diagnostic note: widened from `private` to package-private (ScoreUnit, PdfScore,
+    // CorpusResult, buildScoringSet, scoreUnit below) so Diag9jHarness can reuse this EXACT
+    // 77-PDF corpus-discovery + scoring logic byte-for-byte instead of re-deriving/duplicating
+    // it (which would risk silently drifting from the real bake-off's own scoring set or
+    // pairing policy). Pure visibility changes only -- no method body, field, or behavior was
+    // touched, so BakeOffHarness's own `run()` output is unaffected (verified: reran
+    // `-Dtest=BakeOffHarness -DbakeOff=true` after this change, byte-identical summary table).
+    record ScoreUnit(String id, Path pdf, List<GroundTruth.Table> expected) {}
 
     // ------------------------------------------------------------------------- the actual test
 
@@ -165,9 +172,9 @@ class BakeOffHarness {
 
     // ------------------------------------------------------------------- scoring one (finder,pdf)
 
-    private record RunResult(List<TableExtractor.TableHit> hits, long elapsedNanos, String error) {}
+    record RunResult(List<TableExtractor.TableHit> hits, long elapsedNanos, String error) {}
 
-    private static RunResult runFinderOnPdf(GutterFinder finder, Path pdf) {
+    static RunResult runFinderOnPdf(GutterFinder finder, Path pdf) {
         long t0 = System.nanoTime();
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             List<TableExtractor.TableHit> hits = new ArrayList<>();
@@ -183,7 +190,7 @@ class BakeOffHarness {
         }
     }
 
-    private record PdfScore(int tp, int fp, int fn, double f1, int pairedTables,
+    record PdfScore(int tp, int fp, int fn, double f1, int pairedTables,
                              int dimsExactMatches, boolean detected, String error, double elapsedMs,
                              int adjMatched, int adjDetectedTotal, int adjGtTotal, double adjF1) {}
 
@@ -202,7 +209,7 @@ class BakeOffHarness {
      * table than the exact-cell metric did), so both metrics describe the same head-to-head
      * table-vs-table correspondence.
      */
-    private static PdfScore scoreUnit(GutterFinder finder, ScoreUnit unit) {
+    static PdfScore scoreUnit(GutterFinder finder, ScoreUnit unit) {
         RunResult run = runFinderOnPdf(finder, unit.pdf());
         double elapsedMs = run.elapsedNanos() / 1_000_000.0;
         boolean detected = !run.hits().isEmpty();
@@ -318,7 +325,7 @@ class BakeOffHarness {
 
     // --------------------------------------------------------------------- scoring-set discovery
 
-    private static final class CorpusResult {
+    static final class CorpusResult {
         List<ScoreUnit> units = new ArrayList<>();
         int icdarCount, csvCount, overlapCount;
         List<String> csvSkipped = new ArrayList<>();     // no matching PDF at all
@@ -348,7 +355,7 @@ class BakeOffHarness {
      *       truths, which would double-count one real table as two "expected" tables).</li>
      * </ul>
      */
-    private static CorpusResult buildScoringSet(StringBuilder notes) throws IOException {
+    static CorpusResult buildScoringSet(StringBuilder notes) throws IOException {
         CorpusResult result = new CorpusResult();
 
         // ---- ICDAR ----

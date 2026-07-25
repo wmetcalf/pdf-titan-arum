@@ -2204,17 +2204,80 @@ final class TableTestPdfs {
         }
     }
 
-    /** Harvest all TextPositions on a 0-based page index (top-left-origin coords). */
+    /**
+     * Harvest the glyphs of a 0-based page index (top-left-origin coords) EXACTLY as the shipping
+     * pipeline hands them to {@link TableExtractor#extract}.
+     *
+     * <p>METHODOLOGICAL FIX (this is an instrument correction, not a tuning change). This helper is
+     * the glyph source for every bake-off/baseline harness and for most of the table unit tests. It
+     * used to be a bare {@code PDFTextStripper} at DEFAULT settings that appended {@code ps}
+     * wholesale, which diverged from production in three ways at once:
+     *
+     * <ol>
+     *   <li>ORDERING. Production sets {@code setSortByPosition(true)}
+     *       ({@code PdfTitanArumApp#stripTextPerPage}); this helper did not. Default ordering is
+     *       content-stream order, so the extractor was fed a different glyph SEQUENCE than it ever
+     *       sees in the field. The stream path's word/line clustering and the lattice path's
+     *       text-fill both consume this list in order.</li>
+     *   <li>EMPTY-UNICODE GLYPHS. Production's {@code PositionAwareTextStripper#writeString} skips
+     *       any {@code TextPosition} whose {@code getUnicode()} is null or empty (they contribute no
+     *       character to the collected text, so they never enter {@code indexToPosition}); this
+     *       helper kept them. Those are real geometry with no character -- feeding them to the
+     *       extractor invents ink the shipping pipeline never sees.</li>
+     *   <li>MULTI-CHAR / LIGATURE GLYPHS. Production appends one {@code indexToPosition} entry PER
+     *       CHARACTER of the glyph's unicode (so an "fi" ligature is two entries pointing at the
+     *       same {@code TextPosition}) and then collapses consecutive identical REFERENCES back to
+     *       one via {@code PdfTitanArumApp#dedupeConsecutiveTextPositionRefs} before calling
+     *       {@code extract}. The net effect is one entry per non-empty-unicode glyph -- which is
+     *       what this method now reproduces, by replicating both steps rather than assuming their
+     *       composition.</li>
+     * </ol>
+     *
+     * <p>The body below is a deliberate line-by-line transcription of production's
+     * {@code PositionAwareTextStripper#writeString} + {@code positionsForRange(0, MAX_VALUE)} +
+     * {@code dedupeConsecutiveTextPositionRefs} composition, including the per-char append and the
+     * null newline sentinel, so that any future change to either can be diffed against the other.
+     * (The sentinels and the fallback branch cannot survive the null-filter/dedup, but they are kept
+     * so the transcription is verifiable by inspection instead of by argument.)
+     */
     static java.util.List<org.apache.pdfbox.text.TextPosition> harvestGlyphs(
             org.apache.pdfbox.pdmodel.PDDocument doc, int pageIndex) throws java.io.IOException {
-        java.util.List<org.apache.pdfbox.text.TextPosition> out = new java.util.ArrayList<>();
+        // Mirrors PositionAwareTextStripper.indexToPosition: one entry per CHARACTER, null for the
+        // per-writeString '\n' separator and for the no-unicode fallback branch.
+        java.util.List<org.apache.pdfbox.text.TextPosition> indexToPosition = new java.util.ArrayList<>();
         org.apache.pdfbox.text.PDFTextStripper s = new org.apache.pdfbox.text.PDFTextStripper() {
-            @Override protected void writeString(String t, java.util.List<org.apache.pdfbox.text.TextPosition> ps) {
-                out.addAll(ps);
+            @Override protected void writeString(String string,
+                    java.util.List<org.apache.pdfbox.text.TextPosition> textPositions) {
+                int consumed = 0;
+                for (org.apache.pdfbox.text.TextPosition position : textPositions) {
+                    String unicode = position.getUnicode();
+                    if (unicode == null || unicode.isEmpty()) {
+                        continue;
+                    }
+                    for (int i = 0; i < unicode.length(); i++) {
+                        indexToPosition.add(position);
+                        consumed++;
+                    }
+                }
+                if (consumed == 0 && string != null && !string.isEmpty()) {
+                    for (int i = 0; i < string.length(); i++) indexToPosition.add(null);
+                }
+                indexToPosition.add(null);
             }
         };
+        s.setSortByPosition(true);   // production: PdfTitanArumApp#stripTextPerPage
         s.setStartPage(pageIndex + 1); s.setEndPage(pageIndex + 1);
         s.getText(doc);
+        // positionsForRange(0, Integer.MAX_VALUE) -- drops the nulls -- then
+        // dedupeConsecutiveTextPositionRefs -- collapses consecutive identical references.
+        java.util.List<org.apache.pdfbox.text.TextPosition> out =
+                new java.util.ArrayList<>(indexToPosition.size());
+        org.apache.pdfbox.text.TextPosition prevRef = null;
+        for (org.apache.pdfbox.text.TextPosition tp : indexToPosition) {
+            if (tp == null) continue;
+            if (tp != prevRef) out.add(tp);
+            prevRef = tp;
+        }
         return out;
     }
 }

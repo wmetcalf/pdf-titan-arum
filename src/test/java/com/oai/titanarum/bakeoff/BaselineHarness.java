@@ -105,6 +105,24 @@ class BaselineHarness {
     private static final List<String> FINDER_NAMES =
             List.of("breuel", "gapvote", "alignedge", "occupancy");
 
+    // ------------------------------------------------------------------------------- page scope
+
+    /** ALL pages of every document -- the scope every figure this project has published used. */
+    private static final String S_ALL  = "all-pages";
+    /**
+     * Exactly the pages the shipping CLI processes at its DEFAULT {@code --pages default}: first four
+     * plus the last, with blank pages substituted by the next non-blank ones. Not re-implemented here
+     * -- see {@link ShippingPages}, which reflects into production's own selection code.
+     *
+     * <p>WHY THIS ROW EXISTS. Every published table figure scored all pages; the shipping default
+     * does not. A user running {@code pdf-titan-arum} with no {@code --pages} flag gets the SHIPPING
+     * number, so that is the number they are owed. Ground-truth tables on unprocessed pages are
+     * charged as full recall loss here, because that is exactly what happens in the field.
+     */
+    private static final String S_SHIP = "shipping-dflt";
+
+    private static final List<String> SCOPES = List.of(S_ALL, S_SHIP);
+
     /** The order every table in this report lists its four (protocol, ground-truth) combinations in:
      *  the primary first, the pre-correction baseline last. */
     private static final List<String[]> PROTOCOL_ORDER = List.of(
@@ -225,6 +243,13 @@ class BaselineHarness {
 
     private static final class DocResult {
         String id, source, bucket;
+        /** This document's OWN tagged/lattice classification under THIS scope's page selection.
+         *  {@link #bucket} may have been overwritten with the all-pages classification so that the
+         *  {@code borderless} subset means the same set of documents in both scopes. */
+        String nativeBucket;
+        String scope;
+        int pageCount, blankPages;
+        List<Integer> selectedPages = List.of();
         int taggedCount, latticeCount, rawStreamHits, keptStreamHits;
         int gtTablesRaw, gtTablesDedup;
         int gtRelRaw, gtRelDedup;
@@ -427,10 +452,74 @@ class BaselineHarness {
         return t;
     }
 
+    // -------------------------------------------------------------- shipping page selection
+
+    /**
+     * The SHIPPING page selection, taken from PRODUCTION ITSELF rather than re-derived.
+     *
+     * <p>{@code PdfTitanArumApp#computePagesToProcess}, {@code #classifyBlankPages} and
+     * {@code #fillBlankPages} are private, so they are reached reflectively. That is deliberate: a
+     * transcription of "first four pages plus the last" into this harness would be a SECOND
+     * implementation of the shipping default, free to drift from it silently -- and this whole class
+     * exists because the harness had drifted from production once already. Reflection cannot drift;
+     * it either resolves the real member or fails loudly.
+     *
+     * <p>No {@code src/main} file is touched, and nothing about production's behaviour changes: these
+     * are read-only calls on a throwaway instance whose picocli option fields are never consulted by
+     * any of the three methods.
+     */
+    private static final class ShippingPages {
+        private static final Object APP;
+        private static final java.lang.reflect.Method COMPUTE, CLASSIFY, FILL;
+
+        static {
+            try {
+                java.lang.reflect.Constructor<PdfTitanArumApp> ctor =
+                        PdfTitanArumApp.class.getDeclaredConstructor();
+                ctor.setAccessible(true);
+                APP = ctor.newInstance();
+                COMPUTE = PdfTitanArumApp.class
+                        .getDeclaredMethod("computePagesToProcess", String.class, int.class);
+                CLASSIFY = PdfTitanArumApp.class
+                        .getDeclaredMethod("classifyBlankPages", PDDocument.class);
+                FILL = PdfTitanArumApp.class
+                        .getDeclaredMethod("fillBlankPages", List.class, Set.class, int.class);
+                COMPUTE.setAccessible(true);
+                CLASSIFY.setAccessible(true);
+                FILL.setAccessible(true);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        /** {blank page count, selected pages} for the CLI's default {@code --pages default}. */
+        @SuppressWarnings("unchecked")
+        static Selection select(PDDocument doc) {
+            try {
+                int pageCount = doc.getNumberOfPages();
+                List<Integer> pages = (List<Integer>) COMPUTE.invoke(APP, "default", pageCount);
+                // Production applies blank-page substitution unless --no-skip-blanks; the default is
+                // to apply it, and only when something was actually classified blank.
+                Set<Integer> blank = (Set<Integer>) CLASSIFY.invoke(APP, doc);
+                List<Integer> selected = blank.isEmpty()
+                        ? pages : (List<Integer>) FILL.invoke(APP, pages, blank, pageCount);
+                return new Selection(pageCount, blank.size(), selected);
+            } catch (ReflectiveOperationException e) {
+                // Never silently substitute an approximation: a guessed page selection would make the
+                // shipping row a fiction, which is the exact class of defect this harness fixes.
+                throw new IllegalStateException("cannot reach production's own page selection", e);
+            }
+        }
+    }
+
+    private record Selection(int pageCount, int blankPages, List<Integer> pages) {}
+
     // ---------------------------------------------------------------------------- per-document run
 
-    private static DocResult measure(BakeOffHarness.ScoreUnit unit, List<GutterFinder> finders) {
+    private static DocResult measure(BakeOffHarness.ScoreUnit unit, List<GutterFinder> finders,
+                                     String scope) {
         DocResult d = new DocResult();
+        d.scope = scope;
         d.id = unit.id();
         d.source = unit.id().contains("competition-dataset-us") ? "icdar-us"
                 : unit.id().contains("competition-dataset-eu") ? "icdar-eu" : "csv";
@@ -461,14 +550,31 @@ class BaselineHarness {
 
         try (PDDocument doc = Loader.loadPDF(unit.pdf().toFile())) {
             int pages = doc.getNumberOfPages();
+            d.pageCount = pages;
+
+            // The pages this scope actually processes. Under S_SHIP the glyph map is built ONLY for
+            // those pages, exactly as production does (PdfTitanArumApp#stripTextPerPage skips every
+            // page outside the selection), so an unprocessed page's tables are genuinely invisible to
+            // every path -- including the lattice path, which is handed a null glyph list for pages
+            // absent from the map.
             List<Integer> pageList = new ArrayList<>();
-            Map<Integer, List<TextPosition>> glyphs = new LinkedHashMap<>();
-            Map<Integer, PDRectangle> cropByPage = new LinkedHashMap<>();
-            for (int p = 1; p <= pages; p++) {
-                pageList.add(p);
-                glyphs.put(p, TableTestPdfs.harvestGlyphs(doc, p - 1));
-                cropByPage.put(p, doc.getPage(p - 1).getCropBox());
+            if (scope.equals(S_SHIP)) {
+                Selection sel = ShippingPages.select(doc);
+                d.blankPages = sel.blankPages();
+                pageList.addAll(sel.pages());
+            } else {
+                for (int p = 1; p <= pages; p++) pageList.add(p);
             }
+            d.selectedPages = List.copyOf(pageList);
+
+            Map<Integer, List<TextPosition>> glyphs = new LinkedHashMap<>();
+            for (int p : pageList) glyphs.put(p, TableTestPdfs.harvestGlyphs(doc, p - 1));
+            // cropByPage is page GEOMETRY, not content: the region-given modes need a crop box for
+            // every page a ground-truth region names, whether or not this scope processed it. A
+            // region on an unprocessed page therefore still counts as a MISS (no glyphs -> no
+            // candidates), which is the honest accounting, rather than being silently excluded.
+            Map<Integer, PDRectangle> cropByPage = new LinkedHashMap<>();
+            for (int p = 1; p <= pages; p++) cropByPage.put(p, doc.getPage(p - 1).getCropBox());
 
             // ---- tagged + lattice: production TableExtractor.extract, untouched ----
             List<TableExtractor.TableHit> taggedLattice = new ArrayList<>();
@@ -483,14 +589,26 @@ class BaselineHarness {
                     .filter(h -> "lattice".equals(h.extractionMethod)).count();
             d.bucket = d.taggedCount > 0 && d.latticeCount > 0 ? "both"
                     : d.taggedCount > 0 ? "tagged" : d.latticeCount > 0 ? "lattice" : "neither";
+            d.nativeBucket = d.bucket;
 
             // ---- stream, per finder ----
+            // Honours production's DOCUMENT-LEVEL stream budget (TableExtractor#MAX_STREAM_PAGES_PER_DOC)
+            // and its per-page glyph cap, charged the way TableExtractor#extractStreamPage charges
+            // them: a page with no glyphs, or one refused by the glyph cap, does no detection work and
+            // is therefore not charged. Without this the harness would run the whitespace detector on
+            // pages production never reaches on a long document -- another off-distribution feed.
             Map<String, List<TableExtractor.TableHit>> streamByFinder = new LinkedHashMap<>();
             for (GutterFinder f : finders) {
                 List<TableExtractor.TableHit> hits = new ArrayList<>();
+                int streamPagesRun = 0;
                 try {
                     for (int p : pageList) {
-                        hits.addAll(StreamTableExtractor.extractPage(p, glyphs.get(p), f));
+                        List<TextPosition> pg = glyphs.get(p);
+                        if (pg == null || pg.isEmpty()) continue;
+                        if (pg.size() > StreamTableExtractor.MAX_STREAM_GLYPHS) continue;
+                        if (streamPagesRun >= TableExtractor.MAX_STREAM_PAGES_PER_DOC) break;
+                        streamPagesRun++;
+                        hits.addAll(StreamTableExtractor.extractPage(p, pg, f));
                     }
                 } catch (Throwable t) {
                     d.error = (d.error == null ? "" : d.error + "; ")
@@ -525,6 +643,11 @@ class BaselineHarness {
                 fullArb = full;
                 d.error = (d.error == null ? "" : d.error + "; ") + "arbitrate: work budget";
             }
+            // Production COMPOSES MAX_TABLES_PER_PAGE over the merged list (TableExtractor#extract ->
+            // #capTablesPerPage) after arbitration. A no-op on this corpus -- the densest page carries
+            // 9 ruling + 4 stream candidates against a ceiling of 50 -- but the harness must not be
+            // able to emit a candidate list production would have refused.
+            fullArb = TableExtractor.capTablesPerPage(fullArb, new TableExtractor.Result());
 
             // ---- per-finder region RERUN, cached per RAW ground-truth table index ----
             Map<String, Map<Integer, List<TableExtractor.TableHit>>> rerunByFinder =
@@ -613,7 +736,22 @@ class BaselineHarness {
         List<BakeOffHarness.ScoreUnit> units = corpus.units;
 
         List<DocResult> docs = new ArrayList<>();
-        for (BakeOffHarness.ScoreUnit u : units) docs.add(measure(u, finders));
+        for (BakeOffHarness.ScoreUnit u : units) docs.add(measure(u, finders, S_ALL));
+
+        // SHIPPING CONFIG: the same corpus, the same protocols, but only the pages the CLI's default
+        // --pages selection processes. Measured as a SECOND full pass rather than derived from the
+        // all-pages pass, because a page selection changes what every path sees, not just which hits
+        // are kept.
+        List<DocResult> shipDocs = new ArrayList<>();
+        for (BakeOffHarness.ScoreUnit u : units) shipDocs.add(measure(u, finders, S_SHIP));
+        // Subset MEMBERSHIP is pinned to the all-pages classification so that "borderless" names the
+        // same documents in both scopes and the all-pages/shipping delta is attributable to the page
+        // selection alone. Each shipping document's own classification is kept in nativeBucket and
+        // reported by #printPageScope.
+        for (int i = 0; i < shipDocs.size(); i++) shipDocs.get(i).bucket = docs.get(i).bucket;
+        Map<String, List<DocResult>> byScope = new LinkedHashMap<>();
+        byScope.put(S_ALL, docs);
+        byScope.put(S_SHIP, shipDocs);
 
         // Stream-path timing, measured exactly the way BakeOffHarness measures it (whole PDF,
         // including load and glyph harvest) so the p50/p95 stay comparable to that report's.
@@ -635,15 +773,24 @@ class BaselineHarness {
         line("        parallel-link dedup, blank count NOT in identity), MULTISET comparison.");
         line("        Relation definition and adjacency matching are UNCHANGED by this run.");
         line("PRIMARY protocol = POOLED + dedup. Every row states its own protocol and GT view.");
+        line("PAGE SCOPE is reported TWICE for every configuration: all-pages (what every figure this");
+        line("        project published used) and shipping-dflt (what `--pages default` actually");
+        line("        processes). Both are labelled on every row; neither is a substitute for the other.");
+        printGlyphSourceNote();
         printErrors(docs);
+        printErrors(shipDocs);
         printDedupAudit(docs);
         printGtInventory(docs);
+        printGtScopeControl(docs, shipDocs);
+        printPageScope(docs, shipDocs);
         printClassification(docs);
-        printHeadline(docs);
-        printFullTable(docs);
+        printHeadline(byScope);
+        printShippingDelta(byScope);
+        printFullTable(byScope);
         printDeltas(docs);
         printPoolingMechanism(docs);
         printProtocolSelfCheck(docs);
+        printProtocolSelfCheck(shipDocs);
         printRegressions(docs);
         printProseAndTiming(finders, streamMs);
         printProtocolArgument();
@@ -660,9 +807,117 @@ class BaselineHarness {
 
     private void printErrors(List<DocResult> docs) {
         List<DocResult> bad = docs.stream().filter(d -> d.error != null).toList();
+        String scope = docs.isEmpty() ? "?" : docs.get(0).scope;
         line("");
-        line("Documents with a measurement error: %d", bad.size());
+        line("Documents with a measurement error (page scope %s): %d", scope, bad.size());
         for (DocResult d : bad) line("  %s: %s", d.id, d.error);
+    }
+
+    /**
+     * THE GLYPH SOURCE. Stated in the report itself, because the number every reader takes away
+     * depends on it and it was WRONG in every earlier report.
+     */
+    private void printGlyphSourceNote() {
+        line("");
+        rule();
+        line("GLYPH SOURCE -- now identical to the shipping pipeline's (was not, before this run)");
+        rule();
+        line("  TableTestPdfs.harvestGlyphs feeds every configuration below. It now reproduces");
+        line("  PdfTitanArumApp#stripTextPerPage exactly: PDFTextStripper with setSortByPosition(true),");
+        line("  glyphs with null/empty getUnicode() DROPPED, one entry per non-empty-unicode glyph");
+        line("  (production's per-character index collapsed by dedupeConsecutiveTextPositionRefs).");
+        line("  Previously it used DEFAULT (content-stream) ordering and kept empty-unicode glyphs, so");
+        line("  the extractor was scored on a glyph sequence production never produces. Parity is");
+        line("  pinned by HarvestGlyphsProductionParityTest, which builds the production side by");
+        line("  REFLECTING into PositionAwareTextStripper rather than re-implementing it.");
+        line("  This is an INSTRUMENT correction. No src/main file changed and no threshold was");
+        line("  re-tuned, so any movement below is the previously published figures being restated,");
+        line("  not extraction getting better or worse.");
+    }
+
+    /**
+     * CONTROL. Ground truth comes from the ICDAR XML / tabula CSV -- never from glyphs and never from
+     * a page selection -- so its table and relation counts MUST be bit-identical across page scopes.
+     * If they are not, the glyph/page-scope work leaked into the metric's definition and every number
+     * in this report is void.
+     */
+    private void printGtScopeControl(List<DocResult> all, List<DocResult> ship) {
+        line("");
+        rule();
+        line("CONTROL -- GROUND TRUTH IS INDEPENDENT OF GLYPHS AND OF PAGE SCOPE");
+        rule();
+        int aT = all.stream().mapToInt(d -> d.gtTablesDedup).sum();
+        int sT = ship.stream().mapToInt(d -> d.gtTablesDedup).sum();
+        int aR = all.stream().mapToInt(d -> d.gtRelDedup).sum();
+        int sR = ship.stream().mapToInt(d -> d.gtRelDedup).sum();
+        int aRawT = all.stream().mapToInt(d -> d.gtTablesRaw).sum();
+        int sRawT = ship.stream().mapToInt(d -> d.gtTablesRaw).sum();
+        int aRawR = all.stream().mapToInt(d -> d.gtRelRaw).sum();
+        int sRawR = ship.stream().mapToInt(d -> d.gtRelRaw).sum();
+        line("  all-77 dedup   : tables %d vs %d, relations %d vs %d   %s",
+                aT, sT, aR, sR, aT == sT && aR == sR ? "IDENTICAL (required)" : "*** BUG ***");
+        line("  all-77 raw     : tables %d vs %d, relations %d vs %d   %s",
+                aRawT, sRawT, aRawR, sRawR,
+                aRawT == sRawT && aRawR == sRawR ? "IDENTICAL (required)" : "*** BUG ***");
+        int icdarT = all.stream().filter(d -> !d.source.equals("csv"))
+                .mapToInt(d -> d.gtTablesDedup).sum();
+        int icdarR = all.stream().filter(d -> !d.source.equals("csv"))
+                .mapToInt(d -> d.gtRelDedup).sum();
+        line("  ICDAR subset, de-duplicated: %d tables / %d relations  %s",
+                icdarT, icdarR, icdarT == 156 && icdarR == 25317
+                        ? "== the pinned reference (156 / 25,317)"
+                        : "*** MOVED from the pinned 156 / 25,317 -- the relation definition or GT "
+                          + "loading changed and this report is NOT comparable ***");
+    }
+
+    /**
+     * PAGE-SELECTION INVENTORY. How much of the corpus the shipping default never looks at, and
+     * whether the shipping selection re-classifies any document's extraction path.
+     */
+    private void printPageScope(List<DocResult> all, List<DocResult> ship) {
+        line("");
+        rule();
+        line("PAGE-SELECTION INVENTORY -- all-pages vs the shipping `--pages default`");
+        rule();
+        line("Shipping selection = first min(4, pageCount) pages plus the last, blank pages replaced by");
+        line("the next non-blank ones. Taken from production's OWN computePagesToProcess /");
+        line("classifyBlankPages / fillBlankPages by reflection, not re-derived here.");
+        line("");
+        int over = 0, totalPages = 0, shipPages = 0, maxPages = 0, blankDocs = 0, reclassified = 0;
+        List<String> detail = new ArrayList<>();
+        for (int i = 0; i < all.size(); i++) {
+            DocResult a = all.get(i), s = ship.get(i);
+            totalPages += a.pageCount;
+            shipPages += s.selectedPages.size();
+            maxPages = Math.max(maxPages, a.pageCount);
+            if (s.blankPages > 0) blankDocs++;
+            if (a.pageCount > s.selectedPages.size()) {
+                over++;
+                detail.add(String.format(Locale.ROOT,
+                        "  %-46s pages=%-4d shipping=%-24s gtTables=%d",
+                        tail(s.id, 46), a.pageCount, s.selectedPages, s.gtTablesDedup));
+            }
+            if (!java.util.Objects.equals(a.nativeBucket, s.nativeBucket)) {
+                reclassified++;
+                detail.add(String.format(Locale.ROOT,
+                        "  %-46s RECLASSIFIED by page scope: %s (all) -> %s (shipping)",
+                        tail(s.id, 46), a.nativeBucket, s.nativeBucket));
+            }
+        }
+        line("  documents whose shipping selection is SMALLER than the document : %d of %d",
+                over, all.size());
+        line("  corpus pages, all-pages scope                                   : %d (max %d in one doc)",
+                totalPages, maxPages);
+        line("  corpus pages, shipping scope                                    : %d (%.1f%% of the corpus)",
+                shipPages, totalPages == 0 ? 0.0 : 100.0 * shipPages / totalPages);
+        line("  documents with >=1 page classified blank by production           : %d", blankDocs);
+        line("  documents whose tagged/lattice classification CHANGES           : %d", reclassified);
+        line("  MAX_STREAM_PAGES_PER_DOC = %d; longest corpus document = %d pages, so the "
+                        + "document-level stream budget %s on this corpus.",
+                TableExtractor.MAX_STREAM_PAGES_PER_DOC, maxPages,
+                maxPages > TableExtractor.MAX_STREAM_PAGES_PER_DOC ? "*** BINDS ***" : "never binds");
+        line("");
+        for (String s : detail) line(s);
     }
 
     private void printDedupAudit(List<DocResult> docs) {
@@ -719,7 +974,7 @@ class BaselineHarness {
     private void printClassification(List<DocResult> docs) {
         line("");
         rule();
-        line("CORPUS CLASSIFICATION by TableExtractor.extract (tagged+lattice) output");
+        line("CORPUS CLASSIFICATION by TableExtractor.extract (tagged+lattice), ALL-PAGES scope");
         rule();
         Map<String, Integer> buckets = new LinkedHashMap<>();
         for (String b : List.of("lattice", "tagged", "both", "neither")) buckets.put(b, 0);
@@ -762,8 +1017,16 @@ class BaselineHarness {
                 new Subset("icdar-EU", docs.stream().filter(d -> "icdar-eu".equals(d.source)).toList()));
     }
 
+    /** The same subset rule applied to another page scope's document list. Because
+     *  {@code DocResult#bucket} is pinned to the all-pages classification for both scopes (see
+     *  {@link #run}), a subset names the SAME documents in every scope. */
+    private static List<DocResult> subsetOf(List<DocResult> docs, String name) {
+        for (Subset s : subsets(docs)) if (s.name().equals(name)) return s.docs();
+        throw new IllegalArgumentException("unknown subset: " + name);
+    }
+
     /** The numbers the project should quote: PRIMARY protocol only, one line per configuration. */
-    private void printHeadline(List<DocResult> docs) {
+    private void printHeadline(Map<String, List<DocResult>> byScope) {
         line("");
         rule();
         line("HEADLINE -- PRIMARY PROTOCOL ONLY, DE-DUPLICATED GT, MACRO FIRST");
@@ -771,19 +1034,25 @@ class BaselineHarness {
         line("Primary protocol is POOLED end-to-end and PER-REGION (1:1) in region-given mode -- see");
         line("#primaryProtocol for why, and the FULL BASELINE table below for the other three");
         line("combinations of every row. The protocol column states it on every line.");
+        line("EVERY configuration appears TWICE: once per page scope. all-pages is the scope every");
+        line("published figure used; shipping-dflt is what a user with no --pages flag gets.");
         line("");
-        line("  %-26s %-18s %-11s %-7s %8s %8s %8s %8s %5s",
-                "config", "mode", "subset", "protocol", "MACRO", "microP", "microR", "microF1", "docs");
-        for (Subset s : subsets(docs)) {
+        line("  %-26s %-13s %-18s %-11s %-7s %8s %8s %8s %8s %5s",
+                "config", "page scope", "mode", "subset", "protocol",
+                "MACRO", "microP", "microR", "microF1", "docs");
+        for (Subset s : subsets(byScope.get(S_ALL))) {
             for (String config : List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM)) {
                 for (String mode : List.of(M_E2E, M_REGION, M_RERUN)) {
                     if (mode.equals(M_RERUN) && !isStreamConfig(config)) continue;
                     String protocol = primaryProtocol(mode);
-                    Acc a = aggregate(s.docs(), key(config, mode, protocol, G_DEDUP));
-                    if (a.docs == 0) continue;
-                    line("  %-26s %-18s %-11s %-7s %8.4f %8.4f %8.4f %8.4f %5d",
-                            trim(config, 26), mode, s.name(), protocol,
-                            a.macroF1(), a.microP(), a.microR(), a.microF1(), a.docs);
+                    for (String scope : SCOPES) {
+                        List<DocResult> sel = subsetOf(byScope.get(scope), s.name());
+                        Acc a = aggregate(sel, key(config, mode, protocol, G_DEDUP));
+                        if (a.docs == 0) continue;
+                        line("  %-26s %-13s %-18s %-11s %-7s %8.4f %8.4f %8.4f %8.4f %5d",
+                                trim(config, 26), scope, mode, s.name(), protocol,
+                                a.macroF1(), a.microP(), a.microR(), a.microF1(), a.docs);
+                    }
                 }
             }
         }
@@ -794,33 +1063,72 @@ class BaselineHarness {
         line("  Published region-given: Nurminen 0.9460, GTE 0.9624.");
     }
 
-    /** Every configuration under all four (protocol, GT) combinations. Primary row first. */
-    private void printFullTable(List<DocResult> docs) {
+    /**
+     * SHIPPING-CONFIG DELTA. What the default page selection costs, per configuration, at the primary
+     * protocol. This is the single number a user is owed: they run the CLI with no {@code --pages}
+     * flag and get the shipping column, not the all-pages column every published figure quoted.
+     */
+    private void printShippingDelta(Map<String, List<DocResult>> byScope) {
         line("");
         rule();
-        line("FULL BASELINE -- every configuration x mode x PROTOCOL x GROUND-TRUTH VIEW");
+        line("WHAT THE SHIPPING PAGE SELECTION COSTS (PRIMARY protocol, de-duplicated GT)");
+        rule();
+        line("dScope = shipping-dflt minus all-pages. NEGATIVE is expected and is not a regression in");
+        line("extraction: ground-truth tables on pages `--pages default` never opens cannot be found.");
+        line("It is the price of the default, and it belongs next to every headline figure.");
+        line("");
+        line("  %-11s %-26s %-18s %9s %9s %9s %9s %9s",
+                "subset", "config", "mode", "ALL MACRO", "SHIP MAC", "dMACRO", "ALL mic", "dmicro");
+        for (Subset s : subsets(byScope.get(S_ALL))) {
+            for (String config : reportConfigs()) {
+                for (String mode : List.of(M_E2E, M_REGION, M_RERUN)) {
+                    if (mode.equals(M_RERUN) && !isStreamConfig(config)) continue;
+                    String protocol = primaryProtocol(mode);
+                    Acc a = aggregate(s.docs(), key(config, mode, protocol, G_DEDUP));
+                    Acc b = aggregate(subsetOf(byScope.get(S_SHIP), s.name()),
+                            key(config, mode, protocol, G_DEDUP));
+                    if (a.docs == 0 || b.docs == 0) continue;
+                    line("  %-11s %-26s %-18s %9.4f %9.4f %+9.4f %9.4f %+9.4f",
+                            s.name(), trim(config, 26), mode,
+                            a.macroF1(), b.macroF1(), b.macroF1() - a.macroF1(),
+                            a.microF1(), b.microF1() - a.microF1());
+                }
+            }
+        }
+    }
+
+    /** Every configuration under all four (protocol, GT) combinations, in both page scopes. */
+    private void printFullTable(Map<String, List<DocResult>> byScope) {
+        line("");
+        rule();
+        line("FULL BASELINE -- every configuration x PAGE SCOPE x mode x PROTOCOL x GROUND-TRUTH VIEW");
         rule();
         line("Row order within a block is fixed: POOLED/dedup (PRIMARY), POOLED/raw, 1:1/dedup,");
         line("1:1/raw (= the pre-correction baseline, reproduces MetricFixHarness exactly).");
+        line("The all-pages rows are the ones comparable to every previously published figure; the");
+        line("shipping-dflt rows are the ones a user actually gets.");
 
-        for (Subset s : subsets(docs)) {
+        for (Subset s : subsets(byScope.get(S_ALL))) {
             List<String> configs = s.name().equals("ALL-77") || s.name().equals("borderless")
                     ? reportConfigs() : List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM);
             line("");
             line("--- subset %s (n=%d PDFs) ---", s.name(), s.docs().size());
-            line("  %-26s %-18s %-7s %-5s %8s %8s %8s %8s %5s %5s %5s",
-                    "config", "mode", "protocol", "GT", "MACRO", "microP", "microR", "microF1",
-                    "docs", "cov", "tbl");
+            line("  %-26s %-13s %-18s %-7s %-5s %8s %8s %8s %8s %5s %5s %5s",
+                    "config", "page scope", "mode", "protocol", "GT",
+                    "MACRO", "microP", "microR", "microF1", "docs", "cov", "tbl");
             for (String config : configs) {
                 for (String mode : List.of(M_E2E, M_REGION, M_RERUN)) {
                     if (mode.equals(M_RERUN) && !isStreamConfig(config)) continue;
                     for (String[] pg : PROTOCOL_ORDER) {
-                        Acc a = aggregate(s.docs(), key(config, mode, pg[0], pg[1]));
-                        if (a.docs == 0) continue;
-                        line("  %-26s %-18s %-7s %-5s %8.4f %8.4f %8.4f %8.4f %5d %5d %5d",
-                                trim(config, 26), mode, pg[0], pg[1],
-                                a.macroF1(), a.microP(), a.microR(), a.microF1(),
-                                a.docs, a.covered, a.scoredTables);
+                        for (String scope : SCOPES) {
+                            Acc a = aggregate(subsetOf(byScope.get(scope), s.name()),
+                                    key(config, mode, pg[0], pg[1]));
+                            if (a.docs == 0) continue;
+                            line("  %-26s %-13s %-18s %-7s %-5s %8.4f %8.4f %8.4f %8.4f %5d %5d %5d",
+                                    trim(config, 26), scope, mode, pg[0], pg[1],
+                                    a.macroF1(), a.microP(), a.microR(), a.microF1(),
+                                    a.docs, a.covered, a.scoredTables);
+                        }
                     }
                 }
             }
@@ -831,7 +1139,7 @@ class BaselineHarness {
     private void printDeltas(List<DocResult> docs) {
         line("");
         rule();
-        line("WHAT EACH CORRECTION IS WORTH (ALL-77 and borderless subsets)");
+        line("WHAT EACH PROTOCOL CORRECTION IS WORTH (ALL-77 and borderless, ALL-PAGES scope)");
         rule();
         line("  dPool  = POOLED minus 1:1, at fixed de-duplicated GT.");
         line("  dDedup = dedup minus raw, at fixed POOLED protocol.");
@@ -869,7 +1177,7 @@ class BaselineHarness {
     private void printRegressions(List<DocResult> docs) {
         line("");
         rule();
-        line("HONESTY CHECK -- where a correction LOWERS the reported score (|delta| > %.3f)",
+        line("HONESTY CHECK -- where a PROTOCOL correction LOWERS the score (|delta| > %.3f, all-pages)",
                 MATERIALITY);
         rule();
         int[] counts = new int[]{0, 0};   // {material, noise}
@@ -948,7 +1256,7 @@ class BaselineHarness {
     private void printPoolingMechanism(List<DocResult> docs) {
         line("");
         rule();
-        line("WHERE THE POOLING GAIN COMES FROM (ALL-77, end-to-end, de-duplicated GT)");
+        line("WHERE THE POOLING GAIN COMES FROM (ALL-77, end-to-end, dedup GT, ALL-PAGES scope)");
         rule();
         line("Bucket 1 is a CONTROL: with one ground-truth table and one hit there is no correspondence");
         line("to get wrong, so pooling must change nothing at all there. Buckets 2 and 3 separate the");
@@ -1003,7 +1311,7 @@ class BaselineHarness {
     private void printProtocolSelfCheck(List<DocResult> docs) {
         line("");
         rule();
-        line("PROTOCOL SELF-CHECK");
+        line("PROTOCOL SELF-CHECK (page scope %s)", docs.isEmpty() ? "?" : docs.get(0).scope);
         rule();
         int checked = 0, denomMismatch = 0, aliasMismatch = 0;
         List<String> configs = new ArrayList<>(List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM));
@@ -1074,6 +1382,30 @@ class BaselineHarness {
         }
     }
 
+    /**
+     * The whole shipping pipeline on ONE prose PDF, over exactly the pages
+     * {@code --pages default} would process, via the PRODUCTION wired call rather than a harness
+     * re-assembly of it. Returns {tables with the flag OFF, tables with the flag ON, pages processed}.
+     *
+     * <p>WHY THIS IS REPORTED. The published prose false-positive rate (0.060) is a PAGE 1 ONLY
+     * measurement, but the shipping default processes up to five pages. A prose PDF whose page 1 is
+     * clean and whose page 3 is not was counted clean. This row measures the rate on the page set the
+     * product actually opens.
+     */
+    private static int[] fullPipelineShipping(Path pdf) {
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            if (doc.getNumberOfPages() < 1) return new int[]{0, 0, 0};
+            List<Integer> pages = ShippingPages.select(doc).pages();
+            Map<Integer, List<TextPosition>> byPage = new LinkedHashMap<>();
+            for (int p : pages) byPage.put(p, TableTestPdfs.harvestGlyphs(doc, p - 1));
+            int off = TableExtractor.extract(doc, pages, byPage, false).tables.size();
+            int on = TableExtractor.extract(doc, pages, byPage, true).tables.size();
+            return new int[]{off, on, pages.size()};
+        } catch (Throwable t) {
+            return new int[]{0, 0, 0};   // unreadable prose file -> conservatively "no table"
+        }
+    }
+
     private void printProseAndTiming(List<GutterFinder> finders, List<Double> streamMs) {
         line("");
         rule();
@@ -1124,6 +1456,25 @@ class BaselineHarness {
                     arbFp / (double) prose.size());
             line("  arbitration DoS headroom on prose: max ruling candidates on one page=%d,"
                     + " max stream candidates=%d", maxRuledPerPage, maxStreamPerPage);
+
+            // SHIPPING PAGE SELECTION. Every rate above is page 1 only; the shipping default opens up
+            // to five pages, so it can find a false table the page-1 rate never sees. Measured with
+            // the production wired call TableExtractor.extract(doc, pages, glyphs, streamTables).
+            int shipOff = 0, shipOn = 0, shipPages = 0;
+            for (Path p : prose) {
+                int[] r = fullPipelineShipping(p);
+                if (r[0] > 0) shipOff++;
+                if (r[1] > 0) shipOn++;
+                shipPages += r[2];
+            }
+            line("  SAME sample under the SHIPPING page selection (%d pages total, %.2f/doc), via the",
+                    shipPages, shipPages / (double) prose.size());
+            line("  production wired call TableExtractor.extract(doc, pages, glyphs, streamTables):");
+            line("    flag OFF (tagged+lattice)    %d/%d = %.4f", shipOff, prose.size(),
+                    shipOff / (double) prose.size());
+            line("    flag ON  (+stream+arbitr.)   %d/%d = %.4f   <-- the rate the DEFAULT run has",
+                    shipOn, prose.size(), shipOn / (double) prose.size());
+            line("  The page-1 rows above are NOT the shipping rate; they are a page-1 measurement.");
         }
         List<Double> sorted = new ArrayList<>(streamMs);
         Collections.sort(sorted);
@@ -1170,5 +1521,11 @@ class BaselineHarness {
 
     private static String trim(String s, int n) {
         return s.length() <= n ? s : s.substring(0, n);
+    }
+
+    /** Keep the LAST n characters -- corpus ids share a long directory prefix, so the tail is the
+     *  part that identifies the document. */
+    private static String tail(String s, int n) {
+        return s.length() <= n ? s : s.substring(s.length() - n);
     }
 }

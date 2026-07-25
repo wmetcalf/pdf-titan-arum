@@ -238,6 +238,103 @@ final class TableExtractor {
     // recursing further -- a plausible-if-imperfect placement, never a crash.
     static final int MAX_SPLIT_DEPTH = 64;
 
+    // ------------------------------------------------------------------ prose false positives
+    //
+    // MEASUREMENT (lever 4). Over the project's 200-PDF real-world prose sample (page 1 only), the
+    // tagged+lattice configuration emitted >=1 table on 21/200 documents (0.1050) and the full
+    // arbitrated pipeline on 25/200 (0.1250) -- ordinary mail attachments, not tabular reports.
+    // Classifying all 21 by mechanism found that FIFTEEN are the TAGGED path (HTML-email layout
+    // <table>s that survived conversion into the PDF structure tree), of which twelve emit ONLY
+    // tables of rank below 2x2, and FOUR are lattice grids -- a drawn border box or a
+    // banner+disclaimer rule pair -- carrying 0, 1, 2 and 3 textful cells respectively. The
+    // remaining two documents genuinely contain tables (a vendor invoice, an attachment
+    // name/size list) and nothing here targets them.
+    //
+    // The two bounds below close 14 of those 21 documents. Both are precision-only rules on the
+    // "prefer MISSING a table over FABRICATING one" side of this project's hostile-input contract,
+    // and both were chosen so that the reference corpus's document-pooled adjacency macro F1 does
+    // not move AT ALL -- verified byte-identical for lattice+tagged (0.4718) and for the full
+    // arbitrated pipeline (0.8079/micro 0.8003). Full-pipeline prose false-positive rate over the
+    // 200-PDF sample: 0.1250 -> 0.0600; lattice+tagged alone 0.1050 -> 0.0350.
+    //
+    // Variants measured and REJECTED, recorded so the thresholds are not re-litigated blind:
+    //   * lattice "text must also span 2 distinct grid ROWS": prose FP identical, but lattice+tagged
+    //     macro 0.4718 -> 0.4716 (2 matched relations lost on icdar-eu/eu-024, 2 on eu-025 -- real
+    //     tables whose data rows failed text assignment, leaving only a textful header row -- against
+    //     14 spurious relations removed on eu-012).
+    //   * lattice "at least 4 textful cells": removes one further prose false positive, but also
+    //     removes the legitimate 2x2-with-column-spanning-header shape (3 textful cells).
+    //   * dropping a lattice grid with NO text at all: zero measured prose-FP benefit (no sampled
+    //     document has a textless-only lattice hit), and it costs full+arbitration macro
+    //     0.8079 -> 0.8077, because a textless ruled grid currently suppresses an overlapping stream
+    //     candidate in both merge rules. Left in place -- see #textContradictsColumnStructure.
+
+    /** Minimum structural rank a TAGGED table must reach to be emitted, per dimension. The lattice
+     *  path enforced this from the start; the tagged path did not, and 12 of the 21 measured prose
+     *  false positives are tagged tables of rank 1x1, Nx1 or 1xN (a paragraph in a layout cell, a
+     *  "View in OneDrive" button, a stack of prose blocks). A rank-1 table declares no relation in
+     *  the collapsed dimension at all. COST ON THE REFERENCE CORPUS: exactly zero, and provably so
+     *  -- the tagged path finds 0 tables on all 77 ICDAR/CSV scoring PDFs (measured, all pages), so
+     *  no corpus output can change. */
+    static final int MIN_TAGGED_RANK = 2;
+
+    /** Minimum number of DISTINCT grid COLUMNS a LATTICE table's TEXT-CARRYING cells must occupy,
+     *  once it carries any text at all. The geometry gate in {@link #buildTable} has already
+     *  established that two columns of RULINGS were drawn; this asks the CONTENT to support that
+     *  claim. When every textful cell anchors in a single column, the vertical rulings are a border,
+     *  not column separators -- precisely the measured prose shape: full-width prose blocks stacked
+     *  inside a drawn box, each anchoring in column 0. Three of the four measured lattice prose
+     *  false positives fail it: a bordered ID-verification notice (1 textful cell), a bordered
+     *  attachment-expiry notice (1 textful cell), and a full-width banner plus full-width disclaimer
+     *  separated by a rule (2 textful cells sharing anchor column 0).
+     *
+     *  <p>Deliberately NOT mirrored on rows, and deliberately NOT applied to a grid with no text at
+     *  all -- both variants were implemented and measured, and both cost corpus macro F1 for no
+     *  additional prose-FP benefit. See the measurement block above this constant. */
+    static final int MIN_LATTICE_TEXTFUL_COLUMNS = 2;
+
+    /** True when {@code s} contains at least one non-whitespace character. Early-exit scan rather
+     *  than {@code trim().isEmpty()}: never allocates a copy of a (bounded but potentially large)
+     *  cell string. Total cost across a page is O(total filled cell text), which the region/glyph
+     *  budgets already bound -- no new DoS surface. */
+    private static boolean hasText(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isWhitespace(s.charAt(i))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * True when {@code t} carries text but that text CONTRADICTS the drawn column structure -- i.e.
+     * at least one cell is textful, yet every textful cell anchors in fewer than {@link
+     * #MIN_LATTICE_TEXTFUL_COLUMNS} distinct grid columns. Uses each textful cell's ANCHOR column,
+     * never its span: a cell spanning the full width of the grid still contributes exactly one
+     * column, which is what makes a full-width banner + full-width disclaimer pair fail this test
+     * while a column-spanning header sitting above two real columns passes it.
+     *
+     * <p>A grid with NO textful cell at all returns FALSE (not a contradiction): there is no content
+     * evidence either way, dropping such grids was measured to buy nothing on the prose sample, and
+     * it costs corpus macro F1 because a textless ruled grid currently suppresses an overlapping
+     * stream candidate in both merge rules. Removing only what there is positive evidence against is
+     * also the minimum-change reading of this project's "prefer missing over fabricating" contract
+     * -- an all-empty grid fabricates no CONTENT, since every cell of it renders as "".
+     *
+     * <p>Bounded work: one int set over t.cells (already capped at {@link #MAX_CELLS_PER_TABLE})
+     * plus one early-exit scan per cell string (total O(filled cell text), already bounded by the
+     * region/glyph budgets). Short-circuits as soon as the column count is reached.
+     */
+    private static boolean textContradictsColumnStructure(TableHit t) {
+        Set<Integer> colsWithText = new HashSet<>();
+        for (CellHit c : t.cells) {
+            if (!hasText(c.text)) continue;
+            if (colsWithText.add(c.col) && colsWithText.size() >= MIN_LATTICE_TEXTFUL_COLUMNS) {
+                return false;
+            }
+        }
+        return !colsWithText.isEmpty();
+    }
+
     // PR re-review P2 (DoS): collectByType's FIX 1 identity-memoization only dedups node visits
     // WITHIN one call -- a fresh IdentityHashMap-backed visited set is created per call (see that
     // method's doc). extractTagged calls collectByType ONCE PER Table element found (the "Table"
@@ -1937,6 +2034,20 @@ final class TableExtractor {
             try {
                 TableHit t = buildTable(pageNum, comp, "lattice");
                 renderViews(t);
+                // PROSE FALSE POSITIVES (lever 4): a drawn grid whose text all anchors in ONE column
+                // is a boxed paragraph / banner-rule pair -- see MIN_LATTICE_TEXTFUL_COLUMNS.
+                // Checked here rather than in buildTable because buildTable also runs from
+                // selectKeptTables' geometry-only pass, BEFORE any cell text exists. Silent (no
+                // result.truncated): a degenerate-content decision, not a hostile-input cap.
+                //
+                // ORDER MATTERS, and it is deliberately AFTER renderViews: renderViews carries the
+                // defense-in-depth grid-product cap, whose trip MUST still set Result.truncated
+                // even for a component this content rule would also have dropped (checking content
+                // first silently swallowed that hostile-input signal -- caught by
+                // TableGeometryTest.renderKeptTablesIsolatesGridProductCapFromOthers). renderViews'
+                // own cost is already bounded by MAX_CELLS_PER_TABLE, so paying it for a table
+                // about to be dropped adds no unbounded work.
+                if (textContradictsColumnStructure(t)) continue;
                 // FINAL DECISION (this fix): never drop a lattice table because it overlaps a
                 // tagged one -- ALWAYS add it. Tagged extraction (see extract()) always runs to
                 // completion for every page BEFORE this per-page lattice loop starts, so every
@@ -2804,6 +2915,13 @@ final class TableExtractor {
             result.truncated = true;
             return null;
         }
+
+        // PROSE FALSE POSITIVES (lever 4): a tagged "table" of rank below 2x2 is an HTML layout
+        // wrapper, not a table -- see MIN_TAGGED_RANK for the measurement and for why this costs
+        // nothing on the reference corpus. SILENT reject (no result.truncated): this is a
+        // degenerate-shape decision like the rows.isEmpty()/all-text-empty/colCount==0 rejects
+        // above, not a hostile-input cap, and the lattice path covers the same page unconditionally.
+        if (rows.size() < MIN_TAGGED_RANK || colCount < MIN_TAGGED_RANK) return null;
 
         TableHit t = new TableHit();
         t.page = pageNum;

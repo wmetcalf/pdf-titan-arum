@@ -49,6 +49,47 @@ final class TableTestPdfs {
         cs.stroke();
     }
 
+    // ------------------------------------------------------------------ tagged-rank scaffolding
+    //
+    // TableExtractor.MIN_TAGGED_RANK (lever 4) requires an emitted TAGGED table to have at least
+    // two rows AND at least two columns -- the same 2x2 minimum the lattice path has always
+    // demanded -- because 12 of the 21 measured prose false positives on the 200-PDF real-world
+    // sample were tagged layout tables of rank 1x1, Nx1 or 1xN. Several fixtures below predate
+    // that rule and build a rank-1 tagged table purely as SCAFFOLDING for some other property
+    // (page resolution, glyph budgets, the per-page table cap, whether a tagged table suppresses a
+    // lattice one). The two helpers here lift such a fixture to rank 2x2 WITHOUT disturbing the
+    // property it exists to test:
+    //
+    //   * declareColSpan2 adds a /ColSpan 2 table attribute to an existing content cell. Spans are
+    //     declarative -- TableExtractor.buildTaggedTable reads them for grid placement only, and a
+    //     cell's bbox still comes from its own resolved glyphs -- so the cell's TEXT, its BBOX and
+    //     the tagged cell FOOTPRINT every geometry assertion measures are all byte-identical.
+    //   * appendEmptyRankFillerRow adds one TR whose single TD references no marked content at all:
+    //     no text, no bbox, so it contributes nothing to the table bbox, nothing to the cell
+    //     footprint overlap, and nothing to any text assertion. It only raises rowCount to 2.
+    //
+    // Together they turn "one cell of real content" into a legal 2x2-rank tagged table -- the shape
+    // a real HTML-to-PDF converter emits for a one-cell layout row -- while every glyph, bbox and
+    // span the fixture's own test asserts on stays exactly where it was.
+
+    /** Declares {@code /ColSpan 2} on an existing TD/TH, raising the table's colCount to 2. */
+    static void declareColSpan2(PDStructureElement cell) {
+        PDTableAttributeObject att = new PDTableAttributeObject();
+        att.setColSpan(2);
+        cell.addAttribute(att);
+    }
+
+    /** Appends one content-free TR/TD to {@code table}, raising its rowCount by 1. {@code page} may
+     *  be null for fixtures that deliberately leave /Pg to ancestor inheritance. */
+    static void appendEmptyRankFillerRow(PDStructureElement table, PDPage page) {
+        PDStructureElement tr = new PDStructureElement("TR", table);
+        if (page != null) tr.setPage(page);
+        table.appendKid(tr);
+        PDStructureElement cell = new PDStructureElement("TD", tr);
+        if (page != null) cell.setPage(page);
+        tr.appendKid(cell); // no /K -- no marked content, no text, no bbox
+    }
+
     static void text(PDPageContentStream cs, float x, float y, String s) throws IOException {
         cs.beginText();
         cs.setFont(HELV, 10);
@@ -570,6 +611,8 @@ final class TableTestPdfs {
             cell.setPage(page);
             cell.getCOSObject().setInt(COSName.K, 0);
             tr.appendKid(cell);
+            declareColSpan2(cell);              // MIN_TAGGED_RANK scaffolding -- see the helpers' doc
+            appendEmptyRankFillerRow(table, page);
 
             doc.save(file.toFile());
         }
@@ -915,6 +958,12 @@ final class TableTestPdfs {
             cell1.setPage(page);
             cell1.getCOSObject().setInt(COSName.K, 1);
             tr1.appendKid(cell1);
+            // MIN_TAGGED_RANK scaffolding (see declareColSpan2's doc): the two rows already exist;
+            // declaring ColSpan 2 on each content cell raises colCount to 2 without moving a single
+            // glyph or changing either cell's own bbox, so the tagged cell FOOTPRINT this fixture
+            // exists to measure is untouched.
+            declareColSpan2(cell0);
+            declareColSpan2(cell1);
 
             doc.save(file.toFile());
         }
@@ -981,6 +1030,12 @@ final class TableTestPdfs {
             cell1.setPage(page);
             cell1.getCOSObject().setInt(COSName.K, 1);
             tr1.appendKid(cell1);
+            // MIN_TAGGED_RANK scaffolding (see declareColSpan2's doc): the two rows already exist;
+            // declaring ColSpan 2 on each content cell raises colCount to 2 without moving a single
+            // glyph or changing either cell's own bbox, so the tagged cell FOOTPRINT this fixture
+            // exists to measure is untouched.
+            declareColSpan2(cell0);
+            declareColSpan2(cell1);
 
             doc.save(file.toFile());
         }
@@ -1018,6 +1073,8 @@ final class TableTestPdfs {
             cell.setPage(page);
             cell.getCOSObject().setInt(COSName.K, 0);
             tr.appendKid(cell);
+            declareColSpan2(cell);              // MIN_TAGGED_RANK scaffolding -- see the helpers' doc
+            appendEmptyRankFillerRow(table, page);
 
             doc.save(file.toFile());
         }
@@ -1141,6 +1198,8 @@ final class TableTestPdfs {
             for (int i = 0; i < referenceCount; i++) k.add(COSInteger.get(0));
             cell.getCOSObject().setItem(COSName.K, k);
             tr.appendKid(cell);
+            declareColSpan2(cell);              // MIN_TAGGED_RANK scaffolding -- see the helpers' doc
+            appendEmptyRankFillerRow(table, page);
 
             doc.save(file.toFile());
         }
@@ -1555,6 +1614,8 @@ final class TableTestPdfs {
                 cell.setPage(page);
                 cell.getCOSObject().setInt(COSName.K, i);
                 tr.appendKid(cell);
+                declareColSpan2(cell);          // MIN_TAGGED_RANK scaffolding -- see the helpers' doc
+                appendEmptyRankFillerRow(table, page);
             }
             doc.save(file.toFile());
         }
@@ -1833,6 +1894,212 @@ final class TableTestPdfs {
                         cs.endText();
                     }
                 }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    // ------------------------------------------------------------------ prose false-positive
+    // ------------------------------------------------------------------ fixtures (lever 4)
+    //
+    // The three shapes measured to account for 19 of the 21 lattice+tagged false positives over
+    // the 200-PDF real-world prose sample (see LatticeFpProbe's own classification): an HTML-email
+    // layout table with a single cell, the same with a single COLUMN of stacked cells, and a drawn
+    // border box whose grid carries fewer textful cells than the 2x2 minimum the lattice path
+    // already demands.
+
+    /**
+     * HTML-email layout pattern: {@code Table -> TR -> TD} carrying ONE cell whose content is an
+     * ordinary paragraph of prose. This is the single most common prose false positive on the
+     * real-world sample (a marketing/notification email converted to PDF wraps its body text in a
+     * {@code <table>} used purely for layout). Structurally a 1x1 "table"; it has no second row
+     * and no second column, so it expresses no tabular relation at all.
+     */
+    static void taggedSingleCellLayoutTable(Path file) throws IOException {
+        taggedLayoutTable(file, 1, 1);
+    }
+
+    /**
+     * The same layout pattern one step less degenerate: {@code rows} TRs each with exactly ONE TD
+     * -- a single COLUMN of stacked prose blocks (header banner / body / footer disclaimer), which
+     * is how the majority of the sampled phishing-mail PDFs are authored. Nx1: no column relation
+     * exists.
+     */
+    static void taggedSingleColumnLayoutTable(Path file) throws IOException {
+        taggedLayoutTable(file, 3, 1);
+    }
+
+    /** {@code rows} x {@code cols} tagged table, every cell holding a short prose sentence. */
+    static void taggedLayoutTable(Path file, int rows, int cols) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            int mcid = 0;
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                for (int r = 0; r < rows; r++) {
+                    for (int c = 0; c < cols; c++) {
+                        COSDictionary d = new COSDictionary();
+                        d.setInt(COSName.MCID, mcid++);
+                        cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d));
+                        text(cs, 60 + c * 200, 700 - r * 40,
+                                "Dear Customer, please review the attached document " + r + c);
+                        cs.endMarkedContent();
+                    }
+                }
+            }
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+            mcid = 0;
+            for (int r = 0; r < rows; r++) {
+                PDStructureElement tr = new PDStructureElement("TR", table);
+                tr.setPage(page);
+                table.appendKid(tr);
+                for (int c = 0; c < cols; c++) {
+                    PDStructureElement cell = new PDStructureElement("TD", tr);
+                    cell.setPage(page);
+                    cell.getCOSObject().setInt(COSName.K, mcid++);
+                    tr.appendKid(cell);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * Drawn "boxed paragraph": a bordered rectangle with one internal horizontal rule and one
+     * internal vertical rule, so the lattice path resolves a 2x2 grid of CellRects, but only ONE
+     * cell carries any text -- and that text is a long prose paragraph, not a field value. The
+     * measured real-world instances of this shape (an ID-verification notice inside a border, a
+     * ShareFile expiry warning inside a border, a full-width banner + full-width disclaimer) carry
+     * 1 to 3 textful cells out of 4 to 21 grid positions.
+     *
+     * @param textfulCells how many of the four cells get text (1..4)
+     */
+    static void latticeBoxedParagraph(Path file, int textfulCells) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 640, 580}) line(cs, 60, y, 460, y);
+                for (float x : new float[]{60, 260, 460}) line(cs, x, 700, x, 580);
+                String prose = "Please do not reply to this automated message. Your account "
+                        + "requires verification before the attached statement can be viewed.";
+                int written = 0;
+                for (int r = 0; r < 2 && written < textfulCells; r++) {
+                    for (int c = 0; c < 2 && written < textfulCells; c++) {
+                        // long prose, wrapped over three short lines inside the cell
+                        for (int ln = 0; ln < 3; ln++) {
+                            int from = ln * prose.length() / 3;
+                            int to = Math.min(prose.length(), (ln + 1) * prose.length() / 3);
+                            text(cs, 65 + c * 200, 690 - r * 60 - ln * 14, prose.substring(from, to));
+                        }
+                        written++;
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * The measured real-world shape behind two of the four lattice prose false positives: a
+     * full-width banner block and a full-width disclaimer block, separated by a drawn rule and
+     * enclosed by a border, so the lattice path resolves a grid with an internal vertical ruling
+     * (from the border-plus-rule intersection pattern) but both prose blocks anchor in the SAME
+     * grid column. Two textful cells, two rows, ONE column of text.
+     */
+    static void latticeFullWidthBannerAndDisclaimer(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                // border + three internal horizontal rules, and ONE internal vertical ruling that
+                // reaches only the MIDDLE band -- so the top and bottom bands are each a single
+                // full-width (colSpan 2) cell, exactly the measured real-world geometry.
+                for (float y : new float[]{700, 660, 620, 580}) line(cs, 60, y, 460, y);
+                for (float x : new float[]{60, 460}) line(cs, x, 700, x, 580);
+                line(cs, 260, 660, 260, 620);
+                text(cs, 65, 685, "Account Help Fees Security Accessibility Privacy Legal Contact");
+                text(cs, 65, 600, "Please do not reply to this automated message. Your account "
+                        + "requires verification.");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * A fully ruled 3x3 grid whose ONLY textful row is the header -- the shape that decided
+     * {@code TableExtractor.MIN_LATTICE_TEXTFUL_COLUMNS} not to mirror itself on rows. Real ruled
+     * tables on the ICDAR corpus look like this whenever the data rows' glyphs fail cell assignment
+     * (icdar-eu/eu-012, eu-024, eu-025), and the header row alone still yields correct horizontal
+     * adjacency relations, so this must be emitted.
+     */
+    static void latticeHeaderRowOnly(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) line(cs, x, 700, x, 610);
+                text(cs, 55, 680, "Item");
+                text(cs, 155, 680, "Qty");
+                text(cs, 255, 680, "Price");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * WORST CASE for the prose-FP column rule's scan (see {@code
+     * TableExtractor.MIN_LATTICE_TEXTFUL_COLUMNS}): an {@code n}x{@code n} ruled grid where every
+     * single cell holds {@code spacesPerCell} SPACE glyphs and nothing else. Whitespace-only text is
+     * the only input for which {@code hasText}'s early exit never fires, so every character of every
+     * cell must be scanned; and because no cell is textful, the distinct-column short circuit never
+     * fires either, so all (n-1)^2 cells are visited. Contrast fixture: pass {@code textful=true} to
+     * put a real glyph in each cell instead, which lets both short circuits fire immediately.
+     */
+    static void ruledGridWithWhitespaceOnlyCells(Path file, int n, int spacesPerCell,
+                                                 boolean textful) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            float step = 6f, x0 = 20f, yTop = 770f;
+            String pad = (textful ? "x" : " ").repeat(Math.max(1, spacesPerCell));
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.4f);
+                for (int i = 0; i < n; i++) {
+                    float y = yTop - i * step;
+                    line(cs, x0, y, x0 + (n - 1) * step, y);
+                }
+                for (int j = 0; j < n; j++) {
+                    float x = x0 + j * step;
+                    line(cs, x, yTop, x, yTop - (n - 1) * step);
+                }
+                for (int i = 0; i < n - 1; i++) {
+                    for (int j = 0; j < n - 1; j++) {
+                        text(cs, x0 + j * step + 1f, yTop - i * step - step + 1f, pad);
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /** A fully ruled 3x3 grid with no text anywhere -- an empty form/table skeleton. */
+    static void latticeEmptyGrid(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) line(cs, x, 700, x, 610);
             }
             doc.save(file.toFile());
         }

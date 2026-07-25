@@ -745,18 +745,29 @@ class TableTaggedTest {
         // silent-data-loss class FIX 2 exists to close, reintroduced via geometry. IoU fixes this:
         // the ruled table's area is tiny relative to the inflated tagged bbox's area, so
         // IoU ~= 0.02, far under the dedup threshold -- both tables must survive.
+        //
+        // LEVER 4 UPDATE (prose false positives). This fixture's tagged table is rank 1x1 (one TR,
+        // one TD), so TableExtractor.MIN_TAGGED_RANK now rejects it before it is ever emitted --
+        // that rule exists because 12 of the 21 measured tagged+lattice false positives on the
+        // 200-PDF real-world prose sample are exactly this shape. The property this test exists for
+        // is UNCHANGED and still asserted in full below: the genuinely distinct ruled table must
+        // still be emitted, with its real rows, and must not be flagged as a likely duplicate. What
+        // changed is that the degenerate 1-cell tagged table it could have been suppressed BY is now
+        // suppressed itself -- a strictly stronger outcome, asserted explicitly. The general
+        // property (a tagged table whose OUTER bbox is inflated away from its real cell footprint
+        // must not suppress a distinct ruled table inside it) remains covered end-to-end at ranks
+        // the extractor still emits by the hollow-middle, spread-nine-cell and partial-overlap
+        // fixtures below, whose tagged tables have 2 and 9 real cells.
         Path pdf = tmp.resolve("sparse_tagged_inflated_bbox.pdf");
         TableTestPdfs.taggedSparseTwoMcidCellPlusSeparateRuledTable(pdf);
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
-            assertEquals(2, r.tables.size(),
+            assertEquals(1, r.tables.size(),
                     "the distinct ruled table must NOT be dropped just because its centroid falls "
-                            + "inside a sparse tagged cell's inflated bbox: " + r.tables);
-
-            TableExtractor.TableHit tagged = r.tables.stream()
-                    .filter(t -> "tagged".equals(t.extractionMethod))
-                    .findFirst().orElseThrow(() -> new AssertionError("sparse tagged table missing: " + r.tables));
-            assertEquals("A\nB", tagged.cells.get(0).text, "sanity: both far-apart MCIDs resolved into the one sparse cell");
+                            + "inside a sparse tagged cell's inflated bbox; and the rank-1x1 sparse "
+                            + "tagged table itself must not be emitted at all: " + r.tables);
+            assertTrue(r.tables.stream().noneMatch(t -> "tagged".equals(t.extractionMethod)),
+                    "a rank-1x1 tagged layout table must be rejected by MIN_TAGGED_RANK: " + r.tables);
 
             TableExtractor.TableHit lattice = r.tables.stream()
                     .filter(t -> "lattice".equals(t.extractionMethod))
@@ -779,19 +790,22 @@ class TableTaggedTest {
         // tagged bbox". The cell-count comparability guard closes this: the sparse tagged table
         // has only 1 real cell, the ruled table has 9 -- far from comparable -- so the ruled table
         // must survive no matter how much of the tagged bbox's area it fills.
+        //
+        // LEVER 4 UPDATE: see sparseTaggedCellInflatedBboxDoesNotSuppressDistinctRuledTable's own
+        // note -- this fixture's tagged table is likewise rank 1x1 and so is now rejected by
+        // TableExtractor.MIN_TAGGED_RANK before emission. Every assertion about the LARGE distinct
+        // ruled table (present, 9 real cells, correct rows, unflagged) is kept verbatim; the
+        // 1-cell-tagged side becomes an explicit assertion that the degenerate table is suppressed.
         Path pdf = tmp.resolve("sparse_tagged_large_ruled.pdf");
         TableTestPdfs.taggedSparseTwoMcidCellPlusSeparateLargeRuledTable(pdf);
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
-            assertEquals(2, r.tables.size(),
+            assertEquals(1, r.tables.size(),
                     "a large, genuinely distinct 9-cell ruled table must NOT be dropped just because "
-                            + "it fills most of a 1-cell sparse tagged table's inflated bbox: " + r.tables);
-
-            TableExtractor.TableHit tagged = r.tables.stream()
-                    .filter(t -> "tagged".equals(t.extractionMethod))
-                    .findFirst().orElseThrow(() -> new AssertionError("sparse tagged table missing: " + r.tables));
-            assertEquals(1, tagged.cells.size(), "sanity: the sparse tagged table has only its own 1 real cell");
-            assertEquals("A\nB", tagged.cells.get(0).text, "sanity: both far-apart MCIDs resolved into the one sparse cell");
+                            + "it fills most of a 1-cell sparse tagged table's inflated bbox; and the "
+                            + "rank-1x1 sparse tagged table itself must not be emitted: " + r.tables);
+            assertTrue(r.tables.stream().noneMatch(t -> "tagged".equals(t.extractionMethod)),
+                    "a rank-1x1 tagged layout table must be rejected by MIN_TAGGED_RANK: " + r.tables);
 
             TableExtractor.TableHit lattice = r.tables.stream()
                     .filter(t -> "lattice".equals(t.extractionMethod))
@@ -1023,6 +1037,12 @@ class TableTaggedTest {
         mcr.setMCID(0);
         cell.appendKid(mcr);
         tr.appendKid(cell);
+        // MIN_TAGGED_RANK scaffolding (see TableTestPdfs.declareColSpan2's doc). The filler row is
+        // added with a null page so it keeps this fixture's whole point intact: no TR or TD in this
+        // table ever calls setPage(), leaving /Pg resolvable only by ancestor inheritance or by the
+        // content cell's own MCR.
+        TableTestPdfs.declareColSpan2(cell);
+        TableTestPdfs.appendEmptyRankFillerRow(table, null);
         return cell;
     }
 

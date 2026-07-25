@@ -31,6 +31,47 @@ final class StreamTableExtractor {
         final List<Word> words = new ArrayList<>();
     }
 
+    /**
+     * The page's /Rotate frame, so this class can report geometry in the SAME visual, /Rotate-applied
+     * top-left frame every other path in {@link TableExtractor} reports in.
+     *
+     * <p>WHY THIS EXISTS. {@link #buildWords} reads {@code getXDirAdj()/getYDirAdj()}, which are
+     * /Rotate-BLIND -- they track each glyph's own text DIRECTION, not the page's {@code /Rotate}
+     * (see {@link TableExtractor#applyPageRotation}'s doc). The lattice path maps both rulings and
+     * text through {@code applyPageRotation}; the tagged path was explicitly fixed to do the same
+     * (see {@link TableExtractor}'s "FIX 1 (Codex P2)" writeup). Without this, a {@code /Rotate 90}
+     * page put stream boxes in a DIFFERENT frame than the lattice/tagged boxes in the very same
+     * report.json -- measured: the same table reported at [170,30,255.8,355] by lattice and
+     * [30,50,355,135.8] by stream, whose x1 exceeds the visual page width -- so
+     * {@code contestsSameRegion} (a bbox intersection ACROSS the two frames) saw no contest and both
+     * contradictory answers were emitted.
+     *
+     * <p>Detection itself deliberately still runs in the {@code getXDirAdj()/getYDirAdj()} frame:
+     * that frame is the one in which a line of text reads left-to-right, which is what line
+     * clustering and vertical-gutter search require. Only the FINAL reported geometry (each
+     * {@link TableExtractor.CellHit#bbox} and the {@link TableExtractor.TableHit#bbox}) is mapped,
+     * exactly as {@link TableExtractor#splitClumpedCells} already maps {@code buildWords} output
+     * before comparing it against visual-frame cell rects.
+     */
+    static final class PageFrame {
+        final int rotation;
+        final float unrotatedW, unrotatedH;
+        PageFrame(int rotation, float unrotatedW, float unrotatedH) {
+            this.rotation = rotation; this.unrotatedW = unrotatedW; this.unrotatedH = unrotatedH;
+        }
+        /** No /Rotate: the mapping is the identity, i.e. exactly the pre-fix behaviour. */
+        static final PageFrame IDENTITY = new PageFrame(0, 0f, 0f);
+
+        /** Maps an axis-aligned box, normalising the corners (a 90/270 rotation swaps the axes). */
+        float[] map(float x0, float y0, float x1, float y1) {
+            if (rotation == 0) return new float[]{x0, y0, x1, y1};
+            float[] a = TableExtractor.applyPageRotation(x0, y0, rotation, unrotatedW, unrotatedH);
+            float[] b = TableExtractor.applyPageRotation(x1, y1, rotation, unrotatedW, unrotatedH);
+            return new float[]{Math.min(a[0], b[0]), Math.min(a[1], b[1]),
+                               Math.max(a[0], b[0]), Math.max(a[1], b[1])};
+        }
+    }
+
     static void enforceGlyphCap(int n) {
         if (n > MAX_STREAM_GLYPHS) throw new TableExtractor.RulingOverflowException();
     }
@@ -52,8 +93,39 @@ final class StreamTableExtractor {
             String u = tp.getUnicode();
             if (u == null || u.isEmpty()) continue;
             float gx0 = tp.getXDirAdj();
-            float gy0 = tp.getYDirAdj();                 // top of glyph, top-left origin
+            // FRAME (fix): getYDirAdj() is pageHeight - textMatrix.getTranslateY(), and the text
+            // matrix' translate is the glyph ORIGIN -- i.e. the BASELINE in the top-left, y-down
+            // frame, NOT the top of the glyph. The rest of this codebase already treats it that way:
+            // TableExtractor#fillCellsFromPositions uses getYDirAdj() - getHeightDir()/2 as the glyph
+            // MIDPOINT, and TableExtractor#resolveCellText builds the tagged bbox as [getYDirAdj()-h,
+            // getYDirAdj()]. This method used to add the height DOWNWARD from getYDirAdj(), which put
+            // every stream Word (and so every stream CellHit/TableHit bbox in report.json) roughly one
+            // glyph height BELOW the ink it describes -- almost entirely outside it (measured on a
+            // 12pt Helvetica glyph: reported [50.00, 56.94] against true ink [41.38, 52.48]).
+            // TableExtractor#contestsSameRegion compares these boxes against correctly-framed lattice
+            // boxes, so every arbitration contest was biased by about half a row.
+            //
+            // MEASURED CONSEQUENCE OF THE FIX, stated plainly because it is NOT confined to reporting.
+            // A Word's y extent also feeds buildLines' line clustering, and the fix flips the
+            // direction a Line's box grows: the old box ran from the min BASELINE down to max
+            // baseline+h (reaching into the gap BELOW, covering no ink there), the fixed one runs from
+            // min baseline-h up to the max baseline (covering the real ink). Where a line mixes glyph
+            // heights that changes which neighbouring row's words it absorbs, which changes Step A/A'
+            // block segmentation. On the 77-document benchmark 16 documents move: 14 up (us-022
+            // +0.3295, the largest -- it now reads 13 rows where it read 8), 2 down badly (us-015
+            // -0.4417 and eu-011 -0.3386, both over-merges; eu-011 gains a candidate on a page whose
+            // ground truth has no table). Net: stream alone 0.6562 -> 0.6575 all-pages, positional
+            // merge 0.7393 -> 0.7429, region-given 0.6622 -> 0.6931, but full+ARBITRATION 0.8118 ->
+            // 0.8070 and the prose false-positive rate 13/200 -> 15/200. In other words the extracted
+            // CONTENT improved on every protocol that does not arbitrate, and only the arbitration
+            // DECISION got worse -- because Step A/A' and the arbitration thresholds were all
+            // calibrated against the biased frame. Shipped anyway: the frame was simply wrong, and
+            // re-calibrating those constants against the corrected frame is a separate change with its
+            // own search and its own tests (the natural candidate is making buildLines cluster on
+            // BASELINES, which is frame-invariant, so the two concerns stop being coupled).
+            float gBaseline = tp.getYDirAdj();           // baseline, top-left origin
             float gh  = Math.max(1f, tp.getHeightDir());
+            float gy0 = gBaseline - gh;                  // top of glyph
             float gw  = tp.getWidthDirAdj();
             // getTextMatrix() is (per its own javadoc) NOT the raw "Tm" operator matrix despite the
             // name -- it's the full effective text-RENDERING matrix (Trm = Tfs-scaled Tm x CTM), so
@@ -77,7 +149,11 @@ final class StreamTableExtractor {
             float fs  = Math.max(1f, tp.getTextMatrix().getScalingFactorY());
             float space = Math.max(tp.getWidthOfSpace(), 0.25f * fs);
             boolean whitespace = u.trim().isEmpty();
-            boolean newLine = cur != null && Math.abs(gy0 - prevBaseline) > 0.5f * fs;
+            // NOTE the newLine test (and prevBaseline below) deliberately still compare BASELINES,
+            // exactly as before the frame fix -- comparing glyph TOPS instead would make the line
+            // break depend on font-size changes within one line. Word GROUPING is therefore
+            // byte-identical to the pre-fix behaviour; only each Word's y extent moved.
+            boolean newLine = cur != null && Math.abs(gBaseline - prevBaseline) > 0.5f * fs;
             boolean gap     = cur != null && (gx0 - prevX1) > 0.30f * space;
             if (cur == null || whitespace || newLine || gap) {
                 if (cur != null) {
@@ -86,15 +162,15 @@ final class StreamTableExtractor {
                 }
                 if (whitespace) { cur = null; continue; }
                 cur = new Word();
-                cur.x0 = gx0; cur.y0 = gy0; cur.x1 = gx0 + gw; cur.y1 = gy0 + gh;
+                cur.x0 = gx0; cur.y0 = gy0; cur.x1 = gx0 + gw; cur.y1 = gBaseline;
                 cur.text = u;
             } else {
                 cur.x1 = gx0 + gw;
                 cur.y0 = Math.min(cur.y0, gy0);
-                cur.y1 = Math.max(cur.y1, gy0 + gh);
+                cur.y1 = Math.max(cur.y1, gBaseline);
                 cur.text += u;
             }
-            prevX1 = gx0 + gw; prevBaseline = gy0;
+            prevX1 = gx0 + gw; prevBaseline = gBaseline;
         }
         if (cur != null) {
             finishWord(cur, out);
@@ -796,8 +872,54 @@ final class StreamTableExtractor {
         String hardReject;
     }
 
+    /**
+     * Drop every DECLARED column that ends up with no word in it, returning the surviving gutter
+     * list (the caller's list itself when nothing was dropped, so the common case allocates nothing).
+     *
+     * <p>WHY THIS IS NEEDED. {@code extractPage} computes the band from the UNTRIMMED block and then
+     * scores the TRIMMED lines, so a column whose only content was a trimmed edge line survives in
+     * {@code colBounds} with ZERO words. {@link #scoreGrid}'s column-consistency term only requires
+     * {@code filled >= max(2, cols-1)}, so ONE permanently empty column is free, and it still counts
+     * towards {@code colCount} -- which {@link TableExtractor#arbitrate}'s clause 5 reads as "stream
+     * resolved a column the rulings missed", and {@code confidenceFloorFor} reads as evidence of a
+     * wide grid. REPRODUCED: a grid with an entirely empty 4th declared column scored 0.950 and took
+     * a region away from a fully-ruled, complete 3-column lattice table.
+     *
+     * <p>An empty column is removed by dropping ONE of its two boundaries, merging its (empty) span
+     * into a neighbour -- never by moving a boundary, so no word ever changes column. Two linear
+     * passes, no iteration to a fixed point: the forward pass merges each empty column rightwards
+     * (carrying, so a run of empty columns collapses in one go) and the final column, which has no
+     * boundary to its right, is merged leftwards afterwards. O(words + cols).
+     */
+    static List<Gutter> dropEmptyColumns(List<Line> lines, List<Gutter> gutters,
+                                         float bandX0, float bandX1) {
+        int cols = gutters.size() + 1;
+        if (cols < 2) return gutters;
+        float[] bounds = new float[cols + 1];
+        bounds[0] = bandX0; bounds[cols] = bandX1;
+        for (int i = 0; i < gutters.size(); i++) bounds[i + 1] = gutters.get(i).cx();
+
+        int[] counts = new int[cols];
+        for (Line l : lines) for (Word w : l.words) counts[colOf(w.cx(), bounds)]++;
+
+        boolean anyEmpty = false;
+        for (int c = 0; c < cols; c++) if (counts[c] == 0) { anyEmpty = true; break; }
+        if (!anyEmpty) return gutters;
+
+        // Forward pass: boundary index c+1 is gutters[c]. Dropping it merges column c into c+1.
+        List<Gutter> keep = new ArrayList<>(gutters.size());
+        for (int c = 0; c < cols - 1; c++) {
+            if (counts[c] != 0) keep.add(gutters.get(c));
+        }
+        // The last column has no boundary to its right; merge it LEFTwards by dropping the last
+        // surviving gutter. (If nothing survives there is only one column left and nothing to do.)
+        if (counts[cols - 1] == 0 && !keep.isEmpty()) keep.remove(keep.size() - 1);
+        return keep;
+    }
+
     static Grid scoreGrid(List<Line> lines, List<Gutter> gutters, float bandX0, float bandX1) {
         Grid grid = new Grid();
+        gutters = dropEmptyColumns(lines, gutters, bandX0, bandX1);
         grid.gutters = gutters; grid.rows = lines;
         int cols = gutters.size() + 1;
         int rows = lines.size();
@@ -1177,16 +1299,38 @@ final class StreamTableExtractor {
     // not the cost per line examined.
     static final int MAX_FOOTNOTE_MARKER_SCAN = 40;
 
-    // A footnote/legend block's own first line is reliably introduced by a short, ALL-CAPS
-    // "label:" token used nowhere else in real tabular data in this corpus -- "KEY:", "NOTE:",
-    // "SOURCE:" (see us-007's and us-018's own fixtures). Once such a line is found near a
-    // block's tail, everything from it to the end of the block is the footnote -- true
-    // regardless of whether each individual trailing line would, on its own, straddle a gutter
+    // A footnote/legend block's own first line is often introduced by a short, ALL-CAPS "label:"
+    // token -- "KEY:", "NOTE:", "SOURCE:" (see us-007's and us-018's own fixtures). Once such a line
+    // is found near a block's tail, everything from it to the end of the block is the footnote --
+    // true regardless of whether each individual trailing line would, on its own, straddle a gutter
     // or look single-column (several of us-007's legend lines wrap onto a second physical line
     // and populate 2+ columns, so {@link #isNonConformingEdge} alone under-trims them one at a
     // time; this marker instead removes the whole block in one decisive cut).
+    //
+    // THE MARKER ALONE IS NOT ENOUGH -- see #isFootnoteShapedLine. This comment used to claim such a
+    // token appears "nowhere else in real tabular data in this corpus". The corpus it was calibrated
+    // on is 77 ACADEMIC papers. In the population this tool actually triages -- invoices, remittance
+    // advices, mail attachments -- "TOTAL:", "SUBTOTAL:", "VAT:", "REF:", "IBAN:", "BIC:", "DUE:"
+    // are exactly how the most important ROWS are labelled, and the trim runs before scoreGrid /
+    // buildHit, so a matched row never becomes a cell and nothing sets `truncated`. REPRODUCED: a
+    // 7-row invoice emitted a 5x4 table, with "TOTAL: 77 283.75" and "VAT: 56.75" present on the page
+    // and absent from report.json. A second, unrelated instance was measured on the 200-PDF
+    // real-world sample: a letterhead block's "PH: 281-219-0465" / "Fax 281-219-0484" pair.
     private static final java.util.regex.Pattern FOOTNOTE_MARKER =
         java.util.regex.Pattern.compile("^[A-Z]{2,}:$");
+
+    // #isFootnoteShapedLine's word-count requirement for a NON-bare marker line, i.e. one that
+    // carries footnote text on the marker's own line. A footnote is a continuous prose run; a data
+    // row labelled "TOTAL:" is a label plus one or two values.
+    //
+    // MEASURED, over every marker line the rule fired on across the whole 77-document scoring corpus
+    // AND the 200-PDF real-world sample (36 distinct lines). Genuine footnote markers are either BARE
+    // (exactly one word: "KEY:", "PIN:") or long prose runs -- the shortest genuine multi-word marker
+    // line in the entire population is 5 words ("SOURCE: CONAB - Suvey: Jun/2013"), and the next is
+    // 11. The ONLY 2-word marker line measured anywhere is the "PH: 281-219-0465" false positive. 4
+    // therefore separates the two populations with a word of headroom on each side and changes
+    // NOTHING the corpus can see (no corpus marker line has 2, 3 or 4 words).
+    static final int FOOTNOTE_MIN_PROSE_WORDS = 4;
 
     // Step D: bounds the TOTAL per-page cost of per-block detection (gutter search +
     // gridness scoring + edge trimming) summed across every candidate block on one page.
@@ -1284,7 +1428,7 @@ final class StreamTableExtractor {
             if (!isNonConformingEdge(cur.get(cur.size() - 1), cur, bounds, gutters, medianSpace, stats, neighborGap)) break;
             cur.remove(cur.size() - 1);
         }
-        return stripTrailingFootnoteBlock(cur);
+        return stripTrailingFootnoteBlock(cur, medianSpace);
     }
 
     /** Block-wide median line-pitch and median words-per-line, computed once from the ORIGINAL
@@ -1328,24 +1472,65 @@ final class StreamTableExtractor {
     /**
      * Task 9g fix for defect 3 (the dominant remaining defect on us-007): find the FIRST line,
      * within the last {@link #MAX_FOOTNOTE_MARKER_SCAN} lines of {@code lines}, whose first word
-     * matches {@link #FOOTNOTE_MARKER} (e.g. "KEY:", "NOTE:", "SOURCE:"), and drop it and every
-     * line after it -- a footnote/legend block, once it starts, runs to the end of the block. If
-     * no marker is found, {@code lines} is returned unchanged. Never trims below 3 lines (a
-     * conforming table needs at least that many to be worth keeping at all -- matches the
-     * pre-existing {@code size() > 1} guards above and the {@code trimmed.size() < 3} reject in
-     * {@code extractPage}).
+     * matches {@link #FOOTNOTE_MARKER} (e.g. "KEY:", "NOTE:", "SOURCE:") <b>and which is itself
+     * shaped like a footnote rather than like one of this block's data rows</b> ({@link
+     * #isFootnoteShapedLine}), and drop it and every line after it -- a footnote/legend block, once
+     * it starts, runs to the end of the block. If no such line is found, {@code lines} is returned
+     * unchanged. Never trims below 3 lines (a conforming table needs at least that many to be worth
+     * keeping at all -- matches the pre-existing {@code size() > 1} guards above and the {@code
+     * trimmed.size() < 3} reject in {@code extractPage}).
+     *
+     * <p>The shape test is what stops this rule eating real invoice rows -- see {@link
+     * #FOOTNOTE_MARKER}'s own comment for the reproduced content loss it caused without one. A line
+     * that fails the shape test does NOT abort the scan: a genuine footnote further down the tail is
+     * still found and still trimmed (an invoice whose totals row is followed by a real "NOTE:" block
+     * keeps the totals and loses the note).
      */
-    private static List<Line> stripTrailingFootnoteBlock(List<Line> lines) {
+    private static List<Line> stripTrailingFootnoteBlock(List<Line> lines, float medianSpace) {
         int scanFrom = Math.max(0, lines.size() - MAX_FOOTNOTE_MARKER_SCAN);
         for (int i = scanFrom; i < lines.size(); i++) {
             List<Word> words = lines.get(i).words;
             if (words.isEmpty()) continue;
             if (i < 3) continue;                           // never truncate down to <3 real rows
-            if (FOOTNOTE_MARKER.matcher(words.get(0).text).matches()) {
+            if (FOOTNOTE_MARKER.matcher(words.get(0).text).matches()
+                    && isFootnoteShapedLine(lines.get(i), medianSpace)) {
                 return new ArrayList<>(lines.subList(0, i));
             }
         }
         return lines;
+    }
+
+    /**
+     * Is {@code line} shaped like the FIRST LINE OF A FOOTNOTE rather than like a data row that
+     * merely happens to be labelled with an ALL-CAPS "WORD:" token? Both conditions must hold:
+     *
+     * <ol>
+     *   <li><b>It is one continuous text run, not a row of cells.</b> Reuses {@link
+     *       #hasColumnShapedGap} -- the same already-load-bearing, already-calibrated discriminator
+     *       {@link #isNonConformingEdge} uses: a real row of cells ALWAYS has at least one
+     *       inter-cell gutter gap over {@link #EDGE_COLUMN_GAP_FACTOR} (8x) the median space, while
+     *       running prose does not (measured maxima: 4.55x for prose, 11.3x for the narrowest
+     *       genuine row in the corpus). Across the 36 distinct marker lines measured on the corpus
+     *       plus the 200-PDF sample, every genuine footnote's widest internal gap is at most 8pt --
+     *       roughly 1.5x a median space -- while "TOTAL: 77 283.75" has ~100pt gaps at its
+     *       gutters.</li>
+     *   <li><b>It is either a BARE marker or a real prose run</b> ({@link
+     *       #FOOTNOTE_MIN_PROSE_WORDS}) -- a label plus one or two values is a row, not a footnote.
+     *       This is what protects a narrow "TOTAL: 283.75" whose two words happen to sit inside one
+     *       wide column (so condition 1 alone would not save it) and the measured real-world
+     *       "PH: 281-219-0465".</li>
+     * </ol>
+     *
+     * <p>DELIBERATELY NOT USED: an unconditional "never trim a line with a numeric word in another
+     * column" veto. It reads well but was MEASURED to break genuine footnotes on this corpus -- e.g.
+     * "NOTE: Detail may not sum to 100 percent due to rounding." carries the numeric token "100"
+     * mid-sentence, several columns away from the marker. Condition 1 already refuses every numeric
+     * data row measured, because a numeric CELL is separated from its label by a gutter and a numeric
+     * word in prose is not.
+     */
+    static boolean isFootnoteShapedLine(Line line, float medianSpace) {
+        if (hasColumnShapedGap(line, medianSpace)) return false;
+        return line.words.size() == 1 || line.words.size() >= FOOTNOTE_MIN_PROSE_WORDS;
     }
 
     private static float[] colBoundsOf(List<Gutter> gutters, float bandX0, float bandX1) {
@@ -1357,6 +1542,16 @@ final class StreamTableExtractor {
 
     private static boolean isNonConformingEdge(Line line, List<Line> context, float[] bounds,
             List<Gutter> gutters, float medianSpace, EdgeStats stats, float neighborGap) {
+        // REVIEWED for the same over-reach the footnote rule had (does this eat a real trailing row
+        // that carries a single value, e.g. a grand total whose label is on the line above?) and left
+        // alone, because it is REDUNDANT for exactly that case rather than load-bearing: a one-word
+        // line has ownCols.size() == 1, so the single-column-while-the-body-is-multi-column rule below
+        // already returns true for it in every block whose other lines span 2+ columns -- which is
+        // every real table. MEASURED: relaxing this to {@code words.isEmpty()} leaves the 77-document
+        // corpus and the 200-PDF real-world sample BYTE-IDENTICAL at both page scopes (macro 0.8070
+        // all-pages / 0.7878 shipping, prose FP 15/200, all unchanged to four decimals). It is
+        // therefore not a second instance of the footnote defect, and changing it would be churn with
+        // nothing to pin it.
         if (line.words.size() < 2) return true;
 
         if (!hasColumnShapedGap(line, medianSpace)) {
@@ -1692,11 +1887,23 @@ final class StreamTableExtractor {
      * couldn't be safely built at all.
      */
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs, GutterFinder finder) {
-        return extractPage(pageNum, glyphs, finder, PRODUCTION_BAR, PRODUCTION_BAR, null);
+        return extractPage(pageNum, glyphs, finder, PageFrame.IDENTITY);
     }
 
     /**
-     * DIAGNOSTIC SEAM (measurement only; production always calls the 3-arg overload, which passes
+     * As {@link #extractPage(int, List, GutterFinder)}, reporting geometry in {@code frame}'s visual,
+     * /Rotate-applied top-left frame -- the frame every other path in {@link TableExtractor} reports
+     * in. THIS is the production entry point ({@code TableExtractor#extractStreamPage} passes the
+     * page's own rotation/cropBox); the overloads without a frame keep the identity mapping, which is
+     * exactly the previous behaviour and correct for every unrotated page. See {@link PageFrame}.
+     */
+    static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs,
+                                                     GutterFinder finder, PageFrame frame) {
+        return extractPage(pageNum, glyphs, finder, frame, PRODUCTION_BAR, PRODUCTION_BAR, null);
+    }
+
+    /**
+     * DIAGNOSTIC SEAM (measurement only; production always calls the 4-arg overload, which passes
      * {@link #PRODUCTION_BAR} for both gates and a null sink).
      *
      * <p>{@code emitBar} is the gate the per-block loop applies before emitting a hit; {@code mergeBar}
@@ -1707,6 +1914,14 @@ final class StreamTableExtractor {
      */
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs,
                                                      GutterFinder finder, ConfidenceBar emitBar,
+                                                     ConfidenceBar mergeBar, List<Candidate> sink) {
+        return extractPage(pageNum, glyphs, finder, PageFrame.IDENTITY, emitBar, mergeBar, sink);
+    }
+
+    /** Full form: the diagnostic seam above plus the reporting {@link PageFrame}. */
+    static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs,
+                                                     GutterFinder finder, PageFrame frame,
+                                                     ConfidenceBar emitBar,
                                                      ConfidenceBar mergeBar, List<Candidate> sink) {
         List<Word> words;
         List<Line> lines;
@@ -1755,7 +1970,7 @@ final class StreamTableExtractor {
                 boolean pass = grid.confidence >= emitBar.barFor(grid.colBounds.length - 1);
                 if (!pass && sink == null) continue;
 
-                TableExtractor.TableHit hit = buildHit(pageNum, grid);
+                TableExtractor.TableHit hit = buildHit(pageNum, grid, frame);
                 if (sink != null) sink.add(new Candidate(pageNum, grid.confidence, pass, hit, grid));
                 if (pass && hit != null) hits.add(hit);
             } catch (TableExtractor.RulingOverflowException e) {
@@ -1934,6 +2149,10 @@ final class StreamTableExtractor {
     }
 
     private static TableExtractor.TableHit buildHit(int pageNum, Grid grid) {
+        return buildHit(pageNum, grid, PageFrame.IDENTITY);
+    }
+
+    private static TableExtractor.TableHit buildHit(int pageNum, Grid grid, PageFrame frame) {
         int cols = grid.colBounds.length - 1;
         List<List<Line>> rowGroups = groupLogicalRows(grid.rows, grid.colBounds);
         int rows = rowGroups.size();
@@ -1944,6 +2163,12 @@ final class StreamTableExtractor {
         t.page = pageNum;
         t.extractionMethod = "stream";
         t.confidence = Math.round(grid.confidence * 1000.0) / 1000.0;
+        // The REPORTED confidence stays rounded to 3 decimals (report.json readability); the exact
+        // value is kept alongside it, unserialized, because arbitration's confidence FLOOR must be
+        // the floor the calibration actually chose. Comparing the rounded value against
+        // ARB_MIN_STREAM_CONFIDENCE=0.65 made the effective floor 0.6495, admitting candidates the
+        // calibration excluded. See TableExtractor.TableHit#confidenceUnrounded.
+        t.confidenceUnrounded = grid.confidence;
         t.rowCount = rows; t.colCount = cols;
         t.cells = new ArrayList<>();
         float tx0=Float.MAX_VALUE, ty0=Float.MAX_VALUE, tx1=-Float.MAX_VALUE, ty1=-Float.MAX_VALUE;
@@ -1968,12 +2193,29 @@ final class StreamTableExtractor {
             for (int c = 0; c < cols; c++) {
                 if (text[c] == null) continue;                // sparse cell -> omit (renderViews fills "")
                 TableExtractor.CellHit cell = new TableExtractor.CellHit();
+                // SPANS ARE DELIBERATELY NOT EMITTED, and this is a measured decision rather than an
+                // oversight. Each word is assigned to ONE column by its CENTRE, so a spanning header
+                // lands wholly in the column containing its centre and the other columns it visually
+                // covers are emitted empty. The task-9l reasoning above is right that a word crossing
+                // a gutter is "a colspan -- real structure", so emitting one was PROTOTYPED (colSpan =
+                // the number of column bands the cell's own word extent covers, truncated at the next
+                // populated column in that row) and MEASURED on the full benchmark. It LOSES on every
+                // primary figure: full+arbitration MACRO 0.8070 -> 0.8066 all-pages and 0.7878 ->
+                // 0.7874 shipping; stream alone 0.6575 -> 0.6573 and 0.6404 -> 0.6402; region-given
+                // 0.6931 -> 0.6930; prose false-positive rate unchanged at 15/200. That reproduces the
+                // earlier finding that spans are worth about +0.075 MICRO while REVERSING on MACRO, so
+                // it is not shipped. Emitting spans correctly would need the row's cells built from
+                // column RANGES rather than per-column accumulation (two words in one row can claim
+                // overlapping ranges), i.e. its own change with its own calibration.
                 cell.row = r; cell.col = c; cell.rowSpan = 1; cell.colSpan = 1;
                 cell.text = text[c].toString();
-                cell.bbox = box[c];
+                // Into the page's VISUAL (/Rotate-applied) frame -- the one every lattice/tagged box
+                // in the same report.json lives in, and the one contestsSameRegion intersects. The
+                // identity for an unrotated page. See PageFrame.
+                cell.bbox = frame.map(box[c][0], box[c][1], box[c][2], box[c][3]);
                 t.cells.add(cell);
-                tx0=Math.min(tx0,box[c][0]); ty0=Math.min(ty0,box[c][1]);
-                tx1=Math.max(tx1,box[c][2]); ty1=Math.max(ty1,box[c][3]);
+                tx0=Math.min(tx0,cell.bbox[0]); ty0=Math.min(ty0,cell.bbox[1]);
+                tx1=Math.max(tx1,cell.bbox[2]); ty1=Math.max(ty1,cell.bbox[3]);
             }
         }
         if (t.cells.isEmpty()) return null;

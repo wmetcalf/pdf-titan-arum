@@ -534,6 +534,21 @@ final class TableExtractor {
 
         /** Stream-path only: gridness confidence in [0,1]. null (omitted) for lattice/tagged. */
         public Double confidence;
+
+        /**
+         * Stream-path only, and DELIBERATELY NOT SERIALIZED (package-private, so Jackson's default
+         * PUBLIC_ONLY field visibility never sees it; {@code @JsonIgnore} as belt-and-braces should
+         * that config ever change): {@link #confidence} BEFORE the 3-decimal rounding applied for
+         * report.json readability.
+         *
+         * <p>WHY. {@link #ARB_MIN_STREAM_CONFIDENCE} (0.65) is a calibrated admission floor. Comparing
+         * the ROUNDED confidence against it made the effective floor 0.6495, so a candidate the
+         * calibration excluded was admitted and could displace a drawn-ruling answer. The gate now
+         * reads this exact value, falling back to {@link #confidence} when it is absent (e.g. a
+         * candidate a test built by hand).
+         */
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        Double confidenceUnrounded;
     }
 
     /** One cell (span anchor) of a table. */
@@ -2471,7 +2486,7 @@ final class TableExtractor {
             if (streamHits != null) {
                 if (streamPagesRun >= MAX_STREAM_PAGES_PER_DOC) {
                     result.truncated = true;
-                } else if (extractStreamPage(pageNum, positionsByPage.get(pageNum), streamHits, result)) {
+                } else if (extractStreamPage(doc, pageNum, positionsByPage.get(pageNum), streamHits, result)) {
                     streamPagesRun++;
                 }
             }
@@ -2532,13 +2547,22 @@ final class TableExtractor {
      * class is careful to surface. The cap tested is the same constant, so no page's OUTPUT changes;
      * only its reporting does.
      *
+     * <p>FRAME. The page's own {@code /Rotate} + cropBox is handed to the stream path as a {@link
+     * StreamTableExtractor.PageFrame} so its reported bboxes land in the SAME visual, /Rotate-applied
+     * top-left frame the lattice path ({@link RulingCollector#addRuling}, {@link
+     * #fillCellsFromPositions}) and the tagged path ({@link #resolveCellText}, "FIX 1 (Codex P2)")
+     * already report in. Without it a {@code /Rotate 90} page emitted stream boxes in a different
+     * frame than the lattice boxes beside them in the same report.json, and {@link
+     * #contestsSameRegion} -- a bbox intersection ACROSS those two frames -- saw no contest, so both
+     * contradictory answers for one region survived arbitration.
+     *
      * @return true when the whitespace detector actually ran for this page, i.e. when the page
      *         consumed a unit of the document-level {@link #MAX_STREAM_PAGES_PER_DOC} budget. A page
      *         with no glyphs, or one refused by the glyph cap, does no detection work and is
      *         therefore not charged -- a document of blank pages must not spend a real document's
      *         budget.
      */
-    private static boolean extractStreamPage(int pageNum, List<TextPosition> positions,
+    private static boolean extractStreamPage(PDDocument doc, int pageNum, List<TextPosition> positions,
                                              List<TableHit> out, Result result) {
         if (positions == null || positions.isEmpty()) return false;
         if (positions.size() > StreamTableExtractor.MAX_STREAM_GLYPHS) {
@@ -2548,7 +2572,8 @@ final class TableExtractor {
             return false;
         }
         try {
-            out.addAll(StreamTableExtractor.extractPage(pageNum, positions, new BreuelGutterFinder()));
+            out.addAll(StreamTableExtractor.extractPage(pageNum, positions, new BreuelGutterFinder(),
+                    pageFrameOf(doc, pageNum)));
         } catch (RulingOverflowException e) {
             result.truncated = true;
             System.err.println("WARNING: borderless table extraction skipped on page " + pageNum
@@ -2564,6 +2589,29 @@ final class TableExtractor {
             System.err.println("WARNING: borderless table extraction failed on page " + pageNum + ": " + e);
         }
         return true;
+    }
+
+    /**
+     * The page's own /Rotate + cropBox as a {@link StreamTableExtractor.PageFrame}. Never throws and
+     * never fails a page: an out-of-range page number, or any exception from pdfbox's inherited-
+     * attribute resolution (which {@code getRotation()}/{@code getCropBox()} both go through), yields
+     * the IDENTITY frame -- i.e. exactly the pre-fix behaviour -- rather than costing the page its
+     * tables. {@code /Rotate} is normalised the same way pdfbox itself does (a multiple of 90 in
+     * [0,360)); anything else is treated as 0, matching {@link #applyPageRotation}'s own default arm.
+     */
+    private static StreamTableExtractor.PageFrame pageFrameOf(PDDocument doc, int pageNum) {
+        try {
+            if (doc == null || pageNum < 1 || pageNum > doc.getNumberOfPages()) {
+                return StreamTableExtractor.PageFrame.IDENTITY;
+            }
+            PDPage page = doc.getPage(pageNum - 1);
+            int rotation = ((page.getRotation() % 360) + 360) % 360;
+            if (rotation == 0) return StreamTableExtractor.PageFrame.IDENTITY;
+            PDRectangle cropBox = page.getCropBox();
+            return new StreamTableExtractor.PageFrame(rotation, cropBox.getWidth(), cropBox.getHeight());
+        } catch (RuntimeException | StackOverflowError e) {
+            return StreamTableExtractor.PageFrame.IDENTITY;
+        }
     }
 
     /**
@@ -3314,9 +3362,12 @@ final class TableExtractor {
         if (!anyRealStream) return RegionOutcome.RULED_WINS;
 
         // 1. Confidence floor. A stream candidate with no confidence at all is no evidence.
+        //    Read the UNROUNDED confidence: report.json rounds to 3 decimals, and comparing
+        //    that rounded value here made this calibrated 0.65 floor an effective 0.6495 (F12a).
         double confSum = 0;
         for (int j : compS) {
-            Double c = stream.get(j).confidence;
+            TableHit s = stream.get(j);
+            Double c = s.confidenceUnrounded != null ? s.confidenceUnrounded : s.confidence;
             if (c == null || !Double.isFinite(c)) return RegionOutcome.RULED_WINS;
             confSum += c;
         }

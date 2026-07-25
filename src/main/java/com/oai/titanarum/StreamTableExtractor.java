@@ -956,6 +956,24 @@ final class StreamTableExtractor {
     static final long MAX_STREAM_PAGE_BLOCK_WORK = 10L * MAX_STREAM_WORDS;
 
     /**
+     * Median line-to-line pitch of an ordered (top-to-bottom) line list -- the one shared
+     * definition of "the page's typical line spacing", used both by Step A's split threshold and
+     * Step A''s merge cap so the two can never drift apart.
+     * <p>The 0.5f floor is a degenerate-input guard (near-zero/overlapping line pitch): without
+     * it a zero-ish median would make {@link #BLOCK_GAP_FACTOR}*median ~0, so every nonzero gap
+     * -- however tiny -- would trigger a split, over-fragmenting into near-useless 1-2 line
+     * "blocks". This is purely a defensive floor for pathological input, not expected on real
+     * PDFs (real line pitch is always a real fraction of the font size).
+     */
+    static float pageMedianPitch(List<Line> lines) {
+        if (lines.size() < 2) return 1f;
+        float[] pitches = new float[lines.size() - 1];
+        for (int i = 1; i < lines.size(); i++) pitches[i - 1] = lines.get(i).yTop - lines.get(i - 1).yTop;
+        Arrays.sort(pitches);
+        return Math.max(pitches[pitches.length / 2], 0.5f);
+    }
+
+    /**
      * Step A: split an ordered (top-to-bottom) line list into candidate blocks wherever the
      * vertical gap to the next line exceeds {@link #BLOCK_GAP_FACTOR} times the median
      * line-to-line pitch. {@code lines} must already be sorted by {@code yTop} (as returned by
@@ -966,16 +984,7 @@ final class StreamTableExtractor {
         if (lines.isEmpty()) return blocks;
         if (lines.size() == 1) { blocks.add(new ArrayList<>(lines)); return blocks; }
 
-        float[] pitches = new float[lines.size() - 1];
-        for (int i = 1; i < lines.size(); i++) pitches[i - 1] = lines.get(i).yTop - lines.get(i - 1).yTop;
-        float[] sortedPitches = pitches.clone();
-        Arrays.sort(sortedPitches);
-        // Degenerate-input floor (near-zero/overlapping line pitch): without it a zero-ish
-        // median would make BLOCK_GAP_FACTOR*median ~0, so every nonzero gap -- however tiny --
-        // would trigger a split, over-fragmenting into near-useless 1-2 line "blocks". This is
-        // purely a defensive floor for pathological input, not expected on real PDFs (real line
-        // pitch is always a real fraction of the font size).
-        float medianPitch = Math.max(sortedPitches[sortedPitches.length / 2], 0.5f);
+        float medianPitch = pageMedianPitch(lines);
         float threshold = BLOCK_GAP_FACTOR * medianPitch;
 
         List<Line> cur = new ArrayList<>();
@@ -1125,6 +1134,266 @@ final class StreamTableExtractor {
         return false;
     }
 
+    // ------------------------------------------------------------ Step A': block re-merge (9m)
+    //
+    // Step A splits on ONE signal only -- a vertical gap over BLOCK_GAP_FACTOR (1.6x) times the
+    // page's median line pitch. That signal is right about where a page's REGIONS change, but it
+    // is blind to the commonest real-world layout: a single table with an internal band gap
+    // (above a totals row, below a header band, around a section subhead). Measured against the
+    // ICDAR 2013 -str.xml cell geometry (each GT table's own bbox, converted into our top-left
+    // coords), 23 of the 163 geometry-carrying ground-truth tables -- on 13 of the 77 scored PDFs
+    // -- are split across MORE THAN ONE Step A block (us-002 p1 and p3: 5 blocks each inside one
+    // GT table; us-032 p1: 5; us-001 p1: 4; us-018 p4-p7 and us-017 p2-p4: 2 each). The reverse
+    // error is rare (only 8 blocks straddle >1 GT table). Those 13 PDFs score adjacency F1 0.352
+    // (macro 0.275) against 0.673 (0.568) for the 54 cleanly-segmented ones.
+    //
+    // Step A' is a second pass that re-merges left-to-right (top-to-bottom) adjacent blocks when
+    // the evidence says the table CONTINUES across the gap. All THREE conditions below were
+    // measured independently load-bearing on the real bake-off; dropping any one loses real
+    // score, and two of them are what keep the pass from FABRICATING a table out of two genuine
+    // siblings (the failure mode this tool cares about most):
+    //
+    //   1. the gap is at most BLOCK_MERGE_MAX_GAP_FACTOR x the page median pitch -- an inter-
+    //      REGION gap on a real page is much wider than an intra-table band gap;
+    //   2. the two blocks' COLUMN MODELS AGREE (their independently-found gutter centres line
+    //      up) -- the direct evidence of structural continuity. Without this test the corpus
+    //      micro-F1 still rises (0.548) but the MACRO collapses to 0.489, i.e. below baseline:
+    //      it wins on a few big files by merging indiscriminately and wrecks many small ones;
+    //   3. the MERGED block, scored on its own band exactly as the per-block loop would score it,
+    //      still clears STREAM_CONFIDENCE_MIN. Two grids that agree on gutters can still form a
+    //      non-grid when unioned (e.g. sibling tables whose numeric column is in a DIFFERENT
+    //      place, so the union has no numeric column left and trips the prose veto). Dropping
+    //      this gate costs 0.018 micro and, measured on the corpus canaries, is what neutralises
+    //      eu-020 (-0.212 -> 0.000), us-025 (-0.179 -> +0.028) and eu-003 (-0.184 -> -0.001).
+    //
+    // Cashable ceiling for this lever, two independent estimates: a GT-bbox-SUPERVISED merge
+    // (merge consecutive blocks that sit inside the same GT bbox) scores adjacency F1 0.560 under
+    // production pairing; this rule scores 0.566. They agree, i.e. the rule already captures
+    // essentially all of the available segmentation prize. Reference points: no Step A split at
+    // all scores 0.273 (Step A itself must stay), and a confidence-only agglomeration (no column
+    // test) scores 0.541 while DOUBLING the prose false-positive rate to 0.060.
+
+    // Merge condition 1. Sensitivity (real bake-off, breuel, adjacency micro-F1): gap cap
+    // 2.0x -> 0.549, 2.5x -> 0.566, 3.0x -> 0.566, uncapped -> 0.565. 2.5x is the SMALLEST value
+    // that both keeps the full corpus gain and keeps a genuine sibling-table gap unmerged: the
+    // gap in StreamSegmentationTest#multipleTablesOnOnePageAreDetectedSeparately measures 6.00x
+    // the median pitch, and siblingTablesJustOverTheGapCapStaySeparate pins the 3.0x boundary the
+    // corpus itself cannot test (the entire ICDAR corpus contains only 9 adjacent block pairs
+    // that span two DIFFERENT ground-truth tables). The cap costs nothing on the corpus (0.5656
+    // with it, 0.5653 without) and is pure over-merge insurance. Measured separability of the
+    // pairs the corpus DOES have: SAME-table pairs (n=83) have median gap 1.81x the pitch
+    // (p10..p90 1.66..2.07); DIFFERENT-table pairs (n=9) median 2.00x with p90 3.19x.
+    static final float BLOCK_MERGE_MAX_GAP_FACTOR = 2.5f;
+
+    // Merge condition 2's matching tolerance, in multiples of medianSpace: two gutters are "the
+    // same column boundary" if their centres are within this distance. Sensitivity: 0.5x -> 0.546,
+    // 1.0x -> 0.554, 2.0x -> 0.566. A real table's column boundaries wander slightly between
+    // bands (a header band's gutter is bounded by different words than the body's), so the
+    // tolerance has to be about a space wide, not sub-point.
+    static final float BLOCK_MERGE_GUTTER_TOL_FACTOR = 2.0f;
+
+    // Merge condition 2's agreement threshold: this fraction (rounded up, minimum 1) of the
+    // SMALLER gutter set must have a counterpart in the other. Sensitivity: 0.34 -> 0.566,
+    // 0.5 -> 0.566, 1.0 (every gutter must match) -> 0.517. Requiring a total match is too
+    // strict: a header band legitimately resolves fewer columns than the body it heads, so its
+    // gutter set is a coarse SUBSET, and demanding all of them match refuses exactly the merges
+    // this pass exists for.
+    static final float BLOCK_MERGE_MIN_AGREE_FRACTION = 0.5f;
+
+    // Step A''s own charged work budget, in the same "real work" currency the rest of this file
+    // uses: obstacles (words) handed to a bounded sub-search. The pass runs the gutter finder once
+    // per base block PLUS once per merge probe, and each probe in a chain runs on a LARGER block
+    // than the last -- so on a page of K mutually-agreeing blocks totalling W words the probe
+    // chain charges roughly W*K/2, i.e. it is QUADRATIC in the block count even though every
+    // individual finder call is independently bounded by MAX_GUTTER_SCAN_WORK. That composite
+    // cost is the one real DoS surface this pass adds, and it needs a budget of its own; on
+    // exhaustion the pass returns the UNMERGED partition -- byte-identical to pre-Step-A'
+    // behaviour -- never a partial merge and never a thrown page.
+    //
+    // SIZING RULE: the merge pass may not scan more obstacles than the base per-block pass itself
+    // could, i.e. one MAX_STREAM_WORDS-worth of words searched once. That is a hard, principled
+    // ceiling rather than a guess, and it is generous against measured reality: the worst-case
+    // charge (base pass plus a full all-pairs-merge probe chain, an upper bound since a real
+    // page's gap/column tests reject most attempts) over 301 real pages -- the whole 77-PDF
+    // bake-off corpus plus the 200-PDF real-world prose sample -- is 11,386 (us-021 p3), mean
+    // 1,576, with exactly ONE page over 10,000 and none over 100,000. So this budget leaves 5.3x
+    // headroom over the worst real page while capping the pathological
+    // thousands-of-tiny-mutually-agreeing-blocks page. Measured effect of that cap: an adversarial
+    // 200-block page (3600 words, every pair agreeing) charges ~364,000 and takes ~4.6s of
+    // branch-and-bound if allowed to run; under this budget it is cut off at ~0.7s and returns the
+    // unmerged partition. A page's REAL total gutter work is therefore at most roughly doubled by
+    // Step A', not multiplied by the block count.
+    static final long MAX_BLOCK_MERGE_WORK = MAX_STREAM_WORDS;
+
+    /**
+     * One output group of Step A': the (possibly merged) block plus the gutter set already
+     * computed for it, on its OWN band, by the merge pass -- so the per-block loop in {@link
+     * #extractPage} never re-runs the finder on a block Step A' has already searched. Without
+     * this cache the added cost would be a second full gutter search per block (~2x page work)
+     * instead of just the merge probes.
+     *
+     * <p>{@code gutters} is null when the pass did not compute them (a sub-3-line block, which
+     * the per-block loop rejects anyway; a single-block page, where there is nothing to merge; or
+     * a block reached after the work budget ran out) -- the caller then finds them itself, as
+     * before. {@code gutterSearchOverflowed} records that the finder threw {@link
+     * TableExtractor.RulingOverflowException} for this block: the caller must skip the block,
+     * exactly as its own catch clause would have.
+     */
+    static final class BlockGroup {
+        final List<Line> lines;
+        final List<Gutter> gutters;                 // null = not precomputed; caller must find them
+        final boolean gutterSearchOverflowed;       // true = finder aborted on this block; skip it
+        BlockGroup(List<Line> lines, List<Gutter> gutters, boolean gutterSearchOverflowed) {
+            this.lines = lines; this.gutters = gutters; this.gutterSearchOverflowed = gutterSearchOverflowed;
+        }
+    }
+
+    /** The x-extent of a block's own words -- the band every per-block stage is measured against. */
+    private static float[] bandOf(List<Line> block) {
+        float x0 = Float.MAX_VALUE, x1 = -Float.MAX_VALUE;
+        for (Line l : block) for (Word w : l.words) { x0 = Math.min(x0, w.x0); x1 = Math.max(x1, w.x1); }
+        return new float[]{x0, x1};
+    }
+
+    private static long obstacleCountOf(List<Line> block) {
+        long n = 0;
+        for (Line l : block) n += l.words.size();
+        return n;
+    }
+
+    /** Result of one Step A' probe: the gutters found on that block's own band, plus its gridness
+     *  confidence (or -1 when the probe could not be completed -- overflowed, or trimmed away to
+     *  fewer than 3 lines -- which always means "do not merge"). */
+    private static final class Probe {
+        final List<Gutter> gutters; final double confidence;
+        Probe(List<Gutter> gutters, double confidence) { this.gutters = gutters; this.confidence = confidence; }
+        static final Probe FAILED = new Probe(null, -1);
+    }
+
+    /** Runs exactly the per-block detection stages {@link #extractPage} runs (band -> finder ->
+     *  {@link #trimEdgeLines} -> {@link #scoreGrid}), so a merge decision is made against the
+     *  score the merged block would ACTUALLY get. A DoS abort from the finder means "do not
+     *  merge" -- never lose the page. */
+    private static Probe probeBlock(List<Line> block, GutterFinder finder, float medianSpace) {
+        try {
+            float[] b = bandOf(block);
+            List<Gutter> gutters = finder.find(block, b[0], b[1], medianSpace);
+            if (block.size() < 3) return new Probe(gutters, -1);
+            List<Line> trimmed = trimEdgeLines(block, gutters, b[0], b[1], medianSpace);
+            if (trimmed.size() < 3) return new Probe(gutters, -1);
+            return new Probe(gutters, scoreGrid(trimmed, gutters, b[0], b[1]).confidence);
+        } catch (TableExtractor.RulingOverflowException e) {
+            return Probe.FAILED;
+        }
+    }
+
+    /**
+     * Merge condition 2: do two independently-found gutter sets describe the SAME column model?
+     * Both must be non-empty, and at least {@link #BLOCK_MERGE_MIN_AGREE_FRACTION} (rounded up,
+     * minimum 1) of the smaller set's gutters must have a counterpart in the other within
+     * {@code tol} of their centre.
+     */
+    static boolean columnModelsAgree(List<Gutter> a, List<Gutter> b, float tol) {
+        if (a == null || b == null || a.isEmpty() || b.isEmpty()) return false;
+        int matches = 0;
+        for (Gutter x : a) {
+            for (Gutter y : b) if (Math.abs(x.cx() - y.cx()) <= tol) { matches++; break; }
+        }
+        int minSize = Math.min(a.size(), b.size());
+        return matches >= Math.max(1, (int) Math.ceil(BLOCK_MERGE_MIN_AGREE_FRACTION * minSize));
+    }
+
+    /** Step A' with the production work budget ({@link #MAX_BLOCK_MERGE_WORK}). */
+    static List<BlockGroup> mergeAgreeingBlocks(List<List<Line>> base, GutterFinder finder,
+                                                float medianSpace, float medianPitch) {
+        return mergeAgreeingBlocks(base, finder, medianSpace, medianPitch, MAX_BLOCK_MERGE_WORK);
+    }
+
+    /**
+     * Step A': re-merge adjacent Step A blocks whose column model is continuous across the gap.
+     * See the block comment above {@link #BLOCK_MERGE_MAX_GAP_FACTOR} for the evidence and the
+     * three conditions. {@code maxWork} is the charged budget (obstacles handed to the finder);
+     * on exhaustion this returns the UNMERGED partition, keeping whatever gutter caches were
+     * already validly computed -- i.e. the fail-safe is exactly pre-Step-A' behaviour.
+     */
+    static List<BlockGroup> mergeAgreeingBlocks(List<List<Line>> base, GutterFinder finder,
+                                                float medianSpace, float medianPitch, long maxWork) {
+        if (base.size() < 2) return unmerged(base, null);
+
+        // Per-base-block column models. Sub-3-line blocks are never merge candidates (the
+        // per-block loop rejects them outright, and an empty gutter set can never agree), so they
+        // are not searched at all.
+        List<Probe> baseProbes = new ArrayList<>(base.size());
+        long work = 0;
+        for (List<Line> b : base) {
+            if (b.size() < 3) { baseProbes.add(new Probe(List.of(), -1)); continue; }
+            long cost = obstacleCountOf(b);
+            if (work + cost > maxWork) return unmerged(base, baseProbes);   // budget out -> no merging
+            work += cost;
+            baseProbes.add(probeBlock(b, finder, medianSpace));
+        }
+
+        float gapCap = BLOCK_MERGE_MAX_GAP_FACTOR * medianPitch;
+        float tol = BLOCK_MERGE_GUTTER_TOL_FACTOR * medianSpace;
+        List<BlockGroup> out = new ArrayList<>();
+        List<Line> cur = new ArrayList<>(base.get(0));
+        Probe curProbe = baseProbes.get(0);
+        // The group's REFERENCE column model for the next agreement test. On a merge this stays
+        // the richer (larger) of the two base sets rather than becoming the merged block's own
+        // freshly-found set: a merged band can resolve spurious extra gutters, and chaining off
+        // those would let a group drift away from the column model it started with.
+        List<Gutter> refGutters = curProbe.gutters;
+        for (int i = 1; i < base.size(); i++) {
+            List<Line> next = base.get(i);
+            Probe nextProbe = baseProbes.get(i);
+            float gap = next.get(0).yTop - cur.get(cur.size() - 1).yTop;
+            boolean merged = false;
+            if (gap <= gapCap && columnModelsAgree(refGutters, nextProbe.gutters, tol)) {
+                List<Line> candidate = new ArrayList<>(cur);
+                candidate.addAll(next);
+                long cost = obstacleCountOf(candidate);
+                if (work + cost > maxWork) return unmerged(base, baseProbes);  // budget out -> no merging
+                work += cost;
+                Probe cand = probeBlock(candidate, finder, medianSpace);
+                if (cand.confidence >= STREAM_CONFIDENCE_MIN) {
+                    cur = candidate;
+                    curProbe = cand;
+                    if (nextProbe.gutters != null && refGutters != null
+                            && nextProbe.gutters.size() > refGutters.size()) refGutters = nextProbe.gutters;
+                    merged = true;
+                }
+            }
+            if (!merged) {
+                out.add(groupOf(cur, curProbe));
+                cur = new ArrayList<>(next);
+                curProbe = nextProbe;
+                refGutters = nextProbe.gutters;
+            }
+        }
+        out.add(groupOf(cur, curProbe));
+        return out;
+    }
+
+    /** A group whose gutters are already known (or known to have overflowed) from {@code probe}. */
+    private static BlockGroup groupOf(List<Line> lines, Probe probe) {
+        if (probe == null) return new BlockGroup(lines, null, false);
+        if (probe.gutters == null) return new BlockGroup(lines, null, true);   // finder aborted
+        if (lines.size() < 3) return new BlockGroup(lines, null, false);       // never searched
+        return new BlockGroup(lines, probe.gutters, false);
+    }
+
+    /** The fail-safe / no-op partition: every base block on its own, carrying only the gutter
+     *  caches that were already validly computed ({@code probes} may be null or shorter than
+     *  {@code base} if the budget ran out partway). */
+    private static List<BlockGroup> unmerged(List<List<Line>> base, List<Probe> probes) {
+        List<BlockGroup> out = new ArrayList<>(base.size());
+        for (int i = 0; i < base.size(); i++) {
+            Probe p = probes != null && i < probes.size() ? probes.get(i) : null;
+            out.add(groupOf(base.get(i), p));
+        }
+        return out;
+    }
+
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs) {
         return extractPage(pageNum, glyphs, new BreuelGutterFinder());
     }
@@ -1138,8 +1407,10 @@ final class StreamTableExtractor {
      *
      * <p>Pipeline (see the "region segmentation" block above for the Task 9d rationale): build
      * words/lines for the whole page (as before), split the lines into candidate blocks by
-     * vertical gap (Step A), then for each block with >=3 lines independently find its own
-     * band/gutters, trim non-conforming edge lines (Step C), and score/build a hit (Step B) --
+     * vertical gap (Step A), re-merge adjacent blocks whose column model is continuous across
+     * the gap ({@link #mergeAgreeingBlocks}, Step A'), then for each block with >=3 lines
+     * independently find its own band/gutters (reusing the set Step A' already found for it),
+     * trim non-conforming edge lines (Step C), and score/build a hit (Step B) --
      * capped at {@link #MAX_STREAM_TABLES_PER_PAGE} hits and a per-page work budget (Step D). A
      * DoS abort ({@link TableExtractor.RulingOverflowException}) from an individual block's
      * gutter search or cell-count cap only skips THAT block, not the whole page -- unlike the
@@ -1161,11 +1432,13 @@ final class StreamTableExtractor {
         }
         float medianSpace = 0.5f * medianFontSize(words);
 
-        List<List<Line>> blocks = splitIntoBlocks(lines);
+        List<BlockGroup> blocks = mergeAgreeingBlocks(splitIntoBlocks(lines), finder, medianSpace,
+                                                      pageMedianPitch(lines));
         List<TableExtractor.TableHit> hits = new ArrayList<>();
         long pageWork = 0;
 
-        for (List<Line> block : blocks) {
+        for (BlockGroup group : blocks) {
+            List<Line> block = group.lines;
             if (hits.size() >= MAX_STREAM_TABLES_PER_PAGE) break;
             if (block.size() < 3) continue;
 
@@ -1173,13 +1446,18 @@ final class StreamTableExtractor {
             if (pageWork + charge > MAX_STREAM_PAGE_BLOCK_WORK) break; // page budget exhausted -> keep prior hits, stop
             pageWork += charge;
 
+            // Step A' already ran the finder on this block's own band; skipping an overflowed
+            // block here is exactly what the catch clause below would have done.
+            if (group.gutterSearchOverflowed) continue;
+
             try {
                 float bandX0 = Float.MAX_VALUE, bandX1 = -Float.MAX_VALUE;
                 for (Line l : block) for (Word w : l.words) {
                     bandX0 = Math.min(bandX0, w.x0); bandX1 = Math.max(bandX1, w.x1);
                 }
 
-                List<Gutter> gutters = finder.find(block, bandX0, bandX1, medianSpace);
+                List<Gutter> gutters = group.gutters != null ? group.gutters
+                                     : finder.find(block, bandX0, bandX1, medianSpace);
                 List<Line> trimmed = trimEdgeLines(block, gutters, bandX0, bandX1, medianSpace);
                 if (trimmed.size() < 3) continue;               // Step C left too little to be a table -> reject block
 

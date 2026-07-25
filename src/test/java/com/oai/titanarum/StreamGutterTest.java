@@ -343,4 +343,67 @@ class StreamGutterTest {
         List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 0f, bandX1, 6f);
         assertEquals(cols - 1, g.size(), "expect cols-1=10 interior gutters for an " + rows + "x" + cols + " dense numeric grid, got " + g.size());
     }
+
+    /**
+     * Task 9m: Step A' ({@link StreamTableExtractor#mergeAgreeingBlocks}) runs the gutter finder
+     * once per base block PLUS once per merge probe, and each probe runs on a LARGER block than
+     * the last -- so on a page of K mutually-agreeing blocks the probe chain costs roughly
+     * O(page words x K), quadratic in the block count, even though every individual finder call
+     * is independently bounded by {@code MAX_GUTTER_SCAN_WORK}. This test pins the two halves of
+     * the DoS discipline for that pass:
+     * <ul>
+     *   <li>at the production budget the pass completes (and does merge -- so the budget is not
+     *       accidentally starving legitimate work) on a page of 24 agreeing 3-line blocks;</li>
+     *   <li>at an artificially tiny budget the pass returns the UNMERGED partition -- exactly
+     *       pre-Step-A' behaviour, block for block -- rather than a partial merge, and no
+     *       exception ever escapes to {@code extractPage} (which must never throw).</li>
+     * </ul>
+     */
+    @Test
+    void blockMergePassRespectsItsWorkBudget() {
+        // 24 mutually-agreeing 3-line, 3-column blocks: identical column x positions, each block
+        // separated from the next by 2.0x the 20pt line pitch (inside the 2.5x merge cap), so
+        // every one of the 23 adjacent pairs is a merge candidate.
+        float pitch = 20f, medianSpace = 5f;
+        int nBlocks = 24, rowsPerBlock = 3;
+        List<List<StreamTableExtractor.Line>> base = new ArrayList<>();
+        float y = 0;
+        for (int b = 0; b < nBlocks; b++) {
+            List<StreamTableExtractor.Line> block = new ArrayList<>();
+            for (int r = 0; r < rowsPerBlock; r++) {
+                StreamTableExtractor.Line ln = new StreamTableExtractor.Line();
+                ln.yTop = y; ln.yBot = y + 10;
+                ln.words.add(w(10, 50, y, "Row" + b + r));
+                ln.words.add(w(70, 110, y, String.valueOf(b * 7 + r)));
+                ln.words.add(w(130, 170, y, String.valueOf(b * 11 + r)));
+                block.add(ln);
+                y += pitch;
+            }
+            y += pitch;            // total step to the next block's first line = 2.0x pitch
+            base.add(block);
+        }
+
+        GutterFinder finder = new BreuelGutterFinder();
+
+        List<StreamTableExtractor.BlockGroup> full = assertDoesNotThrow(
+                () -> StreamTableExtractor.mergeAgreeingBlocks(base, finder, medianSpace, pitch),
+                "the merge pass must complete at the production budget, never throw");
+        assertTrue(full.size() < base.size(),
+                "at the production budget these agreeing blocks must actually merge; got " + full.size()
+                        + " groups from " + base.size());
+
+        for (long tiny : new long[]{0L, 1L, 100L}) {
+            List<StreamTableExtractor.BlockGroup> starved = assertDoesNotThrow(
+                    () -> StreamTableExtractor.mergeAgreeingBlocks(base, finder, medianSpace, pitch, tiny),
+                    "budget exhaustion must return the unmerged partition, never throw (budget=" + tiny + ")");
+            assertEquals(base.size(), starved.size(),
+                    "an exhausted merge budget must yield the UNMERGED partition (budget=" + tiny + ")");
+            for (int i = 0; i < base.size(); i++) {
+                assertEquals(base.get(i).size(), starved.get(i).lines.size(),
+                        "block " + i + " must come back untouched (budget=" + tiny + ")");
+                assertSame(base.get(i).get(0), starved.get(i).lines.get(0),
+                        "block " + i + " must be the SAME lines, not a re-partition (budget=" + tiny + ")");
+            }
+        }
+    }
 }

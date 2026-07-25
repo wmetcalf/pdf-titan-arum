@@ -31,7 +31,12 @@
         </label>
       </div>
       <div style="margin-top:6px; display:flex; flex-direction:column; gap:3px; padding-left:2px; border-top:1px solid #333; padding-top:6px">
-        <label title="Also extract borderless (whitespace-aligned) tables. Costs extra work per page and is ignored when 'Skip table extraction' is checked."><input type="checkbox" name="streamTables"> Extract borderless tables (stream)</label>
+        <!-- streamTables is ON by default, and an unchecked HTML checkbox submits NOTHING - which a
+             default-ON flag cannot distinguish from "field omitted". The paired hidden field makes
+             unchecked submit an explicit false; checked submits [false, true] and ApiRoutes'
+             boolFormDefault takes the LAST value. Do not remove the hidden input: without it the box
+             becomes impossible to untick. -->
+        <label title="Extract borderless (whitespace-aligned) tables as well as ruled/tagged ones. ON by default: big recall win on borderless tables (ICDAR-2013 macro F1 0.5114 -> 0.8199), small precision cost on prose. Ignored when 'Skip table extraction' is checked."><input type="hidden" name="streamTables" value="false"><input type="checkbox" name="streamTables" value="true" checked> Extract borderless tables (stream) <span style="color:#777">&mdash; on by default</span></label>
         <label><input type="checkbox" name="addLinkAnnotations"> Add link annotations for bare URLs</label>
         <label><input type="checkbox" name="noSkipBlanks"> Disable blank-page skipping</label>
         <label style="display:flex; gap:6px; align-items:center">

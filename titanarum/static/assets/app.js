@@ -62,7 +62,10 @@ function fmtNum(v, digits) {
 // TITANARUM_SKIP_TABLES). Params outside the operator's allowlist are
 // silently dropped by the dispatcher, not rejected. This form does not expose
 // stream_tables/skip_tables toggles today; they can still be set via a raw
-// `params` field or a blastbox job.json.
+// `params` field or a blastbox job.json. Note that stream_tables now defaults
+// ON, so a job submitted from this form runs borderless extraction; to disable
+// it, send TITANARUM_STREAM_TABLES=0 as a raw param (an EMPTY value means "no
+// opinion" and leaves the default in place).
 function appendJobParams(fd) {
   const skipShots  = document.getElementById('toggle-skip-screenshots').checked;
   const skipImages = document.getElementById('toggle-skip-images').checked;

@@ -80,6 +80,20 @@ class ServerJobRepositoryPostgresTest {
               .locations("classpath:db/migration").target(version).load().migrate();
     }
 
+    /** The column's declared DEFAULT as PostgreSQL reports it, or null when it has none. */
+    private String columnDefaultOf(String column) throws Exception {
+        String sql = "SELECT column_default FROM information_schema.columns "
+                + "WHERE table_schema = ? AND table_name = 'jobs' AND column_name = ?";
+        try (Connection c = ds.getConnection(); var ps = c.prepareStatement(sql)) {
+            ps.setString(1, schema);
+            ps.setString(2, column);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next(), "no such column: " + column);
+                return rs.getString(1);
+            }
+        }
+    }
+
     private boolean columnExists(String column) throws Exception {
         String sql = "SELECT 1 FROM information_schema.columns "
                 + "WHERE table_schema = ? AND table_name = 'jobs' AND column_name = ?";
@@ -200,17 +214,24 @@ class ServerJobRepositoryPostgresTest {
         PdfTitanArumApp appOff = new PdfTitanArumApp();
         WorkerPool.configureApp(appOff, claimedOff, "eng", 60);
         assertFalse(appFlag(appOff, "streamTables"),
-                "the default path must still yield streamTables=false");
+                "a job submitted with streamTables=false must reach setStreamTables(false) — the "
+                        + "REST off switch has to survive claimNext and configureApp");
     }
 
     // -------------------------------------------------------------- 2. backward compatibility
 
     /**
      * An EXISTING database — schema at V7, with rows — must migrate cleanly, and those pre-existing
-     * rows must read back as the flag's default (off), i.e. keep the meaning they were created with.
+     * rows must KEEP THE MEANING THEY WERE CREATED WITH, which is the pre-flip default: off.
+     *
+     * <p>This is deliberate rolling-deploy behaviour, not an oversight. V8 backfills the new column
+     * with FALSE and V9 only moves the column DEFAULT — {@code SET DEFAULT} rewrites no rows. So a job
+     * submitted (and perhaps still pending) before the flip runs with the setting its submitter chose,
+     * and a deploy never silently re-interprets queued work. Only jobs submitted afterwards get the
+     * new default.
      */
     @Test
-    void existingDatabaseMigratesAndOldRowsReadAsTheDefault() throws Exception {
+    void existingDatabaseMigratesAndOldRowsKeepTheirOriginalMeaning() throws Exception {
         migrateTo("7");
         assertFalse(columnExists("stream_tables"),
                 "precondition: at V7 the column must not exist yet");
@@ -222,7 +243,9 @@ class ServerJobRepositoryPostgresTest {
 
         Job j = new JobRepository(ds).findById(legacy).orElseThrow();
         assertFalse(j.streamTables(),
-                "a row inserted before V8 must read as the default (stream path OFF)");
+                "a row that existed before V8 must still read FALSE after V9 moves the column "
+                        + "default: SET DEFAULT must not rewrite stored rows, so already-submitted "
+                        + "jobs keep the behaviour they were submitted under");
         // ...and the migration must not have disturbed anything else about that row.
         assertEquals("legacy.pdf", j.filename());
         assertEquals("legacyhash", j.fileHash());
@@ -244,18 +267,40 @@ class ServerJobRepositoryPostgresTest {
     }
 
     /**
-     * ROLLING DEPLOY, the other direction: an older application binary still issuing the 18-column
-     * INSERT against a database already at V8. The column default has to make that work, otherwise
-     * upgrading the DB ahead of the app takes writes down.
+     * ROLLING DEPLOY, DB ahead of app: an older application binary still issuing the 18-column INSERT
+     * against a fully migrated database. The column default has to make that work — otherwise
+     * upgrading the DB ahead of the app takes writes down — and after V9 it supplies the NEW default,
+     * so an old binary starts producing default-on jobs the moment the DB is migrated. That is the
+     * flip being deployed, and it is the one behaviour change a DB-first rollout causes.
      */
     @Test
-    void preMigrationInsertStatementStillWorksAgainstTheNewSchema() throws Exception {
+    void preMigrationInsertStatementStillWorksAndPicksUpTheNewDefault() throws Exception {
         migrate();
         UUID id = insertLegacyRow("old-binary.pdf");
         Job j = new JobRepository(ds).findById(id).orElseThrow();
-        assertFalse(j.streamTables(),
-                "an INSERT that omits stream_tables must default it to off, not fail");
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, j.streamTables(),
+                "an INSERT that omits stream_tables must succeed and take the column DEFAULT, which "
+                        + "after V9 is the shipping default");
         assertEquals("old-binary.pdf", j.filename());
+    }
+
+    /**
+     * THE COLUMN DEFAULT ITSELF, read out of a real PostgreSQL rather than inferred from the SQL text:
+     * FALSE at V8 (as it shipped) and the shipping default once V9 has applied. This is the
+     * declaration {@code StreamTablesDefaultCoherenceTest} can only check by parsing the migration
+     * files; here the database is the one answering.
+     */
+    @Test
+    void theColumnDefaultTracksTheShippingDefault() throws Exception {
+        migrateTo("8");
+        assertEquals("false", columnDefaultOf("stream_tables"),
+                "V8 shipped DEFAULT FALSE and must keep saying so");
+        migrate();
+        assertEquals(String.valueOf(PdfTitanArumApp.STREAM_TABLES_DEFAULT),
+                columnDefaultOf("stream_tables"),
+                "after V9 the jobs.stream_tables column DEFAULT must equal "
+                        + "PdfTitanArumApp.STREAM_TABLES_DEFAULT — this is what an INSERT that omits "
+                        + "the column (an old binary mid-deploy) gets");
     }
 
     /** Re-running migrate() on an already-migrated database must be a no-op, not an error. */
@@ -264,11 +309,14 @@ class ServerJobRepositoryPostgresTest {
         migrate();
         migrate();
         assertTrue(columnExists("stream_tables"));
-        try (Connection c = ds.getConnection(); Statement s = c.createStatement();
-             ResultSet rs = s.executeQuery(
-                 "SELECT COUNT(*) FROM " + schema + ".flyway_schema_history WHERE version = '8'")) {
-            rs.next();
-            assertEquals(1, rs.getInt(1), "V8 must be recorded exactly once");
+        for (String version : new String[]{"8", "9"}) {
+            try (Connection c = ds.getConnection(); Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery(
+                     "SELECT COUNT(*) FROM " + schema + ".flyway_schema_history WHERE version = '"
+                             + version + "'")) {
+                rs.next();
+                assertEquals(1, rs.getInt(1), "V" + version + " must be recorded exactly once");
+            }
         }
     }
 }

@@ -149,6 +149,50 @@ public class PdfTitanArumApp implements Callable<Integer> {
     private static final int MAX_NAME_TREE_DEPTH      = 50;
     private static final int MAX_DEREF_HOPS           = 50;
 
+    /**
+     * THE canonical shipping default for borderless ("stream") table extraction -- ON.
+     *
+     * <p>WHY A NAMED CONSTANT. This one flag is declared independently on five surfaces, in three
+     * languages, and nothing derives any of them from any other:
+     * <ol>
+     *   <li>the CLI's {@code @Option} on {@link #streamTables} (picocli, {@code --stream-tables});</li>
+     *   <li>the FIELD INITIALIZER on {@link #streamTables}, which is the default every programmatic
+     *       caller gets -- {@code new PdfTitanArumApp()} never runs picocli, so the annotation above
+     *       is invisible to the REST server and to any embedder;</li>
+     *   <li>{@link JobDescriptor#streamTables()}'s absent-key default, i.e. what a blastbox
+     *       {@code job.json} that omits {@code stream_tables} means (see {@link #runWorker});</li>
+     *   <li>the {@code jobs.stream_tables} column DEFAULT in {@code src/main/resources/db/migration}
+     *       (V8 declared FALSE, V9 sets TRUE), which is what an INSERT omitting the column means;</li>
+     *   <li>{@code titanarum/engine.py}'s {@code _DEFAULT_JOB["stream_tables"]}, the value the
+     *       blastbox dispatcher actually writes into {@code job.json}.</li>
+     * </ol>
+     * Items 1-3 read this constant, so they cannot drift. Items 4 and 5 are a different language and
+     * cannot; {@code StreamTablesDefaultCoherenceTest} parses both and fails if either disagrees with
+     * this field. Flipping any ONE of the five in isolation is the failure this constant plus that
+     * test exist to prevent -- it had already happened once here (the REST surface silently could not
+     * express the flag at all).
+     *
+     * <p>See {@link #streamTables} for the measured quality and cost behind choosing ON.
+     */
+    public static final boolean STREAM_TABLES_DEFAULT = true;
+
+    /**
+     * {@link #STREAM_TABLES_DEFAULT} as picocli needs it -- an annotation value must be a
+     * compile-time String constant, so this is the one place the boolean is spelled twice.
+     * {@code StreamTablesDefaultCoherenceTest} pins the two equal.
+     */
+    static final String STREAM_TABLES_DEFAULT_VALUE = "true";
+
+    /**
+     * Resolves a job-supplied borderless-table choice against the shipping default: {@code null}
+     * means the key was ABSENT from job.json (so: the default), and any non-null value is the
+     * caller's explicit instruction and always wins. One named place, so the absent-vs-explicit rule
+     * cannot be re-decided differently by a second caller.
+     */
+    static boolean resolveStreamTables(Boolean fromJob) {
+        return fromJob != null ? fromJob : STREAM_TABLES_DEFAULT;
+    }
+
     // I1 (warm-plan.md): per-document QR-scan / image-extraction budgets. scanQrCodes()
     // forks a ZXingReader subprocess per call and is invoked once per screenshot, per
     // resource image, and per drawn image with no document-level cap; a QR-flood PDF
@@ -235,28 +279,63 @@ private boolean skipQrScan;
     private boolean skipTables;
 
     /**
-     * Borderless ("stream") table extraction: OPT-IN, and deliberately so.
+     * Borderless ("stream") table extraction: ON by default. Turn it off with
+     * {@code --stream-tables=false}.
      *
-     * <p>Tagged (structure-tree) and lattice (drawn-ruling) extraction are always on because both
-     * rest on something the document itself asserts -- a {@code /Table} structure element, or lines
-     * actually drawn on the page. The stream path infers a table from whitespace alone. Measured
-     * end-to-end on ICDAR 2013 (document-pooled adjacency-relation macro F1, de-duplicated ground
-     * truth) the arbitrated three-path pipeline scores 0.8118 against 0.5113 for tagged+lattice
-     * alone over all pages, and 0.7927 against 0.4938 over the pages THIS CLI processes by default
-     * -- a large gain, but still below the best heuristic extractors (TEXUS 0.8259, Nurminen
-     * 0.8374, FineReader 0.8772), the size of the gain depends on how many of a corpus's tables are
-     * borderless at all, and on a 200-PDF real-world prose sample it raises the rate of documents
-     * where the FULL pipeline emits at least one table from 0.0350 to 0.0650 (over the whole
-     * 1,599-PDF population, 0.0475 to 0.0826). For a tool that runs
-     * automatically over untrusted, hostile PDFs in a triage sandbox, a table that is not really
-     * there is the more expensive error, so this stays something an operator asks for.
+     * <p>Tagged (structure-tree) and lattice (drawn-ruling) extraction rest on something the
+     * document itself asserts -- a {@code /Table} structure element, or lines actually drawn on the
+     * page. The stream path infers a table from whitespace alone, which is why it was opt-in until
+     * the numbers below were measured.
+     *
+     * <p>QUALITY, ICDAR 2013 (156 tables / 25,317 relations, adjacency-relation macro F1 over
+     * de-duplicated ground truth). Document-POOLED, the harness's end-to-end protocol: the
+     * arbitrated three-path pipeline scores <b>0.8199</b> all-pages and 0.7999 over the pages this
+     * CLI selects by default, against <b>0.5114</b> for tagged+lattice alone. Under 1:1 pairing --
+     * the protocol comparable to published work, and the one that can actually see table
+     * segmentation quality -- the full pipeline is <b>~0.73</b>, which sits between TABFIND (0.6962)
+     * and Nitro (0.7535) and below Nurminen (0.8374, the best pure heuristic), OmniPage (0.8420) and
+     * FineReader (0.8772). The gain is CORPUS-COMPOSITION DEPENDENT and that is the honest headline:
+     * on the 22 genuinely borderless documents the ruled/tagged path scores <b>0.0000</b> and this
+     * scores <b>0.7507</b>; on icdar-EU it is worth about +0.20, on icdar-US about +0.055, and on a
+     * corpus whose tables are all ruled it is worth exactly nothing. Content recovery is the
+     * clearest signal: ground-truth cell text recovered exactly rises 26.0% -> 86.8% and content
+     * lost falls 67.7% -> 11.5%.
+     *
+     * <p>COST. On a 200-PDF real-world prose sample, under this CLI's default page selection, the
+     * share of documents where the pipeline emits at least one table rises 7/200 -> 12/200 (over the
+     * whole 1,599-PDF population, 76 -> 118). Those 44 added documents were hand-adjudicated: 25 are
+     * GENUINE tables the ruled path was missing, 10 are arguable, and 9 were fabrications of which 4
+     * have since been fixed -- so the true added-fabrication rate is about 0.3%, not the 2.5% the raw
+     * rate implies. Speed is not the constraint: marginal cost p50 0.077 ms, p95 4.7 ms, worst real
+     * document +16.7 ms, end-to-end p50 260.8 -> 261.2 ms. A hostile page stays bounded by the
+     * MAX_STREAM_* work budgets (worst case ~405 ms/page, ~1.9 s/document, always with
+     * {@code truncated=true}).
+     *
+     * <p>WHY ON ANYWAY, given a fabricated table is the expensive error for hostile-PDF triage: the
+     * per-document ledger is 39 documents improved against 3 regressed (85:1 by relation weight
+     * all-pages, 115:1 shipping, never below 84:1), and all three regressions were adjudicated as
+     * metric artifacts whose flag-ON output contains strictly MORE ground-truth content. On 1,599
+     * real-world PDFs, 42 documents gain a table, 1 has a table replaced by a superset of itself, and
+     * 0 lose one.
      *
      * <p>Orthogonal to {@code --skip-tables}, which disables ALL table extraction and wins.
+     *
+     * <p>DEFAULT DECLARED ONCE: {@link #STREAM_TABLES_DEFAULT}. The {@code arity="0..1"} +
+     * {@code fallbackValue} shape is load-bearing, not decoration -- picocli sets a plain boolean
+     * flag to the OPPOSITE of its {@code defaultValue} when the flag appears, so a bare
+     * {@code @Option(defaultValue="true")} would silently turn {@code --stream-tables} into an OFF
+     * switch and break every existing caller. With an explicit {@code fallbackValue},
+     * {@code --stream-tables} still means ON, and {@code --stream-tables=false} is the off switch.
      */
-    @Option(names = {"--stream-tables"}, defaultValue = "false",
-            description = "Also extract borderless (whitespace-only) tables. Off by default: "
-                    + "lower precision than ruled/tagged extraction, so it is opt-in.")
-    private boolean streamTables;
+    @Option(names = {"--stream-tables"}, arity = "0..1", fallbackValue = "true",
+            defaultValue = STREAM_TABLES_DEFAULT_VALUE, paramLabel = "<true|false>",
+            description = "Also extract borderless (whitespace-only) tables. ON by default; "
+                    + "disable with --stream-tables=false. Large recall win on borderless tables "
+                    + "(ICDAR-2013 macro F1 0.5114 -> 0.8199 pooled; 0.0000 -> 0.7507 on the "
+                    + "borderless subset) at a small precision cost on prose (7/200 -> 12/200 "
+                    + "real-world documents emit any table, of which adjudication says ~1 is a "
+                    + "genuine fabrication).")
+    private boolean streamTables = STREAM_TABLES_DEFAULT;
 
     @Option(names = {"--skip-page-export"}, defaultValue = "false", description = "Skip per-page PDF export")
     private boolean skipPageExport;
@@ -5314,9 +5393,20 @@ for (int pageNum : pagesToProcess) {
             @JsonProperty("skip_images") boolean skipImages,
             @JsonProperty("skip_phones") boolean skipPhones,
             @JsonProperty("skip_tables") boolean skipTables,
-            /** Opt-in borderless ("stream") table extraction; see {@code --stream-tables}. Absent
-             *  in job.json means false, i.e. off, which is the shipping default. */
-            @JsonProperty("stream_tables") boolean streamTables,
+            /**
+             * Borderless ("stream") table extraction; see {@code --stream-tables}.
+             *
+             * <p>BOXED ON PURPOSE. As a primitive {@code boolean} this component could not tell
+             * "the caller asked for OFF" from "the key is not in the file": Jackson leaves an absent
+             * primitive at {@code false}, so an absent key silently meant OFF no matter what the
+             * shipping default was. That was fine while the default WAS off and became a bug the
+             * moment it wasn't -- a {@code job.json} from an older dispatcher (or any hand-written
+             * one) would have pinned the flag off while every other surface ran it on.
+             * {@link #runWorker} resolves {@code null} to {@link #STREAM_TABLES_DEFAULT}, so absent
+             * means "the shipping default" and only an explicit {@code "stream_tables": false}
+             * means off.
+             */
+            @JsonProperty("stream_tables") Boolean streamTables,
             @JsonProperty("skip_page_export") boolean skipPageExport,
             @JsonProperty("skip_text_urls") boolean skipTextUrls,
             @JsonProperty("no_skip_blanks") boolean noSkipBlanks,
@@ -5391,7 +5481,11 @@ for (int pageNum : pagesToProcess) {
         setSkipImages(job.skipImages());
         setSkipPhones(job.skipPhones());
         setSkipTables(job.skipTables());
-        setStreamTables(job.streamTables());
+        // Absent stream_tables means "the shipping default", NOT false -- see JobDescriptor.
+        // ROLLING DEPLOY: an old dispatcher's job.json that predates the key lands on
+        // STREAM_TABLES_DEFAULT here, i.e. it behaves like every other surface on this binary
+        // rather than silently keeping the pre-flip behaviour.
+        setStreamTables(resolveStreamTables(job.streamTables()));
         setSkipPageExport(job.skipPageExport());
         setSkipTextUrls(job.skipTextUrls());
         setNoSkipBlanks(job.noSkipBlanks());

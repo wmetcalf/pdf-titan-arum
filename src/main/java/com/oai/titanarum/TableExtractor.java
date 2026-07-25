@@ -2383,6 +2383,14 @@ final class TableExtractor {
      * InterruptedException/the interrupt flag must never be swallowed by the per-page
      * catch(Exception) below. FIX 1 and FIX 2 already bound the work a single page can do, so a
      * between-page check is sufficient -- no in-loop check is needed within one page.
+     *
+     * <p>NOT THE PRODUCT DEFAULT. This overload hardcodes the stream path OFF and always will: it is
+     * the tagged+lattice REFERENCE pipeline, used by callers that specifically want the ruled/tagged
+     * answer (and by the bake-off harness's {@code lattice+tagged} configuration, whose published
+     * 0.5114 macro F1 is only meaningful if this stays flag-off). The shipping default that CLI /
+     * REST / blastbox jobs get is {@link PdfTitanArumApp#STREAM_TABLES_DEFAULT}, which is now ON;
+     * production goes through the 4-arg overload with an explicit value. Do not "fix" this to follow
+     * the product default -- that would silently redefine what the flag-off baseline measures.
      */
     static Result extract(PDDocument doc, List<Integer> pagesToProcess,
                           Map<Integer, List<TextPosition>> positionsByPage) {
@@ -2393,20 +2401,24 @@ final class TableExtractor {
      * As {@link #extract(PDDocument, List, Map)}, plus the borderless ("stream") whitespace path
      * when {@code streamTables} is true.
      *
-     * <p>OPT-IN BY DESIGN, and the 3-arg overload above pins that: with {@code streamTables} false
-     * this method is bit-identical to the tagged+lattice pipeline that shipped before the stream
-     * path existed -- no stream stage runs, {@link #arbitrate} is never called, and the emitted
-     * candidate list, its ordering and {@link Result#truncated} are all unchanged. The default is
-     * off because the measured quality of the whitespace path, while competitive
-     * (document-pooled ICDAR-2013 adjacency macro F1 0.8118 end-to-end for the arbitrated pipeline
-     * over all pages -- 0.7927 under the shipping page default -- against 0.5113 and 0.4938 for
-     * tagged+lattice alone), sits below the best heuristic extractors, the arbitration gain depends
-     * on how many borderless tables a corpus actually contains, and it raises the rate at which the
-     * full pipeline emits a table on a real-world prose PDF from 0.0350 to 0.0650 on the project's
-     * 200-PDF sample (0.0475 to 0.0826 over the whole 1,599-PDF population), both measured over the
-     * pages the CLI default actually processes.
-     * For a security-triage tool run automatically on hostile input, emitting a table that is not
-     * there is the worse failure, so the operator asks for this stage explicitly.
+     * <p>STRICT SUPERSET WHEN OFF, and the 3-arg overload above pins that: with {@code streamTables}
+     * false this method is bit-identical to the tagged+lattice pipeline that shipped before the
+     * stream path existed -- no stream stage runs, {@link #arbitrate} is never called, and the
+     * emitted candidate list, its ordering and {@link Result#truncated} are all unchanged.
+     *
+     * <p>{@code streamTables} now defaults to TRUE for CLI / REST / blastbox jobs
+     * ({@link PdfTitanArumApp#STREAM_TABLES_DEFAULT}). Measured, document-pooled ICDAR-2013
+     * adjacency macro F1 over de-duplicated ground truth: the arbitrated pipeline scores 0.8199
+     * all-pages and 0.7999 under the shipping page default, against 0.5114 and 0.4938 for
+     * tagged+lattice alone; under 1:1 pairing (comparable to published work) the full pipeline is
+     * ~0.73, below Nurminen's 0.8374. The gain is corpus-composition dependent -- 0.0000 -> 0.7507 on
+     * the 22 borderless documents, ~+0.20 on icdar-EU, ~+0.055 on icdar-US, nothing at all on an
+     * all-ruled corpus. It raises the rate at which the full pipeline emits a table on a real-world
+     * prose PDF from 7/200 to 12/200 on the project's 200-PDF sample (76 -> 118 over the whole
+     * 1,599-PDF population), both over the pages the CLI default processes; hand-adjudication of the
+     * 44 added documents found 25 genuine tables, 10 arguable and 9 fabrications (4 since fixed).
+     * For a security-triage tool a table that is not there is still the worse failure, so the flag
+     * remains switchable off per job on every surface.
      *
      * <p>COMPOSITION OF BUDGETS (not multiplication). The stream stage runs inside the SAME per-page
      * loop as lattice, so:

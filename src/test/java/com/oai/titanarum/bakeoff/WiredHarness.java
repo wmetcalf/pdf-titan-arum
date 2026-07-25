@@ -332,7 +332,10 @@ class WiredHarness {
                             "--input", unit.pdf().toString(), "--output", dir.toString(),
                             "--pages", cfg.equals("on-default-pages") ? "default" : "all",
                             "--skip-screenshots", "--skip-images", "--skip-page-export", "--skip-qr"));
-                    if (!cfg.equals("off")) args.add("--stream-tables");
+                    // Both arms are EXPLICIT. The "off" arm used to just omit the flag, which was
+                    // only "off" while the CLI default was off; now that the default is ON, omitting
+                    // it would silently measure the on-pipeline twice and report a delta of 0.0000.
+                    args.add(cfg.equals("off") ? "--stream-tables=false" : "--stream-tables=true");
                     int exit = new CommandLine(new PdfTitanArumApp())
                             .execute(args.toArray(String[]::new));
                     Path report = dir.resolve("report.json");
@@ -370,16 +373,16 @@ class WiredHarness {
             deleteRecursively(work);
         }
         line("  CLI runs that failed to produce a report.json : %d", failures);
-        line("  MACRO, --pages all, no --stream-tables : %.4f (micro %.4f)", off.macro(), off.microF1());
-        line("  MACRO, --pages all, --stream-tables    : %.4f (micro %.4f)", on.macro(), on.microF1());
-        line("  delta                                  : %+.4f", on.macro() - off.macro());
-        line("  stream tables actually emitted         : %d across %d of %d documents",
+        line("  MACRO, --pages all, --stream-tables=false : %.4f (micro %.4f)", off.macro(), off.microF1());
+        line("  MACRO, --pages all, --stream-tables=true  : %.4f (micro %.4f)", on.macro(), on.microF1());
+        line("  delta                                     : %+.4f", on.macro() - off.macro());
+        line("  stream tables actually emitted            : %d across %d of %d documents",
                 streamTablesEmitted, docsWithStream, units.size());
         line("");
-        line("  SHIPPING page selection (--pages default = first 4 + last), --stream-tables:");
-        line("  MACRO                                  : %.4f (micro %.4f)",
+        line("  SHIPPING page selection (--pages default = first 4 + last), --stream-tables=true:");
+        line("  MACRO                                     : %.4f (micro %.4f)",
                 onDefaultPages.macro(), onDefaultPages.microF1());
-        line("  delta vs --pages all                   : %+.4f",
+        line("  delta vs --pages all                      : %+.4f",
                 onDefaultPages.macro() - on.macro());
         line("  corpus documents with >5 pages         : %d of %d", multiPage, units.size());
     }

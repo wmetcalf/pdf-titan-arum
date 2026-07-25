@@ -97,14 +97,22 @@ class ServerStreamTablesWiringTest {
                 "a job with stream_tables=true must call setStreamTables(true)");
     }
 
+    /**
+     * A fresh app starts at the shipping default, and a {@link Job} carrying an explicit false turns
+     * it off. Both halves matter: the first is the value an embedder gets, the second is the REST
+     * OFF PATH -- {@code configureApp} copies the DB row unconditionally, so a stored false has to
+     * beat the field initializer rather than the other way round.
+     */
     @Test
-    void defaultJobLeavesStreamTablesOff() throws Exception {
+    void freshAppTakesTheShippingDefaultAndAnExplicitFalseTurnsItOff() throws Exception {
         PdfTitanArumApp app = new PdfTitanArumApp();
-        assertFalse(appFlag(app, "streamTables"),
-                "a fresh triage app must default the stream path OFF");
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, appFlag(app, "streamTables"),
+                "a fresh triage app must start at STREAM_TABLES_DEFAULT");
         WorkerPool.configureApp(app, defaultJob(), "eng", 60);
         assertFalse(appFlag(app, "streamTables"),
-                "the default server path must still yield streamTables=false");
+                "a job row with stream_tables=false must yield streamTables=false: the operator's "
+                        + "stored choice has to win over the compiled-in default, or the REST "
+                        + "surface has no working off switch");
     }
 
     /**

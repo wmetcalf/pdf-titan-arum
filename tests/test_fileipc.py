@@ -159,11 +159,15 @@ def test_stream_tables_env_override(monkeypatch):
     assert over["stream_tables"] is True
 
 
-def test_stream_tables_default_off():
-    # Borderless (whitespace-only) table extraction is OPT-IN: measured quality is below the best
-    # heuristic extractors and it raises the full-pipeline prose false-positive rate, so the
-    # conservative default for a triage engine is off. See README ("Borderless tables").
-    assert eng._DEFAULT_JOB["stream_tables"] is False
+def test_stream_tables_default_on():
+    # Borderless (whitespace-only) table extraction is ON by default. Ruled/tagged extraction alone
+    # scores 0.0000 on genuinely borderless documents against 0.7507 with the stream path, and the
+    # per-document ledger is 39 improved to 3 regressed; the cost is a prose false-positive rate of
+    # 12/200 vs 7/200 real-world documents, of which adjudication found ~1 genuine fabrication.
+    # See README ("Borderless tables"). This is ONE OF FIVE declarations of the same default --
+    # StreamTablesDefaultCoherenceTest (Java) parses this exact line and fails if it disagrees with
+    # PdfTitanArumApp.STREAM_TABLES_DEFAULT, so do not flip it alone.
+    assert eng._DEFAULT_JOB["stream_tables"] is True
 
 
 def test_stream_tables_unset_is_not_injected(monkeypatch):
@@ -190,13 +194,18 @@ def test_stream_tables_falsey_env_values_are_off_exactly_like_its_siblings(monke
         over = eng._env_param_overrides()
         assert over["stream_tables"] is True, f"{value!r} must be ON"
         assert over["stream_tables"] is over["skip_images"], f"{value!r} must parse like siblings"
-    # Empty string = "operator set the compose variable but left it blank" -> not injected at all,
-    # so _DEFAULT_JOB's False applies. Same for the sibling.
+    # Empty string = "operator set the compose variable but left it blank" -> NOT INJECTED AT ALL, so
+    # _DEFAULT_JOB applies. Note what this means now that the default is ON: an empty
+    # TITANARUM_STREAM_TABLES leaves the stream path ENABLED. Empty means "no opinion", not "off" --
+    # exactly as it does for every sibling toggle. To disable, send a falsey value, not a blank one.
     monkeypatch.setenv("TITANARUM_STREAM_TABLES", "")
     monkeypatch.setenv(sibling, "")
     over = eng._env_param_overrides()
     assert "stream_tables" not in over
     assert "skip_images" not in over
+    assert eng._build_job(Path("/in.pdf"), Path("/out"), "a" * 64)["stream_tables"] is True, (
+        'a blank TITANARUM_STREAM_TABLES must fall through to the ON default, not to off'
+    )
 
 
 def test_stream_tables_reaches_the_job_json_the_worker_reads(monkeypatch):
@@ -208,7 +217,7 @@ def test_stream_tables_reaches_the_job_json_the_worker_reads(monkeypatch):
 
     monkeypatch.delenv("TITANARUM_STREAM_TABLES", raising=False)
     job = json.loads(json.dumps(eng._build_job(Path("/in.pdf"), Path("/out"), "a" * 64)))
-    assert job["stream_tables"] is False, "unset env must serialize the OFF default"
+    assert job["stream_tables"] is True, "unset env must serialize the ON default"
 
     monkeypatch.setenv("TITANARUM_STREAM_TABLES", "1")
     job = json.loads(json.dumps(eng._build_job(Path("/in.pdf"), Path("/out"), "a" * 64)))

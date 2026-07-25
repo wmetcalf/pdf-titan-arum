@@ -17,25 +17,27 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * CROSS-SURFACE AUDIT of the borderless-table opt-in. The flag is expressible on three
- * independent Java-side surfaces, and each one carries its OWN copy of the default:
+ * CROSS-SURFACE AUDIT of the borderless-table flag, which is ON by default
+ * ({@link PdfTitanArumApp#STREAM_TABLES_DEFAULT}). It is expressible on three independent Java-side
+ * surfaces, and each one used to carry its OWN copy of the default:
  *
  * <ol>
- *   <li>the CLI, {@code --stream-tables} -- default from picocli's {@code defaultValue="false"},
- *       applied only when picocli parses;</li>
+ *   <li>the CLI, {@code --stream-tables} -- default from picocli's {@code defaultValue}, applied only
+ *       when picocli parses;</li>
  *   <li>the blastbox file-IPC worker, {@code --run <scratch>} + {@code control/job.json}'s
- *       {@code stream_tables} -- default from Jackson leaving a {@code boolean} record component
- *       at {@code false} when the key is absent (that IS the old-job.json compatibility path);</li>
+ *       {@code stream_tables} -- default from {@link PdfTitanArumApp#resolveStreamTables} when
+ *       Jackson leaves the boxed component {@code null} because the key is absent (that IS the
+ *       old-job.json compatibility path);</li>
  *   <li>the programmatic entry ({@code new PdfTitanArumApp()} + {@code setStreamTables} +
  *       {@code callWith}) that the REST server's {@code WorkerPool} uses -- default from the Java
- *       field initializer, i.e. {@code false}, and NOT from the {@code @Option} annotation.</li>
+ *       field initializer, and NOT from the {@code @Option} annotation.</li>
  * </ol>
  *
- * <p>Because those three defaults are independent, editing {@code defaultValue} alone would flip
- * the CLI while leaving the worker and the server on the old default -- a silent per-surface
- * divergence. {@link #everySurfaceAgreesOnTheDefault()} pins them equal, so a future default flip
- * has to be made deliberately on every surface (and in {@code titanarum/engine.py}'s
- * {@code _DEFAULT_JOB}, which {@code tests/test_fileipc.py} pins on the Python side).
+ * <p>All three now read one constant, so they cannot drift; {@code StreamTablesDefaultCoherenceTest}
+ * is the tripwire for that (and for the two declarations that are not Java at all -- the
+ * {@code jobs.stream_tables} column default and {@code titanarum/engine.py}'s {@code _DEFAULT_JOB}).
+ * What THIS class adds is behaviour: it drives each surface for real and checks what actually comes
+ * out, in both directions, because agreeing on a constant is not the same as honouring it.
  *
  * <p>The worker-mode tests here drive the REAL {@code --run} control loop (pre-staged
  * {@code job.json} + {@code control.go}) rather than calling a setter, so they cover the whole
@@ -133,42 +135,49 @@ class StreamTablesSurfaceTest {
         boolean cliDefault = streamTablesOf(parsed);
 
         // (3) programmatic/server: the field initializer, with NO picocli parse -- this is the value
-        //     src/main/java-server's WorkerPool.processJob runs with (it never calls
-        //     setStreamTables at all, so the REST surface cannot express the flag today).
+        //     src/main/java-server's WorkerPool starts a fresh app from before configureApp copies
+        //     the DB row's choice over it.
         boolean programmaticDefault = streamTablesOf(new PdfTitanArumApp());
 
-        // (2) worker: Jackson's absent-boolean default for job.json.
-        boolean jobJsonDefault = new ObjectMapper()
+        // (2) worker: job.json's absent-key resolution.
+        boolean jobJsonDefault = PdfTitanArumApp.resolveStreamTables(new ObjectMapper()
                 .readValue("{\"input_path\":\"/x\",\"output_dir\":\"/y\"}",
                         PdfTitanArumApp.JobDescriptor.class)
-                .streamTables();
+                .streamTables());
 
         // Parity first: a deliberate future default flip should be told WHICH other surfaces it
         // still has to change, not merely that the value moved.
         assertEquals(cliDefault, programmaticDefault,
                 "the @Option defaultValue and the FIELD INITIALIZER are independent defaults: a "
                         + "default flip done only in the annotation would leave every programmatic "
-                        + "caller (WorkerPool.processJob, callWith) on the old default");
+                        + "caller (WorkerPool, callWith) on the old default");
         assertEquals(cliDefault, jobJsonDefault,
                 "job.json's absent-key default is a third independent default: flipping the CLI "
                         + "without changing this would make a blastbox job behave differently from "
                         + "the same invocation on the CLI");
-        assertFalse(cliDefault,
-                "the shipping default is OFF on every surface; flipping it is a product decision "
-                        + "that also has to move titanarum/engine.py's _DEFAULT_JOB and the "
-                        + "README, so this assertion is the tripwire, not a typo");
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, cliDefault,
+                "every Java surface must read STREAM_TABLES_DEFAULT rather than restating it. The "
+                        + "shipping default is ON; the DB column default and "
+                        + "titanarum/engine.py's _DEFAULT_JOB are the two declarations that cannot "
+                        + "share this constant, and StreamTablesDefaultCoherenceTest pins those.");
     }
 
     @Test
-    void preFeatureJobJsonStillDeserializesAndIsOff() throws Exception {
+    void preFeatureJobJsonStillDeserializesAndTakesTheShippingDefault() throws Exception {
         // OLD-JOB COMPATIBILITY: a job.json written before stream_tables existed must still bind
-        // every field it does carry, and must behave as default-off (not merely "not crash").
+        // every field it does carry, and must take the SHIPPING DEFAULT for the key it lacks -- not a
+        // hardcoded false. A dispatcher too old to know about the flag is asking for "whatever this
+        // binary does by default", which is the same thing the CLI and the REST server would do.
         Map<String, Object> old = preFeatureJob(Path.of("/x.pdf"), Path.of("/y"));
         String json = new ObjectMapper().writeValueAsString(old);
         PdfTitanArumApp.JobDescriptor job =
                 new ObjectMapper().readValue(json, PdfTitanArumApp.JobDescriptor.class);
 
-        assertFalse(job.streamTables(), "absent stream_tables must mean OFF");
+        assertNull(job.streamTables(), "an absent stream_tables key must stay distinguishable from "
+                + "an explicit false, which is why the component is a boxed Boolean");
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT,
+                PdfTitanArumApp.resolveStreamTables(job.streamTables()),
+                "absent stream_tables must resolve to the shipping default");
         assertEquals(150.0f, job.dpi(), "an old job.json's other fields must still bind");
         assertEquals("default", job.pages());
         assertTrue(job.skipQr());
@@ -200,12 +209,22 @@ class StreamTablesSurfaceTest {
                 "the borderless fixture has no rulings and no tags, so OFF means no tables at all");
     }
 
+    /**
+     * ROLLING DEPLOY, new worker + old job.json. The pre-feature job.json shape, byte-for-byte
+     * missing the key -- the case a deployed dispatcher/queue can still hand this worker after an
+     * upgrade. It must behave like the shipping default, i.e. identically to a CLI run on the same
+     * binary, rather than silently inheriting the pre-flip behaviour.
+     *
+     * <p>This is also the test that pins {@code runWorker} to
+     * {@link PdfTitanArumApp#resolveStreamTables} -- a {@code runWorker} that resolved the absent key
+     * itself (e.g. {@code job.streamTables() != null && job.streamTables()}) would pass every
+     * constant-comparison test and still strand old dispatchers on the old default.
+     */
     @Test
-    void workerModeLegacyJobJsonWithoutTheFieldIsOff() throws Exception {
-        // The pre-feature job.json shape, byte-for-byte missing the key -- the case a deployed
-        // dispatcher/queue can still hand this worker after an upgrade.
+    void workerModeLegacyJobJsonWithoutTheFieldTakesTheShippingDefault() throws Exception {
         JsonNode report = runWorker(jobFor("legacy", null), "legacy");
-        assertFalse(methods(report).contains("stream"),
-                "a job.json with no stream_tables key must behave as default-OFF: " + methods(report));
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, methods(report).contains("stream"),
+                "a job.json with no stream_tables key must behave as the shipping default ("
+                        + PdfTitanArumApp.STREAM_TABLES_DEFAULT + "), got " + methods(report));
     }
 }

@@ -53,18 +53,51 @@ class TableReportIntegrationTest {
         assertEquals(0, report.get("tables").size());
     }
 
-    // -------------------------------------------------------------- --stream-tables (opt-in)
+    // ------------------------------------------------------ --stream-tables (ON by default)
 
     @Test
-    void borderlessTableIsAbsentByDefault() throws Exception {
-        // The conservative default for a security-triage tool: borderless extraction is OFF, so a
-        // page with no rulings and no tags emits no table at all unless asked for.
+    void borderlessTableIsPresentByDefault() throws Exception {
+        // The default is ON: a page with no rulings and no tags still yields its table. Ruled/tagged
+        // extraction alone scores 0.0000 on genuinely borderless documents, which is why this flipped.
         Path pdf = tmp.resolve("borderless.pdf");
         TableTestPdfs.borderless3Col(pdf);
         JsonNode report = runApp(pdf, tmp.resolve("outS1"));
+        JsonNode tables = report.get("tables");
+        assertNotNull(tables);
+        assertEquals(1, tables.size(),
+                "borderless extraction is ON by default, so the CLI must find this table with no "
+                        + "flags at all");
+        assertEquals("stream", tables.get(0).get("extractionMethod").asText());
+    }
+
+    /**
+     * THE OFF SWITCH on the CLI. A default cannot be acceptable unless it is reversible per
+     * invocation, and this fixture is only findable by the stream path -- so 0 tables here is proof
+     * the stage really was disabled, not merely that nothing matched.
+     */
+    @Test
+    void streamTablesCanBeTurnedOffPerInvocation() throws Exception {
+        Path pdf = tmp.resolve("borderless.pdf");
+        TableTestPdfs.borderless3Col(pdf);
+        JsonNode report = runApp(pdf, tmp.resolve("outS1off"), "--stream-tables=false");
         assertNotNull(report.get("tables"));
         assertEquals(0, report.get("tables").size(),
-                "borderless extraction must be opt-in, not the default");
+                "--stream-tables=false must disable the borderless path entirely");
+    }
+
+    /**
+     * REGRESSION GUARD for picocli's boolean inversion: a bare {@code @Option(defaultValue="true")}
+     * makes the flag's own name turn the feature OFF. Passing the flag must still mean ON.
+     */
+    @Test
+    void passingTheFlagExplicitlyStillMeansOn() throws Exception {
+        Path pdf = tmp.resolve("borderless.pdf");
+        TableTestPdfs.borderless3Col(pdf);
+        JsonNode report = runApp(pdf, tmp.resolve("outS1on"), "--stream-tables");
+        assertEquals(1, report.get("tables").size(),
+                "--stream-tables must still ENABLE borderless extraction; if this emits 0 tables the "
+                        + "option was turned into a plain boolean flag and picocli inverted it");
+        assertEquals("stream", report.get("tables").get(0).get("extractionMethod").asText());
     }
 
     @Test
@@ -146,10 +179,25 @@ class TableReportIntegrationTest {
     }
 
     @Test
-    void jobDescriptorDefaultsStreamTablesOff() throws Exception {
+    void jobDescriptorResolvesAnAbsentStreamTablesToTheShippingDefault() throws Exception {
         PdfTitanArumApp.JobDescriptor job = new ObjectMapper()
                 .readValue("{\"input_path\":\"/x\"}", PdfTitanArumApp.JobDescriptor.class);
-        assertFalse(job.streamTables(), "absent stream_tables must mean OFF, never on");
+        assertNull(job.streamTables(),
+                "an absent key must remain distinguishable from an explicit false");
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT,
+                PdfTitanArumApp.resolveStreamTables(job.streamTables()),
+                "absent stream_tables must mean the shipping default, so a blastbox job matches an "
+                        + "equivalent CLI run on the same binary");
+    }
+
+    /** ...and an explicit false in job.json must still win against a default-ON build. */
+    @Test
+    void jobDescriptorExplicitFalseTurnsTheStreamPathOff() throws Exception {
+        PdfTitanArumApp.JobDescriptor job = new ObjectMapper()
+                .readValue("{\"input_path\":\"/x\",\"stream_tables\":false}",
+                        PdfTitanArumApp.JobDescriptor.class);
+        assertFalse(PdfTitanArumApp.resolveStreamTables(job.streamTables()),
+                "\"stream_tables\": false in job.json is the blastbox off switch");
     }
 
     @Test

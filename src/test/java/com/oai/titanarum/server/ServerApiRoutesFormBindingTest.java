@@ -1,5 +1,6 @@
 package com.oai.titanarum.server;
 
+import com.oai.titanarum.PdfTitanArumApp;
 import io.javalin.Javalin;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -169,27 +170,75 @@ class ServerApiRoutesFormBindingTest {
                 "the argument after streamTables must not be shifted");
     }
 
+    /**
+     * A raw API client that never sends the field -- e.g. every {@code curl} script written before the
+     * flag existed -- must get the SHIPPING DEFAULT, not false. This is the declaration that actually
+     * governs REST submissions: {@code JobRepository.insert} always supplies the column, so the
+     * database's own DEFAULT never comes into play for a job submitted through this route.
+     */
     @Test
-    void omittingStreamTablesYieldsTheDefaultOff() throws Exception {
+    void omittingStreamTablesYieldsTheShippingDefault() throws Exception {
         HttpResponse<String> r = postJob(List.of());
         assertEquals(202, r.statusCode(), r.body());
-        assertEquals(Boolean.FALSE, repo.args.get("streamTables"),
-                "a form with no streamTables field must keep the flag OFF");
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, repo.args.get("streamTables"),
+                "a form with no streamTables field must resolve to STREAM_TABLES_DEFAULT");
     }
 
-    /** {@code boolForm} accepts three encodings; all three must reach the new field. */
+    /** Every truthy encoding must reach the field. */
     @Test
     void streamTablesAcceptsEveryTruthyEncoding() throws Exception {
-        for (String v : new String[]{"on", "true", "1"}) {
+        for (String v : new String[]{"on", "true", "1", "yes"}) {
             repo.args = null;
             HttpResponse<String> r = postJob(List.<String[]>of(new String[]{"streamTables", v}));
             assertEquals(202, r.statusCode(), r.body());
             assertEquals(Boolean.TRUE, repo.args.get("streamTables"), "encoding rejected: " + v);
         }
-        // and anything else is off, not an error
+    }
+
+    /** THE REST OFF SWITCH: every falsey encoding must actually disable a default-ON flag. */
+    @Test
+    void streamTablesAcceptsEveryFalseyEncoding() throws Exception {
+        for (String v : new String[]{"off", "false", "0", "no"}) {
+            repo.args = null;
+            HttpResponse<String> r = postJob(List.<String[]>of(new String[]{"streamTables", v}));
+            assertEquals(202, r.statusCode(), r.body());
+            assertEquals(Boolean.FALSE, repo.args.get("streamTables"),
+                    "a default-ON flag must be switchable off per job; encoding failed: " + v);
+        }
+    }
+
+    /**
+     * An UNRECOGNISED value falls back to the default rather than silently disabling the stage. For a
+     * default-ON detection stage a typo that quietly turns it off is the worse outcome.
+     */
+    @Test
+    void anUnrecognisedStreamTablesValueFallsBackToTheDefault() throws Exception {
+        HttpResponse<String> r = postJob(List.<String[]>of(new String[]{"streamTables", "maybe"}));
+        assertEquals(202, r.statusCode(), r.body());
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, repo.args.get("streamTables"));
+    }
+
+    /**
+     * THE BROWSER'S ENCODING. An unchecked HTML checkbox submits nothing, so the template pairs a
+     * hidden {@code false} with the checkbox and the LAST value wins. Both of the sequences a real
+     * browser can produce are exercised here, because getting this wrong makes the UI checkbox
+     * impossible to untick -- and {@code formParam} (first value) would do exactly that.
+     */
+    @Test
+    void theHiddenFieldPlusCheckboxPairFromTheBrowserWorksBothWays() throws Exception {
         repo.args = null;
-        assertEquals(202, postJob(List.<String[]>of(new String[]{"streamTables", "off"})).statusCode());
-        assertEquals(Boolean.FALSE, repo.args.get("streamTables"));
+        assertEquals(202, postJob(List.<String[]>of(
+                new String[]{"streamTables", "false"})).statusCode());
+        assertEquals(Boolean.FALSE, repo.args.get("streamTables"),
+                "hidden field alone (checkbox unticked) must mean OFF");
+
+        repo.args = null;
+        assertEquals(202, postJob(List.<String[]>of(
+                new String[]{"streamTables", "false"},
+                new String[]{"streamTables", "true"})).statusCode());
+        assertEquals(Boolean.TRUE, repo.args.get("streamTables"),
+                "hidden field THEN checkbox (ticked) must mean ON -- the last value has to win, so "
+                        + "this field cannot be read with formParam()");
     }
 
     /**
@@ -250,8 +299,17 @@ class ServerApiRoutesFormBindingTest {
         assertTrue(Files.isRegularFile(template), "template not found at " + template.toAbsolutePath());
         String html = Files.readString(template);
         assertTrue(html.contains("name=\"streamTables\""),
-                "job-list.html must offer a streamTables checkbox");
-        assertTrue(html.contains("type=\"checkbox\" name=\"streamTables\""),
-                "the streamTables field must be a checkbox, so absent == off");
+                "job-list.html must offer a streamTables control");
+        assertTrue(html.contains("type=\"checkbox\" name=\"streamTables\" value=\"true\" checked"),
+                "the streamTables checkbox must be CHECKED, matching the ON default, and must carry "
+                        + "an explicit value=\"true\"");
+        assertTrue(html.contains("type=\"hidden\" name=\"streamTables\" value=\"false\""),
+                "the checkbox needs its paired hidden false: an unticked checkbox submits nothing, "
+                        + "which for a default-ON flag is indistinguishable from 'field omitted' and "
+                        + "would leave the box impossible to untick");
+        assertTrue(html.indexOf("type=\"hidden\" name=\"streamTables\"")
+                        < html.indexOf("type=\"checkbox\" name=\"streamTables\""),
+                "the hidden field must come BEFORE the checkbox: browsers submit controls in document "
+                        + "order and boolFormDefault takes the last value");
     }
 }

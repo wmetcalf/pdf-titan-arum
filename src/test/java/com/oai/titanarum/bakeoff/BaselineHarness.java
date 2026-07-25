@@ -801,6 +801,48 @@ class BaselineHarness {
         Files.writeString(outPath, "```\n" + out + "```\n", StandardCharsets.UTF_8);
         System.out.println();
         System.out.println("Report also written to " + outPath);
+
+        writePerDocTsv(byScope);
+    }
+
+    /**
+     * OPT-IN PER-DOCUMENT DUMP, {@code -DperdocOut=<path>}. Writes one TSV row per
+     * (document, scope, config, mode, protocol, ground-truth view) with that document's raw
+     * (matched, detected, gt) tally and the per-document F1 the MACRO average is the mean of.
+     *
+     * <p>Purely additive and off by default: it prints nothing, asserts nothing, and reads only the
+     * tallies the report itself already aggregated, so no row of the report can change because this
+     * exists. It is here because MACRO deltas restricted to a SUBSET of documents (e.g. the 67 whose
+     * ground truth carries cell geometry) and grouped leave-one-out validation over publication
+     * groups cannot be derived from the aggregated report -- both need the per-document terms.
+     */
+    private static void writePerDocTsv(Map<String, List<DocResult>> byScope) throws Exception {
+        String p = System.getProperty("perdocOut");
+        if (p == null || p.isBlank()) return;
+        StringBuilder tsv = new StringBuilder("doc\tscope\tconfig\tmode\tprotocol\tgt\t"
+                + "matched\tdetected\tgtTotal\tf1\tgtTablesDedup\tgtTablesRaw\n");
+        for (Map.Entry<String, List<DocResult>> e : byScope.entrySet()) {
+            for (DocResult d : e.getValue()) {
+                for (Map.Entry<String, Tally> t : d.tallies.entrySet()) {
+                    String[] k = t.getKey().split(" \\| ");
+                    Tally v = t.getValue();
+                    double pr = v.detected == 0 ? 0.0 : (double) v.matched / v.detected;
+                    double rc = v.gt == 0 ? 0.0 : (double) v.matched / v.gt;
+                    double f1 = v.matched == 0 ? 0.0 : 2 * pr * rc / (pr + rc);
+                    tsv.append(d.id).append('\t').append(e.getKey()).append('\t')
+                            .append(k[0]).append('\t').append(k[1]).append('\t')
+                            .append(k[2]).append('\t').append(k[3]).append('\t')
+                            .append(v.matched).append('\t').append(v.detected).append('\t')
+                            .append(v.gt).append('\t')
+                            .append(String.format(Locale.ROOT, "%.6f", f1)).append('\t')
+                            .append(d.gtTablesDedup).append('\t').append(d.gtTablesRaw).append('\n');
+                }
+            }
+        }
+        Path out = Path.of(p).toAbsolutePath().normalize();
+        Files.createDirectories(out.getParent());
+        Files.writeString(out, tsv.toString(), StandardCharsets.UTF_8);
+        System.out.println("Per-document tallies written to " + out);
     }
 
     // ---------------------------------------------------------------------------------- reporting

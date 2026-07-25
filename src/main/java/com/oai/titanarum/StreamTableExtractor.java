@@ -2026,6 +2026,58 @@ final class StreamTableExtractor {
     // this pass exists for.
     static final float BLOCK_MERGE_MIN_AGREE_FRACTION = 0.5f;
 
+    // ------------------------------------------------------------ Step A'': model-less bridging
+    //
+    // Merge condition 2 has a structural blind spot that Step A' shipped with. A block with fewer
+    // than 3 lines is never handed to the gutter finder at all (the per-block emit loop rejects
+    // sub-3-line blocks outright, so searching one would be wasted work) -- mergeAgreeingBlocks
+    // substitutes an EMPTY gutter set for it, and columnModelsAgree returns false for an empty set
+    // by construction. So a short block does not merely fail condition 2, it makes condition 2
+    // UNANSWERABLE, and the answer taken was "do not merge". Because such a block also becomes the
+    // group's own reference model once the group is flushed at it, it vetoes continuation in BOTH
+    // directions: one table containing a single spanning subhead, a two-line totals band, or a
+    // header row that Step A split off becomes THREE groups, and the short one is then dropped for
+    // being under 3 lines -- its rows are lost outright, not merely mis-segmented.
+    //
+    // MEASURED SIZE (SegMergeDiagHarness, over the geometry-bearing ICDAR 2013 documents, using
+    // each ground-truth table's own cell-bbox union): after Step A', 23 of 144 (table,page) units
+    // are still split across more than one production group, and of the 52 same-ground-truth-table
+    // block boundaries Step A' refuses, 43 are refused for exactly this reason. Only 8 are genuine
+    // column-model disagreements and 1 fails the gridness gate. The affected documents are eu-015,
+    // us-001, us-002, us-003, us-010, us-014, us-023, us-024, us-033, us-037 and us-039.
+    //
+    // MEASURED EFFECT of this pass. Same census after it: still-split units 23 -> 16, refused
+    // same-table boundaries 43 -> 18, and the REVERSE error -- production groups straddling more
+    // than one ground-truth table -- is UNCHANGED at 8, i.e. the recovered segmentation is not paid
+    // for in over-merging. On the 77-PDF bake-off, production config (tagged+lattice+arbitrated
+    // stream), MACRO, de-duplicated ground truth: 1:1 pairing 0.7166 -> 0.7293 and document-POOLED
+    // 0.8147 -> 0.8193, identically at both page scopes (all-pages and the shipping default);
+    // stream alone 1:1 0.5371 -> 0.5693. Five of 77 documents improve (us-001 +0.521, eu-015 +0.258,
+    // us-023 +0.174, us-002 +0.024, us-033 +0.011) and ONE regresses (eu-006 -0.010). Cost: the
+    // real-world prose false-positive rate over the whole 1,599-PDF sample, stream flag ON under the
+    // shipping page selection, moves 120 -> 122 documents (0.0750 -> 0.0763); the tracked 200-PDF
+    // subsample is unchanged at 13/200. Held out by publication group the gain is +0.011 (1:1) /
+    // +0.004 (POOLED) with t ~ 1.6, i.e. real in direction but not statistically established on a
+    // corpus with ~30 independent units.
+    //
+    // THE RULE. A model-less block is exempt from condition 2 ONLY. Condition 1 (the gap cap) and
+    // condition 3 (the merged block's own gridness) apply to it unchanged, and condition 3 is what
+    // stops this from becoming "merge anything short": a caption, title or unrelated stray line
+    // pulled into a table either fails the gridness bar or is dropped again by Step C's edge
+    // trimming, both of which run on the merged candidate exactly as they would on any other block.
+    // A model-less block also never contributes gutters to the group's reference model, which is
+    // the published treatment of a spanning row (Nurminen 2013 section 4.3: keep the row inside the
+    // table, exclude it from column derivation).
+    //
+    // WHY THE FLOOR IS THE SAME 3 LINES and not a tunable of its own: it is not a threshold to be
+    // swept, it is the exact line count below which this file refuses to derive a column model
+    // anywhere (probeBlock, the emit loop, and mergeAgreeingBlocks' base-probe skip all use it).
+    // Tying the bridge to that same number is what makes "model-less" mean "no model exists"
+    // rather than "no model was found" -- a 3+-line block whose finder legitimately resolved no
+    // gutters is a single-column prose blob, that IS evidence of discontinuity, and it must keep
+    // failing condition 2.
+    static final int BLOCK_MERGE_MODEL_MIN_LINES = 3;
+
     // Step A''s own charged work budget, in the same "real work" currency the rest of this file
     // uses: obstacles (words) handed to a bounded sub-search. The pass runs the gutter finder once
     // per base block PLUS once per merge probe, and each probe in a chain runs on a LARGER block
@@ -2049,6 +2101,17 @@ final class StreamTableExtractor {
     // branch-and-bound if allowed to run; under this budget it is cut off at ~0.7s and returns the
     // unmerged partition. A page's REAL total gutter work is therefore at most roughly doubled by
     // Step A', not multiplied by the block count.
+    //
+    // STEP A'' (model-less bridging) DOES NOT MOVE THIS BOUND. The 11,386-obstacle worst case above
+    // was computed as "the base pass plus a FULL all-pairs-merge probe chain" -- i.e. assuming every
+    // adjacent pair on the page is probed and every probe accepted, which is the maximum over all
+    // possible accept/reject patterns. Bridging changes only WHICH probes are attempted, never the
+    // Step A partition, the page's word list, or the per-probe cost, so it cannot exceed a bound that
+    // already assumed the whole chain. What it does change is the charge on a REAL page, which moves
+    // up toward that bound; measured on the 77-PDF corpus that shows as stream-path wall time
+    // p50 6.1 -> 6.5 ms, p95 25.9 -> 28.1 ms, max 33.3 -> 34.4 ms per document. Every probe a bridge
+    // attempts is charged against this same budget before it runs, and exhaustion still returns the
+    // UNMERGED partition (never a partial merge, never a thrown page).
     static final long MAX_BLOCK_MERGE_WORK = MAX_STREAM_WORDS;
 
     /**
@@ -2192,13 +2255,14 @@ final class StreamTableExtractor {
                                                 ConfidenceBar mergeBar, PageAccount account) {
         if (base.size() < 2) return unmerged(base, null);
 
-        // Per-base-block column models. Sub-3-line blocks are never merge candidates (the
-        // per-block loop rejects them outright, and an empty gutter set can never agree), so they
-        // are not searched at all.
+        // Per-base-block column models. A {@link #modelless} block is not searched at all -- the
+        // per-block emit loop rejects it outright, so a gutter set for it would be wasted work.
+        // Step A'' handles it by SKIPPING condition 2 for it rather than by searching it (see the
+        // BLOCK_MERGE_MODEL_MIN_LINES block comment).
         List<Probe> baseProbes = new ArrayList<>(base.size());
         long work = 0;
         for (List<Line> b : base) {
-            if (b.size() < 3) { baseProbes.add(new Probe(List.of(), -1, 0)); continue; }
+            if (modelless(b)) { baseProbes.add(new Probe(List.of(), -1, 0)); continue; }
             long cost = obstacleCountOf(b);
             if (work + cost > maxWork) return unmerged(base, baseProbes);   // budget out -> no merging
             work += cost;
@@ -2215,23 +2279,57 @@ final class StreamTableExtractor {
         // freshly-found set: a merged band can resolve spurious extra gutters, and chaining off
         // those would let a group drift away from the column model it started with.
         List<Gutter> refGutters = curProbe.gutters;
+        // Step A'': is the group STILL made only of model-less blocks? (See modelless() -- such a
+        // group has no reference column model to compare anything against, so condition 2 is not
+        // merely failing, it is unanswerable.) Cleared the moment a block that HAS a model joins.
+        boolean curModelless = modelless(base.get(0));
         for (int i = 1; i < base.size(); i++) {
             List<Line> next = base.get(i);
             Probe nextProbe = baseProbes.get(i);
             float gap = next.get(0).yTop - cur.get(cur.size() - 1).yTop;
             boolean merged = false;
-            if (gap <= gapCap && columnModelsAgree(refGutters, nextProbe.gutters, tol)) {
+            // Step A'': when one side is model-less, condition 2 is not failing -- it is
+            // UNANSWERABLE (there is no gutter set to compare). It is replaced, not dropped, by the
+            // one-sided form of the same question: do the model-less block's own LINES conform to
+            // the column model the OTHER side does have? See conformsToColumnModel.
+            boolean nextModelless = modelless(next);
+            boolean bridge;
+            if (curModelless && nextModelless) {
+                // Neither side has a model, so there is nothing to conform to yet. The candidate is
+                // itself model-less and can therefore produce no output; the conformance test is
+                // applied to the whole accumulated run at the first modelled block that joins it.
+                bridge = true;
+            } else if (nextModelless) {
+                float[] rb = bandOf(cur);
+                bridge = conformsToColumnModel(next, refGutters, rb[0], rb[1], medianSpace);
+            } else if (curModelless) {
+                float[] rb = bandOf(next);
+                bridge = conformsToColumnModel(cur, nextProbe.gutters, rb[0], rb[1], medianSpace);
+            } else {
+                bridge = false;                      // both modelled -> ordinary condition 2 below
+            }
+            if (gap <= gapCap && (bridge || columnModelsAgree(refGutters, nextProbe.gutters, tol))) {
                 List<Line> candidate = new ArrayList<>(cur);
                 candidate.addAll(next);
                 long cost = obstacleCountOf(candidate);
                 if (work + cost > maxWork) return unmerged(base, baseProbes);  // budget out -> no merging
                 work += cost;
                 Probe cand = probeBlock(candidate, finder, medianSpace, account);
-                if (cand.confidence >= mergeBar.barFor(cand.cols)) {
+                // A candidate that is ITSELF still model-less has no gridness evidence either way
+                // (probeBlock returns -1 for it, and the per-block emit loop would reject it for
+                // being under 3 lines whether or not it is merged), so condition 3 is deferred
+                // rather than answered "no": the group keeps accumulating and the bar is applied in
+                // full at the first step that produces a scorable block. Without this a run of
+                // single-line blocks -- a widely-spaced table where Step A splits at every row, the
+                // us-039 p2 / us-010 p2 / us-014 p2 shape -- can never reach 3 lines and so can
+                // never be recovered at all.
+                boolean ok = modelless(candidate) || cand.confidence >= mergeBar.barFor(cand.cols);
+                if (ok) {
                     cur = candidate;
                     curProbe = cand;
                     if (nextProbe.gutters != null && refGutters != null
                             && nextProbe.gutters.size() > refGutters.size()) refGutters = nextProbe.gutters;
+                    curModelless = curModelless && nextModelless;
                     merged = true;
                 }
             }
@@ -2240,10 +2338,78 @@ final class StreamTableExtractor {
                 cur = new ArrayList<>(next);
                 curProbe = nextProbe;
                 refGutters = nextProbe.gutters;
+                curModelless = nextModelless;
             }
         }
         out.add(groupOf(cur, curProbe));
         return out;
+    }
+
+    /**
+     * Step A'', the one-sided replacement for merge condition 2. A {@link #modelless} block has no
+     * gutter set of its own, so it cannot be compared model-to-model; instead its own lines are
+     * tested against the column model the other side of the boundary DOES have. Every word of every
+     * line must sit cleanly inside a column -- no word may straddle a gutter centre -- which is the
+     * same "does this line respect the table's columns" predicate {@link #scoreGrid} uses to count
+     * consistent rows and {@link #trimEdgeLines} uses to identify edge debris.
+     *
+     * <p>This is what keeps bridging from meaning "absorb anything short". The two documents that
+     * a straddle-blind bridge regressed both fail here for the same reason: eu-014 p2 pulled a
+     * TWO-LINE PROSE PARAGRAPH (x 71..524, running clean across the table's gutter at x=358) into
+     * the 14-line table below it, and eu-020 p3 pulled a two-line running header (x 58..362, across
+     * gutters at 153 and 253) into the table below it. Both cost the whole document its pairing
+     * (eu-014 1:1 F1 0.846 -> 0.000; eu-020 0.962 -> 0.460) while still clearing the gridness bar,
+     * because two extra full-width rows do not stop a 14-row grid from looking like a grid. Full-
+     * width prose is exactly what a straddle test rejects, and a genuine short table row -- a
+     * totals band, a continuation row, a header row Step A cut off -- is exactly what it accepts.
+     *
+     * <p>The second half of the test -- the block's words must occupy at least TWO of the reference
+     * model's columns -- is the other half of {@link #isNonConformingEdge}'s rule, and it is what
+     * rejects a figure label or a caption that happens to sit entirely inside one column and so
+     * straddles nothing. Measured: eu-014 p1 is a funding FLOW CHART with no annotated table at all,
+     * whose caption line ("Municipal taxes Municipa lities", x 219..412) lies wholly left of the
+     * figure block's only gutter (x=444); bridging it in built a 4-line group that then cleared the
+     * emit gate and cost the document 0.159 of 1:1 F1 in pure false-positive precision. One column
+     * of text is not a row.
+     *
+     * <p>An empty or absent reference model returns false: with no columns to conform to there is
+     * no evidence either, and the conservative answer is the pre-Step-A'' one (do not merge).
+     */
+    private static boolean conformsToColumnModel(List<Line> block, List<Gutter> gutters,
+                                                float bandX0, float bandX1, float medianSpace) {
+        if (gutters == null || gutters.isEmpty()) return false;
+        float[] bounds = colBoundsOf(gutters, bandX0, bandX1);
+        Set<Integer> cols = new HashSet<>();
+        for (Line l : block) {
+            if (l.words.size() < 2) return false;
+            // Same waiver Step C grants: a line whose own internal word spacing already has the
+            // shape of a column gutter ({@link #EDGE_COLUMN_GAP_FACTOR}) is a row whose cell text is
+            // merely wider than the reference band's, not prose. Prose has reading-flow spacing and
+            // never clears 8x a space, so the straddle test still applies to it in full.
+            if (!hasColumnShapedGap(l, medianSpace)) {
+                for (Word w : l.words) {
+                    for (Gutter g : gutters) {
+                        if (w.x0 < g.cx() && w.x1 > g.cx()) return false;
+                    }
+                }
+            }
+            for (Word w : l.words) cols.add(colOf(w.cx(), bounds));
+        }
+        return cols.size() >= 2;
+    }
+
+    /**
+     * Step A'': does this block have NO column model of its own, as a matter of construction rather
+     * than of measurement? True exactly when it has fewer than {@link #BLOCK_MERGE_MODEL_MIN_LINES}
+     * lines -- the same floor the per-block emit loop and {@link #probeBlock} use, and the reason
+     * {@link #mergeAgreeingBlocks} never runs the gutter finder on such a block at all.
+     *
+     * <p>Deliberately NOT "its gutter set came back empty": a block with 3+ lines whose finder
+     * genuinely resolved no gutters is a single-column blob (prose), and that IS evidence -- it must
+     * keep failing condition 2 rather than becoming exempt from it.
+     */
+    private static boolean modelless(List<Line> block) {
+        return block.size() < BLOCK_MERGE_MODEL_MIN_LINES;
     }
 
     /** A group whose gutters are already known (or known to have overflowed) from {@code probe}. */

@@ -578,4 +578,231 @@ class StreamSegmentationTest {
         assertEquals(1, accepted.size(), "control: with the gridness gate satisfied the same two blocks DO merge");
         assertEquals(6, accepted.get(0).lines.size());
     }
+
+    // ------------------------------------------------- Step A'': bridging model-less short blocks
+
+    /**
+     * Step A'' (this change), merge condition 2's blind spot, in isolation.
+     *
+     * <p>Three Step A blocks at a uniform 2.0x-pitch spacing, all three at the IDENTICAL 3-column
+     * x positions and all made of ordinary well-formed rows: a 3-line band, a TWO-line band, then
+     * another 3-line band. Conditions 1 (gap cap) and 3 (merged gridness) pass at both boundaries;
+     * condition 2 cannot even be evaluated at either, because {@code mergeAgreeingBlocks} never
+     * probes a sub-3-line block for a column model (it substitutes an EMPTY gutter set, and {@link
+     * StreamTableExtractor#columnModelsAgree} returns false for an empty set by construction). A
+     * model-less block therefore VETOES continuation in BOTH directions: the group is flushed when
+     * the 2-line band is reached, and the 2-line band -- now the group's own reference model, and
+     * empty -- cannot agree with the band below it either. One table becomes three groups, of which
+     * the middle one is then dropped for having fewer than 3 lines, so its rows are lost outright.
+     *
+     * <p>Why this shape and not a corpus quirk: measured on the ICDAR 2013 {@code -str.xml} cell
+     * geometry (SegMergeDiagHarness), 43 of the 52 same-ground-truth-table block boundaries that
+     * Step A' still refuses are refused for exactly this reason (8 are genuine column-model
+     * disagreements; 1 fails the gridness gate), spread over 11 documents -- us-001 p1 and p3 are
+     * literally this fixture (9+2 then 2+7 lines, both at 2.00x the page pitch). The ground truth
+     * keeps such interior short bands INSIDE the table, so splitting there is a scored error, and
+     * the published heuristic answer (Nurminen 2013 section 4.3, steps 2 and 5) is likewise to keep
+     * the row and merely exclude it from column derivation -- which is what a bridged block does
+     * here, since it contributes no gutters to the group's reference model.
+     *
+     * <p>RED before the fix: {@code groups.size()} is 3, not 1.
+     */
+    @Test
+    void modellessShortBlockBetweenAgreeingBandsDoesNotSplitTheTable() {
+        float[][] slots = {{10, 60}, {70, 120}, {130, 180}};
+        List<StreamTableExtractor.Line> upper = rows(0, 3, slots, 1);
+        float yMid = 2 * MP + 2 * MP;                       // 2.0x pitch below the upper band
+        List<StreamTableExtractor.Line> mid = rows(yMid, 2, slots, 1);
+        List<StreamTableExtractor.Line> lower = rows(yMid + MP + 2 * MP, 3, slots, 1);
+
+        // Fixture sanity: this is condition 2's blind spot, not a failure of conditions 1 or 3.
+        assertEquals(40f, mid.get(0).yTop - upper.get(upper.size() - 1).yTop, 0.01f,
+                "fixture: the middle band sits 2.0x the pitch below the upper band");
+        assertEquals(40f, lower.get(0).yTop - mid.get(mid.size() - 1).yTop, 0.01f,
+                "fixture: the lower band sits 2.0x the pitch below the middle band");
+        assertTrue(40f <= StreamTableExtractor.BLOCK_MERGE_MAX_GAP_FACTOR * MP,
+                "condition 1 (gap cap) must PASS at both boundaries");
+        List<StreamTableExtractor.Line> whole = concatBlocks(concatBlocks(upper, mid), lower);
+        assertTrue(confidenceOf(whole) >= StreamTableExtractor.STREAM_CONFIDENCE_MIN,
+                "condition 3 (merged gridness) must PASS, so it cannot be what rejects the merge; got "
+                        + confidenceOf(whole));
+        assertTrue(StreamTableExtractor.columnModelsAgree(guttersOf(upper), guttersOf(lower),
+                        StreamTableExtractor.BLOCK_MERGE_GUTTER_TOL_FACTOR * MS),
+                "the two OUTER bands' column models agree -- only the middle band has none");
+
+        List<StreamTableExtractor.BlockGroup> groups = StreamTableExtractor.mergeAgreeingBlocks(
+                List.of(upper, mid, lower), new BreuelGutterFinder(), MS, MP);
+        assertEquals(1, groups.size(),
+                "a model-less short band must not split one table into three groups, got sizes "
+                        + groups.stream().map(g -> g.lines.size()).toList());
+        assertEquals(8, groups.get(0).lines.size(),
+                "the merged group must carry all 8 physical lines (3 + 2 + 3)");
+    }
+
+    /**
+     * The same blind spot with the model-less block LEADING the table rather than sitting inside
+     * it: a single well-formed row 2.0x the pitch above a 4-line band at the same column
+     * positions. Measured on the corpus this is the shape of us-024 p2 (1 line then 51), us-003 p1
+     * (1 then 4), us-033 p2 (1 then 7, twice) and us-037 p1 -- a header or label row that Step A
+     * split off from the body it belongs to. The group's reference column model starts out EMPTY,
+     * so condition 2 rejects the very first merge and the group can never acquire a model at all.
+     *
+     * <p>RED before the fix: {@code groups.size()} is 2, not 1.
+     */
+    @Test
+    void modellessShortBlockLeadingAnAgreeingBandDoesNotSplitTheTable() {
+        float[][] slots = {{10, 60}, {70, 120}, {130, 180}};
+        List<StreamTableExtractor.Line> lead = rows(0, 1, slots, 1);
+        List<StreamTableExtractor.Line> body = rows(2 * MP, 4, slots, 1);
+
+        assertEquals(40f, body.get(0).yTop - lead.get(0).yTop, 0.01f,
+                "fixture: the band sits 2.0x the pitch below the leading row");
+        assertTrue(confidenceOf(concatBlocks(lead, body)) >= StreamTableExtractor.STREAM_CONFIDENCE_MIN,
+                "condition 3 (merged gridness) must PASS; got " + confidenceOf(concatBlocks(lead, body)));
+
+        List<StreamTableExtractor.BlockGroup> groups = StreamTableExtractor.mergeAgreeingBlocks(
+                List.of(lead, body), new BreuelGutterFinder(), MS, MP);
+        assertEquals(1, groups.size(),
+                "a model-less leading row must not be left as its own group, got sizes "
+                        + groups.stream().map(g -> g.lines.size()).toList());
+        assertEquals(5, groups.get(0).lines.size());
+    }
+
+    /**
+     * The guard that stops Step A'' from becoming "merge anything short". A model-less block is
+     * exempt from condition 2 ONLY -- conditions 1 and 3 still apply to it in full. Here a single
+     * model-less row sits between two 3-line blocks built with the same numeric-column-moves
+     * construction {@link #mergeIsRejectedWhenMergedBlockFailsGridnessGate} uses: each block has a
+     * numeric column of its own (which blocks {@code scoreGrid}'s prose hard veto individually),
+     * their union has none (each candidate column is only ~50% numeric), so the union is three
+     * columns of full-width text, the veto fires, and confidence is 0. Bridging must be refused,
+     * exactly as a non-bridged merge would be.
+     *
+     * <p>The CONTROL at the end is what makes this a test of condition 3 rather than of the
+     * bridge: identical geometry and an identical model-less block in the middle, but with the
+     * numeric column in the SAME place in both bands, so the union keeps a numeric column, the
+     * veto cannot fire, and the bridge IS taken.
+     */
+    @Test
+    void bridgingStillObeysTheGridnessGate() {
+        // Tight 6pt gutters so each column's text fills >85% of its width (the prose signature).
+        float[][] slots = {{10, 60}, {66, 116}, {122, 172}};
+        List<StreamTableExtractor.Line> upperNum1 = rows(0, 3, slots, 1);
+        float yMid = 2 * MP + 2 * MP;
+        List<StreamTableExtractor.Line> mid = rows(yMid, 1, slots, 1);
+        float yLower = yMid + 2 * MP;
+        List<StreamTableExtractor.Line> lowerNum2 = rows(yLower, 3, slots, 2);
+
+        List<StreamTableExtractor.Line> whole = concatBlocks(concatBlocks(upperNum1, mid), lowerNum2);
+        assertTrue(confidenceOf(whole) < StreamTableExtractor.STREAM_CONFIDENCE_MIN,
+                "fixture sanity: the three-block union must FAIL the gridness gate, got "
+                        + confidenceOf(whole));
+
+        List<StreamTableExtractor.BlockGroup> groups = StreamTableExtractor.mergeAgreeingBlocks(
+                List.of(upperNum1, mid, lowerNum2), new BreuelGutterFinder(), MS, MP);
+        assertTrue(groups.size() > 1,
+                "bridging a model-less block must still obey the gridness gate; got sizes "
+                        + groups.stream().map(g -> g.lines.size()).toList());
+
+        // CONTROL: same geometry, same model-less middle block, numeric column in the SAME place.
+        List<StreamTableExtractor.Line> lowerNum1 = rows(yLower, 3, slots, 1);
+        List<StreamTableExtractor.BlockGroup> accepted = StreamTableExtractor.mergeAgreeingBlocks(
+                List.of(upperNum1, mid, lowerNum1), new BreuelGutterFinder(), MS, MP);
+        assertEquals(1, accepted.size(),
+                "control: with the gridness gate satisfied the bridge IS taken, got sizes "
+                        + accepted.stream().map(g -> g.lines.size()).toList());
+        assertEquals(7, accepted.get(0).lines.size());
+    }
+
+    /**
+     * The gap cap still applies to a model-less block: the same leading-row shape as {@link
+     * #modellessShortBlockLeadingAnAgreeingBandDoesNotSplitTheTable} but 3.0x the pitch away, just
+     * over {@link StreamTableExtractor#BLOCK_MERGE_MAX_GAP_FACTOR}. A caption or title sitting well
+     * above a table must stay its own (rejected) block rather than becoming row 0 of it.
+     */
+    @Test
+    void modellessBlockBeyondTheGapCapIsNotBridged() {
+        float[][] slots = {{10, 60}, {70, 120}, {130, 180}};
+        List<StreamTableExtractor.Line> lead = rows(0, 1, slots, 1);
+        List<StreamTableExtractor.Line> body = rows(3 * MP, 4, slots, 1);
+
+        assertEquals(60f, body.get(0).yTop - lead.get(0).yTop, 0.01f,
+                "fixture: 3.0x the pitch, just over the 2.5x merge cap");
+        List<StreamTableExtractor.BlockGroup> groups = StreamTableExtractor.mergeAgreeingBlocks(
+                List.of(lead, body), new BreuelGutterFinder(), MS, MP);
+        assertEquals(2, groups.size(),
+                "a model-less block beyond the gap cap must NOT be bridged, got sizes "
+                        + groups.stream().map(g -> g.lines.size()).toList());
+    }
+
+    /**
+     * End-to-end (real PDF, {@code extractPage}) version of
+     * {@link #modellessShortBlockBetweenAgreeingBandsDoesNotSplitTheTable}: one 3-column
+     * borderless table whose middle two rows are set off by 38pt band gaps (1.9x the 20pt pitch --
+     * over Step A's 1.6x split threshold, under Step A''s 2.5x merge cap), which is the us-001
+     * p1/p3 shape. The table must come out as ONE hit containing rows from every band, including
+     * the two middle rows a sub-3-line block would otherwise drop on the floor.
+     *
+     * <p>RED before the fix: two hits of 3 rows each, and the two middle rows are lost.
+     */
+    @Test
+    void shortInteriorBandInsideATableIsNotATableBoundary() throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(300, 460));
+            doc.addPage(page);
+            PDType1Font f = helv();
+            String[][] upper = {
+                {"Region", "Votes", "Pct"},
+                {"North", "1200", "41.2"},
+                {"South", "900", "30.9"}
+            };
+            String[][] mid = {
+                {"Coastal", "610", "20.9"},
+                {"Inland", "540", "18.5"}
+            };
+            String[][] lower = {
+                {"East", "450", "15.4"},
+                {"West", "360", "12.5"},
+                {"Alpha", "220", "7.5"}
+            };
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setFont(f, 11);
+                float[] colX = {40, 150, 230};
+                float y = 400;
+                for (String[] r : upper) {
+                    for (int c = 0; c < 3; c++) {
+                        cs.beginText(); cs.newLineAtOffset(colX[c], y); cs.showText(r[c]); cs.endText();
+                    }
+                    y -= 20;
+                }
+                y -= 18;                       // 38pt total gap = 1.9x the 20pt pitch
+                for (String[] r : mid) {
+                    for (int c = 0; c < 3; c++) {
+                        cs.beginText(); cs.newLineAtOffset(colX[c], y); cs.showText(r[c]); cs.endText();
+                    }
+                    y -= 20;
+                }
+                y -= 18;
+                for (String[] r : lower) {
+                    for (int c = 0; c < 3; c++) {
+                        cs.beginText(); cs.newLineAtOffset(colX[c], y); cs.showText(r[c]); cs.endText();
+                    }
+                    y -= 20;
+                }
+            }
+            List<TextPosition> glyphs = TableTestPdfs.harvestGlyphs(doc, 0);
+            List<TableExtractor.TableHit> hits = StreamTableExtractor.extractPage(1, glyphs);
+            assertEquals(1, hits.size(),
+                    "a short interior band must not split one table into two hits, got "
+                            + hits.stream().map(h -> h.rowCount + "x" + h.colCount).toList());
+            TableExtractor.TableHit t = hits.get(0);
+            assertEquals(3, t.colCount, "colCount must be the table's real 3 columns");
+            assertEquals(8, t.rowCount, "every physical row must survive (3 + 2 + 3)");
+            List<String> col0 = new ArrayList<>();
+            for (List<String> row : t.rows) col0.add(row.isEmpty() ? "" : row.get(0));
+            assertEquals(List.of("Region", "North", "South", "Coastal", "Inland",
+                                 "East", "West", "Alpha"), col0,
+                    "the rows must be in document order in ONE table");
+        }
+    }
 }

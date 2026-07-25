@@ -95,6 +95,11 @@ class BaselineHarness {
     private static final String G_RAW = "raw";
 
     private static final String C_FULL   = "full(tagged+lattice+stream)";
+    /** The same three paths, merged by {@link TableExtractor#arbitrate} (per-region path arbitration
+     *  on extraction-time signals) instead of by the positional overlap-drop {@link #C_FULL} uses.
+     *  Added ALONGSIDE C_FULL, never replacing it, so both merge rules are reported side by side and
+     *  every pre-existing row of this report is unchanged. */
+    private static final String C_FULL_ARB = "full+arbitration";
     private static final String C_LT     = "lattice+tagged";
     private static final String C_STREAM = "stream";
     private static final List<String> FINDER_NAMES =
@@ -505,6 +510,22 @@ class BaselineHarness {
             List<TableExtractor.TableHit> full = new ArrayList<>(taggedLattice);
             full.addAll(keptStream);
 
+            // ---- the SAME three paths, merged by production per-region arbitration instead ----
+            // TableExtractor.arbitrate is a pure function of extraction-time signals (grid occupancy,
+            // row/column counts, the stream path's gridness confidence). It sees no ground truth.
+            // A RulingOverflowException from its work budget cannot happen on this corpus (measured
+            // by ArbRuleHarness: the densest page carries 9 ruling and 4 stream candidates, against
+            // per-page caps of 50 and 20 and a budget with ~8900 saturated pages of headroom), but is
+            // handled the conservative way -- fall back to the positional merge -- rather than
+            // losing the document.
+            List<TableExtractor.TableHit> fullArb;
+            try {
+                fullArb = TableExtractor.arbitrate(taggedLattice, streamDefault);
+            } catch (TableExtractor.RulingOverflowException e) {
+                fullArb = full;
+                d.error = (d.error == null ? "" : d.error + "; ") + "arbitrate: work budget";
+            }
+
             // ---- per-finder region RERUN, cached per RAW ground-truth table index ----
             Map<String, Map<Integer, List<TableExtractor.TableHit>>> rerunByFinder =
                     new LinkedHashMap<>();
@@ -541,6 +562,7 @@ class BaselineHarness {
             record Cfg(String name, List<TableExtractor.TableHit> hits, String finder) {}
             List<Cfg> cfgs = new ArrayList<>();
             cfgs.add(new Cfg(C_FULL, full, null));
+            cfgs.add(new Cfg(C_FULL_ARB, fullArb, null));
             cfgs.add(new Cfg(C_LT, taggedLattice, null));
             cfgs.add(new Cfg(C_STREAM, streamDefault, "breuel"));
             for (GutterFinder f : finders) {
@@ -723,7 +745,7 @@ class BaselineHarness {
      * computing it.
      */
     private static List<String> reportConfigs() {
-        List<String> out = new ArrayList<>(List.of(C_FULL, C_LT, C_STREAM));
+        List<String> out = new ArrayList<>(List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM));
         for (String f : FINDER_NAMES) {
             if (!f.equals("breuel")) out.add(C_STREAM + ":" + f);
         }
@@ -753,7 +775,7 @@ class BaselineHarness {
         line("  %-26s %-18s %-11s %-7s %8s %8s %8s %8s %5s",
                 "config", "mode", "subset", "protocol", "MACRO", "microP", "microR", "microF1", "docs");
         for (Subset s : subsets(docs)) {
-            for (String config : List.of(C_FULL, C_LT, C_STREAM)) {
+            for (String config : List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM)) {
                 for (String mode : List.of(M_E2E, M_REGION, M_RERUN)) {
                     if (mode.equals(M_RERUN) && !isStreamConfig(config)) continue;
                     String protocol = primaryProtocol(mode);
@@ -783,7 +805,7 @@ class BaselineHarness {
 
         for (Subset s : subsets(docs)) {
             List<String> configs = s.name().equals("ALL-77") || s.name().equals("borderless")
-                    ? reportConfigs() : List.of(C_FULL, C_LT, C_STREAM);
+                    ? reportConfigs() : List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM);
             line("");
             line("--- subset %s (n=%d PDFs) ---", s.name(), s.docs().size());
             line("  %-26s %-18s %-7s %-5s %8s %8s %8s %8s %5s %5s %5s",
@@ -935,7 +957,7 @@ class BaselineHarness {
         line("  %-26s %-26s %5s %9s %9s %8s %9s %9s %8s",
                 "config", "bucket", "docs", "1:1 MACRO", "PL MACRO", "dMACRO",
                 "1:1 micro", "PL micro", "dmicro");
-        for (String config : List.of(C_FULL, C_LT, C_STREAM)) {
+        for (String config : List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM)) {
             for (int bucket = 0; bucket < 3; bucket++) {
                 final int b = bucket;
                 List<DocResult> sel = docs.stream()
@@ -984,7 +1006,7 @@ class BaselineHarness {
         line("PROTOCOL SELF-CHECK");
         rule();
         int checked = 0, denomMismatch = 0, aliasMismatch = 0;
-        List<String> configs = new ArrayList<>(List.of(C_FULL, C_LT, C_STREAM));
+        List<String> configs = new ArrayList<>(List.of(C_FULL, C_FULL_ARB, C_LT, C_STREAM));
         for (String f : FINDER_NAMES) configs.add(C_STREAM + ":" + f);
         for (DocResult d : docs) {
             for (String config : configs) {
@@ -1023,6 +1045,35 @@ class BaselineHarness {
                 aliasMismatch, aliasMismatch == 0 ? "(identical, as expected)" : "*** BUG ***");
     }
 
+    /**
+     * Page 1 of one prose PDF through the whole pipeline, both merge rules.
+     * Returns {latticeTaggedTables, positionalMergeTables, arbitratedTables, ruledCount, streamCount}.
+     */
+    private static int[] fullPipelinePage1(GutterFinder finder, Path pdf) {
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            if (doc.getNumberOfPages() < 1) return new int[]{0, 0, 0, 0, 0};
+            List<TextPosition> glyphs = TableTestPdfs.harvestGlyphs(doc, 0);
+            Map<Integer, List<TextPosition>> byPage = new LinkedHashMap<>();
+            byPage.put(1, glyphs);
+            List<TableExtractor.TableHit> ruled =
+                    new ArrayList<>(TableExtractor.extract(doc, List.of(1), byPage).tables);
+            List<TableExtractor.TableHit> str = StreamTableExtractor.extractPage(1, glyphs, finder);
+            List<TableExtractor.TableHit> positional = new ArrayList<>(ruled);
+            for (TableExtractor.TableHit s : str) {
+                if (!MetricFixHarness.overlapsSubstantially(s, ruled)) positional.add(s);
+            }
+            int arb;
+            try {
+                arb = TableExtractor.arbitrate(ruled, str).size();
+            } catch (TableExtractor.RulingOverflowException e) {
+                arb = positional.size();
+            }
+            return new int[]{ruled.size(), positional.size(), arb, ruled.size(), str.size()};
+        } catch (Throwable t) {
+            return new int[]{0, 0, 0, 0, 0};   // unreadable prose file -> conservatively "no table"
+        }
+    }
+
     private void printProseAndTiming(List<GutterFinder> finders, List<Double> streamMs) {
         line("");
         rule();
@@ -1047,6 +1098,32 @@ class BaselineHarness {
                 line("    %-10s %d/%d = %.4f", f.name(), flagged, prose.size(),
                         flagged / (double) prose.size());
             }
+            // The rows above are the STREAM PATH ALONE (the historical watch item). Per-region
+            // arbitration changes what the FULL pipeline emits, so the full pipeline's own
+            // false-positive rate is measured too, under BOTH merge rules, on the same 200 files.
+            // Arbitration can only SELECT among candidates the two paths already produced -- it can
+            // never invent one -- so the arbitrated rate can differ from the positional rate only by
+            // trading a lattice false table for a stream one, or vice versa, on the same page.
+            int posFp = 0, arbFp = 0, latFp = 0, maxRuledPerPage = 0, maxStreamPerPage = 0;
+            GutterFinder breuel = finders.get(0);
+            for (Path p : prose) {
+                int[] r = fullPipelinePage1(breuel, p);
+                if (r[0] > 0) latFp++;
+                if (r[1] > 0) posFp++;
+                if (r[2] > 0) arbFp++;
+                maxRuledPerPage = Math.max(maxRuledPerPage, r[3]);
+                maxStreamPerPage = Math.max(maxStreamPerPage, r[4]);
+            }
+            line("  full-pipeline false-positive rate on the same %d prose PDFs (page 1, >=1 table"
+                    + " emitted):", prose.size());
+            line("    lattice+tagged only          %d/%d = %.4f", latFp, prose.size(),
+                    latFp / (double) prose.size());
+            line("    full, positional merge       %d/%d = %.4f", posFp, prose.size(),
+                    posFp / (double) prose.size());
+            line("    full, per-region arbitration %d/%d = %.4f", arbFp, prose.size(),
+                    arbFp / (double) prose.size());
+            line("  arbitration DoS headroom on prose: max ruling candidates on one page=%d,"
+                    + " max stream candidates=%d", maxRuledPerPage, maxStreamPerPage);
         }
         List<Double> sorted = new ArrayList<>(streamMs);
         Collections.sort(sorted);

@@ -661,6 +661,9 @@ function buildTablesSection(report) {
     html += '<div class="table-block">';
     html += '<div class="table-block-hdr">';
     html += '<span>Table — page '+esc(t.page != null ? t.page : '?')+', '+esc(t.rowCount)+'×'+esc(t.colCount)+', '+esc(t.extractionMethod||'')+'</span>';
+    if (t.confidence != null) {
+      html += '<span class="badge badge-neutral" title="stream-path gridness confidence">conf '+esc(fmtNum(t.confidence, 2))+'</span>';
+    }
     if (t.likelyDuplicateOfTagged) {
       html += '<span class="badge dup-badge" title="This lattice table’s cell footprint is substantially covered by an already-emitted tagged table on the same page">possible duplicate of tagged table</span>';
     }

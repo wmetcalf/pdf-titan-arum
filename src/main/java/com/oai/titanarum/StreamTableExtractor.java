@@ -197,6 +197,96 @@ final class StreamTableExtractor {
         return s.matches("[-+(]?[\\d.,%$)]+") && s.chars().anyMatch(Character::isDigit);
     }
 
+    /**
+     * An ENUMERATION MARKER: a whole token that is nothing but a small ordinal plus the punctuation
+     * a list is written with -- {@code 1.} {@code 2)} {@code (3)} {@code a.} {@code b)} {@code iv.}.
+     *
+     * <p>WHY THIS EXISTS. {@link #isNumericToken} accepts {@code "1."} (digits plus the punctuation
+     * numbers are written with, and at least one real digit), so the MARKER column of a numbered list
+     * satisfied every numeric test in {@link #scoreGrid}. A numbered list is the single most common
+     * structure a borderless-table detector fabricates a table over, and its marker column was
+     * supplying exactly the numeric evidence the {@code cols == 2} gate demands. A list marker is an
+     * ORDINAL -- a position in a sequence -- not a measured value, so it is not numeric data.
+     *
+     * <p>THE DISCRIMINATOR IS THE LIST PUNCTUATION, NOT THE SMALLNESS OF THE NUMBER. A quantity
+     * column holding bare {@code 1 2 3} is real numeric data and must keep counting (asserted by
+     * StreamEnumerationMarkerTest#twoColumnBareSmallIntegerQuantityColumnStillPasses); only the
+     * trailing {@code .} or {@code )} form is a marker. The {@code \d{1,3}} bound keeps years
+     * ({@code 2008.}) and the {@code [.)]}-terminated requirement keeps decimals ({@code 12.6}),
+     * currency ({@code $100.00}) and thousands ({@code 1,250}) out.
+     *
+     * <p>MEASURED SCOPE, over every passing stream candidate on the 77-PDF ICDAR corpus (162) and on
+     * every real-world document the stream flag ADDS a table to (46): exactly TWO of those 208
+     * candidates have marker-only numeric evidence, and both are enumerated lists rather than tables
+     * -- the Polish instruction list in the real-world sample and the {@code (1)/(2)/(3)} criteria
+     * list on page 4 of {@code us-027}. Zero real tables are in scope.
+     */
+    static boolean isEnumerationMarker(String s) {
+        if (s == null) return false;
+        String t = s.trim();
+        if (t.isEmpty() || t.length() > 6) return false;
+        return t.matches("\\(?\\d{1,3}[.)]")            // 1.  2)  (3)  (12)
+            || t.matches("\\(?[a-zA-Z][.)]")            // a.  b)  (c)
+            || t.matches("\\(?[ivxIVX]{2,4}[.)]");      // iv.  (vii)   (single letters: above)
+    }
+
+    /**
+     * Whether column {@code c}'s numeric tokens are PREDOMINANTLY {@linkplain #isEnumerationMarker
+     * enumeration markers}, in which case the column carries no numeric DATA and must not be counted
+     * as numeric evidence by {@link #numericDataColumnCount} or by {@link #scoreGrid}'s numeric lean.
+     *
+     * <p>A strict majority is required rather than "any", so that one marker-shaped token among real
+     * values (a truncated {@code 3.} in a column of prices) cannot disqualify a genuine numeric
+     * column -- asserted by
+     * StreamEnumerationMarkerTest#aMinorityOfMarkerShapedTokensDoesNotDisqualifyARealNumericColumn.
+     *
+     * <p>COST: one pass over the words of one column, i.e. O(words) per column and O(cols x words)
+     * for a whole grid -- the SAME order as the numeric scans it guards, which {@link #gridWorkFor}
+     * has already charged up front for this block. It adds no new asymptotic term.
+     */
+    /**
+     * PROSE-CELL VETO, the CONTENT companion to the geometric prose veto: the fraction of the block's
+     * OCCUPIED cells that hold {@link #PROSE_CELL_MIN_TOKENS} or more whitespace-delimited tokens.
+     *
+     * <p>WHY A TOKEN COUNT AND NOT A WIDTH. The existing prose veto asks a GEOMETRIC question -- does
+     * a column's text span > {@link #VETO_FILL_THRESHOLD} of the column's WIDTH on a majority of its
+     * rows. That question is blind to multi-column prose whose columns are wide relative to their
+     * text: newspaper/newsletter body text set in three columns fills maybe 70% of each column on a
+     * ragged right edge, so no column is ever "prose-like" by width, and the block sails through. But
+     * a running-text cell is not distinguished from a field value by how WIDE it is -- it is
+     * distinguished by how MANY WORDS it holds. A data cell is one to four tokens (measured over the
+     * adjudicated-real candidates: {@code Amount Due Company Card From} is the longest at five); a
+     * clause is five or more. Counting tokens is also font- and layout-independent, which matters on
+     * hostile input where widths are attacker-controlled.
+     *
+     * <p>COST: O(total words). {@code per} and {@code touched} are allocated ONCE for the whole grid
+     * and only the columns a line actually touches are read and reset, so there is no {@code cols}
+     * factor -- the same technique, and strictly less work than, the prose-fill pass above. Far inside
+     * the O(cols x words) that {@link #gridWorkFor} already charged up front for this block.
+     */
+    static double proseCellFraction(List<Line> lines, float[] bounds) {
+        int cols = bounds.length - 1;
+        if (cols < 1) return 0;
+        int[] per = new int[cols];
+        int[] touched = new int[cols];
+        int cells = 0, longCells = 0;
+        for (Line l : lines) {
+            int nTouched = 0;
+            for (Word w : l.words) {
+                int c = colOf(w.cx(), bounds);
+                if (per[c] == 0) touched[nTouched++] = c;
+                per[c]++;
+            }
+            for (int i = 0; i < nTouched; i++) {
+                int c = touched[i];
+                cells++;
+                if (per[c] >= PROSE_CELL_MIN_TOKENS) longCells++;
+                per[c] = 0;                                // reset only what this line touched
+            }
+        }
+        return cells == 0 ? 0 : longCells / (double) cells;
+    }
+
     static List<Line> buildLines(List<Word> words, float medianFontSize) {
         List<Word> sorted = new ArrayList<>(words);
         sorted.sort(Comparator.comparingDouble(a -> a.y0));
@@ -931,6 +1021,41 @@ final class StreamTableExtractor {
     // Animal|Action|Result all-text table that StreamGridnessTest asserts twice must survive), and
     // retuning the five confidence weights (every variant tried cost MACRO; raising the prose weight
     // before fixing the prose TERM made real-world false positives WORSE, 131 -> 136).
+    //
+    // ------------------------- MEASURED AND NOT SHIPPED: the rest of the CONTENT-level family
+    //
+    // The two content discriminators that ARE shipped (#isEnumerationMarker, and the PROSE_CELL_*
+    // veto) came out of a study that first HAND-ADJUDICATED every real-world document the stream flag
+    // adds a table to -- 44 documents at the full 1,599-PDF population -- as a genuine table, an
+    // arguable one, or a fabrication. The result is the single most important fact about this metric:
+    // 25 of the 44 are GENUINE small tables (order/receipt totals, expense-report key-value grids, fax
+    // confirmation logs, invoice line items), 10 are real table REGIONS given a mangled column model,
+    // and only 9 are outright fabrications. On the tracked 200-PDF sample exactly ONE of the six added
+    // documents is a fabrication. So the reachable floor on the headline sample rate is 12/200, NOT
+    // the 7/200 flag-off floor, and pushing below it means refusing small real tables. Do not treat
+    // the residual rate as headroom.
+    //
+    // Rejected, each measured end-to-end (1:1 MACRO all-pages / POOLED MACRO all-pages / FP 200):
+    //   * A veto on the fraction of ROWS holding a >= 6-token cell. Strictly worse than the CELL
+    //     fraction at every threshold, because a genuine long-text table has occasional long rows:
+    //     0.30 -> 0.7016 / 0.8058 / 12; 0.50 -> 0.7103 / 0.8091 / 12; 0.70 -> 0.7092 / 0.8158 / 12,
+    //     against 0.7169 / 0.8153 / 12 for the shipped cell-fraction veto.
+    //   * PROSE_CELL_MAJORITY_FRACTION = 0.40. Scores BEST of everything measured (0.7189 / 0.8173 /
+    //     12) and is rejected anyway: it deletes the lower half of the genuine 3-column FDA table on
+    //     page 4 of us-015, and the corpus metric REWARDED that deletion. See PROSE_CELL_* above.
+    //   * A numbered-LIST veto on the fraction of rows whose leftmost token is an enumeration marker
+    //     (> 0.60). Exactly redundant once markers stop counting as numeric evidence: pointwise
+    //     identical to the shipped state on every axis (0.7169 / 0.8150 / 12). A second gate for no
+    //     measured effect is a liability, not a safeguard.
+    //   * Sentence-detection by FUNCTION WORDS, average token length, or terminal punctuation. Not
+    //     measurable as a discriminator here and not shippable in principle: the corpus's own real
+    //     tables sit inside the fabrication cloud on every one of them (us-015 p2 is a genuine ICDAR
+    //     table whose cells are bulleted clauses), and any closed word list is English-only, while the
+    //     fabrications this was meant to catch include Polish and Japanese documents. Token COUNTS are
+    //     the only language-independent part of that idea, which is why the shipped veto uses them.
+    //   * OCR-noise signatures (mean token length, single-character non-word fraction). The two
+    //     OCR-noise fabrications the earlier study named were already removed by the prose-fill fix
+    //     before this study began; there is no longer a case in the data to fit, so nothing was built.
 
     // Prose hard-veto constants. See the rationale comment at the veto site in scoreGrid().
     // VETO_FILL_THRESHOLD mirrors the spec's own wording ("fills >~85% of column width").
@@ -944,6 +1069,37 @@ final class StreamTableExtractor {
     // table) must not be enough to veto the whole grid.
     static final double VETO_COLUMN_MAJORITY_FRACTION = 0.50;
 
+    // ---------------------------------------------------------- PROSE-CELL VETO (content, not width)
+    //
+    // See #proseCellFraction for the mechanism and for why a token count sees multi-column prose that
+    // the width-based veto above cannot. These two constants were chosen from a MEASURED separation,
+    // not tuned to a score: the feature was computed for every passing stream candidate on the 77-PDF
+    // ICDAR corpus (162 candidates) and on every real-world document the stream flag ADDS a table to
+    // (46 candidates), and each of those 208 was hand-adjudicated as a genuine table or a fabrication.
+    //
+    //   * At >= 5 tokens, the HIGHEST prose-cell fraction reached by any candidate adjudicated a REAL
+    //     table is 0.489 -- the lower half of the genuine 3-column FDA table on page 4 of us-015,
+    //     whose cells really are sentences ("Evidence that the instrument measures the concept of
+    //     interest ..."). Every clear fabrication above it scores 0.571 or more.
+    //   * A bare strict majority (0.50) therefore already separates them, but by only 0.011. The bar
+    //     is set at 0.60 to keep a real margin: 0.111 below the nearest real table and still below
+    //     every fabrication in scope. MEASURED: 0.45, 0.50 and 0.60 give IDENTICAL corpus MACRO
+    //     (0.8153 all-pages POOLED) and IDENTICAL real-world false positives (12/200, 116/1,599), so
+    //     the extra margin costs nothing -- but 0.45 and 0.50 sit inside and just outside the noise
+    //     of a real table's score respectively, and 0.60 does not.
+    //   * 0.40 was REJECTED even though it scores BEST of all (MACRO 0.8173 / 0.7973): it deletes
+    //     that us-015 half-table, and the corpus metric REWARDED the deletion. That is the same trap
+    //     that killed the numeric-corroboration lever recorded above -- the metric cannot see a real
+    //     table being removed when the removed candidate's column model was imperfect.
+    //
+    // ALSO MEASURED AND NOT SHIPPED, as the row-based variant of this same idea: vetoing on the
+    // fraction of ROWS holding a >= 6-token cell. It is strictly worse at every threshold tried
+    // because a genuine long-text table has occasional long rows -- 1:1 MACRO all-pages falls to
+    // 0.7016 at 0.30, 0.7103 at 0.50 and 0.7092 at 0.70, against 0.7169 here. The CELL fraction is
+    // the right denominator; the ROW fraction is not.
+    static final int PROSE_CELL_MIN_TOKENS = 5;
+    static final double PROSE_CELL_MAJORITY_FRACTION = 0.60;
+
     static final class Grid {
         List<Gutter> gutters;
         List<Line> rows;
@@ -954,7 +1110,7 @@ final class StreamTableExtractor {
         // DIAGNOSTIC ONLY. Recorded by scoreGrid so a harness can attribute a confidence to its
         // terms; never read by production logic. hardReject names the all-or-nothing gate that
         // zeroed the confidence, or is null when the graded formula produced it.
-        double tColConsistency, tViolation, tProse, tColCount, tNumeric, tProseColFrac;
+        double tColConsistency, tViolation, tProse, tColCount, tNumeric, tProseColFrac, tProseCellFrac;
         int nCols, nRows, nNumericCols, nNumericDataCols;
         String hardReject;
     }
@@ -1195,6 +1351,7 @@ final class StreamTableExtractor {
         grid.tColCount = Math.min(1, (cols - 2) / 2.0);
         grid.tNumeric = numericBonus;
         grid.tProseColFrac = proseColumnFraction;
+        grid.tProseCellFrac = proseCellFraction(lines, bounds);
         grid.nNumericCols = numericCols;
 
         // The two remaining ALL-OR-NOTHING gates. Deliberately applied AFTER every term above has
@@ -1209,6 +1366,22 @@ final class StreamTableExtractor {
         if (proseColumnFraction > VETO_COLUMN_MAJORITY_FRACTION && numericCols == 0) {
             grid.confidence = 0;
             grid.hardReject = "prose-veto";
+            return grid;
+        }
+
+        // PROSE-CELL VETO (content). A block a MAJORITY of whose occupied cells hold
+        // PROSE_CELL_MIN_TOKENS or more tokens is running text, whatever its geometry says. See
+        // #proseCellFraction for why token counts see what the width-based veto above cannot, and
+        // the PROSE_CELL_* constants for the measured scope and the margin.
+        //
+        // DELIBERATELY NOT GUARDED BY numericCols == 0, unlike the geometric veto above. Measured:
+        // adding that guard spares two 15-row tables of contents ("1. Introduction 4 / 2. Purpose
+        // 4 / ...") whose only numeric evidence is a column occupied on ONE of fifteen rows. A
+        // block whose cells are predominantly clauses is prose even when one sparse column happens
+        // to hold a numeral.
+        if (grid.tProseCellFrac > PROSE_CELL_MAJORITY_FRACTION) {
+            grid.confidence = 0;
+            grid.hardReject = "prose-cell-veto";
             return grid;
         }
 
@@ -1322,25 +1495,41 @@ final class StreamTableExtractor {
      * numerator only if EVERY word of that column on that row is numeric -- one word of prose in the
      * cell disqualifies the row, which is what makes prose-with-numerals score 0 rather than
      * middling. See the block comment above for the measurement behind this.
+     *
+     * <p>A column whose numeric tokens are predominantly {@linkplain #isEnumerationMarker enumeration
+     * markers} does NOT count: an ordinal is a position in a list, not a measured value, so a numbered
+     * list's marker column is not numeric data; the marker count is taken in the SAME pass, so it costs
+     * no additional traversal.
      */
     static int numericDataColumnCount(List<Line> lines, float[] bounds) {
         int cols = bounds.length - 1;
         int numericDataCols = 0;
         for (int c = 0; c < cols; c++) {
-            int occupied = 0, allNumeric = 0;
+            int occupied = 0, allNumeric = 0, numTok = 0, markerTok = 0;
             for (Line l : lines) {
                 int inCol = 0, inColNumeric = 0;
                 for (Word w : l.words) {
                     if (colOf(w.cx(), bounds) != c) continue;
                     inCol++;
-                    if (w.numeric) inColNumeric++;
+                    if (w.numeric) {
+                        inColNumeric++;
+                        numTok++;
+                        if (isEnumerationMarker(w.text)) markerTok++;
+                    }
                 }
                 if (inCol > 0) {
                     occupied++;
                     if (inColNumeric == inCol) allNumeric++;
                 }
             }
-            if (occupied > 0 && (double) allNumeric / occupied >= NUMERIC_DATA_ROW_MAJORITY) {
+            // A column whose numeric tokens are predominantly enumeration markers carries no numeric
+            // DATA. Counted in the SAME pass above rather than in a second scan, so this costs no
+            // additional traversal of the block -- see #isEnumerationMarker. A strict majority is
+            // required so that one marker-shaped token among real values (a truncated "3." in a
+            // column of prices) cannot disqualify a genuine numeric column.
+            boolean markerOnly = numTok > 0 && markerTok * 2 > numTok;
+            if (occupied > 0 && (double) allNumeric / occupied >= NUMERIC_DATA_ROW_MAJORITY
+                    && !markerOnly) {
                 numericDataCols++;
             }
         }

@@ -750,7 +750,7 @@ final class StreamTableExtractor {
         // terms; never read by production logic. hardReject names the all-or-nothing gate that
         // zeroed the confidence, or is null when the graded formula produced it.
         double tColConsistency, tViolation, tProse, tColCount, tNumeric, tProseColFrac;
-        int nCols, nRows, nNumericCols;
+        int nCols, nRows, nNumericCols, nNumericDataCols;
         String hardReject;
     }
 
@@ -835,7 +835,11 @@ final class StreamTableExtractor {
             if (tot > 0 && (double) num / tot >= 0.70) numericCols++;
         }
         double numericBonus = cols > 0 ? (double) numericCols / cols : 0;
-        grid.numericLeanColumn = numericCols > 0;
+        // The cols==2 gate below asks a different question than the numericBonus term does, and needs
+        // its own, row-based, answer -- see numericDataColumnCount's doc.
+        int numericDataCols = numericDataColumnCount(lines, bounds);
+        grid.nNumericDataCols = numericDataCols;
+        grid.numericLeanColumn = numericCols > 0 || numericDataCols > 0;
 
         // Prose hard veto (spec: "reject if median cell text fills >~85% of column width
         // and wraps across lines -- the two-column-prose signature"). The graded proseScore
@@ -903,7 +907,12 @@ final class StreamTableExtractor {
         // The two remaining ALL-OR-NOTHING gates. Deliberately applied AFTER every term above has
         // been recorded on the Grid, so a diagnostic harness can see what a hard-rejected candidate
         // would have graded at. Behaviour is unchanged: either gate still zeroes the confidence.
-        if (cols == 2 && numericBonus == 0) { grid.confidence = 0; grid.hardReject = "cols==2-nonnumeric"; return grid; }
+        // The cols==2 gate's own numeric test is numericDataColumnCount (row-based), NOT numericBonus
+        // (word-based). See that method's doc for the measured reason; numericBonus keeps its
+        // word-based definition everywhere else so this change cannot move any other term.
+        if (cols == 2 && numericDataCols == 0) {
+            grid.confidence = 0; grid.hardReject = "cols==2-nonnumeric"; return grid;
+        }
         if (proseColumnFraction > VETO_COLUMN_MAJORITY_FRACTION && numericCols == 0) {
             grid.confidence = 0;
             grid.hardReject = "prose-veto";
@@ -921,6 +930,103 @@ final class StreamTableExtractor {
     private static int colOf(float x, float[] bounds) {
         for (int c = 0; c < bounds.length - 1; c++) if (x < bounds[c + 1]) return c;
         return bounds.length - 2;
+    }
+
+    // ------------------------------------------------------- the cols==2 gate's own numeric test
+    //
+    // MEASURED PROBLEM (lever-3 residual measurement: 77-PDF corpus + the 1,599-PDF real-world
+    // sample). The full pipeline's residual gate ceiling -- what a ground-truth oracle could still
+    // add by overriding the gate -- is +0.0211 MACRO (0.6884 -> 0.7094, POOLED + dedup, ALL-77), and
+    // 4 of the 5 candidates that make it up are hard-rejected by the cols==2 gate. Dumping their
+    // actual extracted content split them cleanly into two kinds:
+    //
+    //   * TWO GENUINE TABLES whose numeric data column is diluted below the gate's 0.70 bar by that
+    //     column's own multi-word HEADER LABEL:
+    //       eu-006 p2  "Retailer | Own Brands Market Shares" over Monoprix|28%, Casino|25%,
+    //                  Intermarche|23%, Carrefour|22%, Auchan|19%, Leclerc|10%
+    //                  -> 6 numeric words against 4 header words = 0.600 < 0.70, REJECTED
+    //       eu-014 p2  "Indicators | Weight of indicator in 2006" over Employment|40,
+    //                  Further studies|15, Dropping out|15, ... -> 0.636 < 0.70, REJECTED
+    //   * TWO FABRICATIONS: us-011a p2 and p3, which are running PROSE paragraphs cut in half by a
+    //     spurious gutter ("The U.S. General Services Administration's (GSA) Office of Citizen ||
+    //     Services and"). They score a positive adjacency delta only because a real mini-table
+    //     ("Program | Budget", "Performance.gov | $1.1M") happens to sit lower in the same block.
+    //     Those two must STAY rejected -- admitting them is exactly the "fabricate a table over
+    //     prose" failure this project refuses.
+    //
+    // So the addressable defect is precisely the header dilution, and the fix is to ask the gate's
+    // question ("is this two-column block a data table?") in the unit a table is actually made of:
+    // ROWS, not words. A column is a numeric DATA column when at least
+    // NUMERIC_DATA_ROW_MAJORITY of its own OCCUPIED ROWS are ENTIRELY numeric. A four-word header
+    // label then contributes exactly one row to the denominator instead of four words to it, so it
+    // can no longer outvote six rows of data; and prose carrying incidental numerals -- which is
+    // what produces a middling numeric WORD fraction -- has no all-numeric row at all, so it scores
+    // 0 under this test rather than creeping towards the bar.
+    //
+    // MEASURED SEPARABILITY over every 2-column all-non-numeric candidate the gate rejects (66 on
+    // the corpus, 12 on the 200-PDF real-world prose sample):
+    //
+    //   definition                                     genuine  prose-fabrication  corpus-other  PROSE
+    //   word fraction >= 0.70 (production, pre-fix)        0/2           0/2            0/62      0/12
+    //   row majority  >= 0.70 (this method)                2/2           0/2            2/62      0/12
+    //   word fraction, first row skipped                   2/2           0/2            2/62      1/12
+    //
+    // i.e. the row-majority definition is the only one of the three that recovers both genuine
+    // tables while flagging NO page of the real-world prose sample; the "skip the header row" variant
+    // reaches the same corpus recall but leaks a real-world false positive, which is why the test is
+    // row-majority rather than a header exclusion. The two corpus-other candidates it newly admits
+    // (eu-015 p1, us-009 p1) are worth -0.0014 and -0.0435 adjacency F1 on their own documents, an
+    // order of magnitude less than the +0.8462 and +0.0698 the two genuine tables bring.
+    //
+    // DELIBERATELY NARROW: this test is consulted ONLY by the cols==2 gate. numericBonus (the graded
+    // 0.10-weighted term) and the prose veto's own numericCols==0 condition keep the word-based
+    // definition unchanged, so no other term of the confidence formula and no other gate moves --
+    // the alternative (redefining numeric-ness globally) would perturb every grid's confidence and
+    // therefore every Step A' merge decision on every page, for no measured benefit.
+    //
+    // COST: no new scan of anything unbounded -- one extra O(rows x words-per-row) pass over the
+    // SAME block scoreGrid is already iterating several times, so the per-block cost is a small
+    // constant multiple of what it already was and stays inside Step D's own
+    // MAX_STREAM_PAGE_BLOCK_WORK page budget (which charges block word counts, not passes).
+
+    /** A numeric DATA column must be entirely numeric on at least this fraction of its own occupied
+     *  rows. Deliberately the SAME 0.70 as the word-based numericBonus test above -- this change is
+     *  about which UNIT the fraction is measured in (rows vs. words), not about relaxing the bar, and
+     *  reusing the value keeps that explicit. Measured sensitivity on the corpus's own 66 rejected
+     *  2-column candidates: the two genuine tables sit at 0.857 and 0.857, and the nearest negative
+     *  under this definition sits at 0.750, so 0.70 admits both genuine tables with margin while any
+     *  value above 0.75 would lose them along with the negative. */
+    static final double NUMERIC_DATA_ROW_MAJORITY = 0.70;
+
+    /**
+     * How many of the grid's columns are numeric DATA columns: entirely numeric on at least {@link
+     * #NUMERIC_DATA_ROW_MAJORITY} of the rows they actually occupy. A row counts towards the
+     * numerator only if EVERY word of that column on that row is numeric -- one word of prose in the
+     * cell disqualifies the row, which is what makes prose-with-numerals score 0 rather than
+     * middling. See the block comment above for the measurement behind this.
+     */
+    static int numericDataColumnCount(List<Line> lines, float[] bounds) {
+        int cols = bounds.length - 1;
+        int numericDataCols = 0;
+        for (int c = 0; c < cols; c++) {
+            int occupied = 0, allNumeric = 0;
+            for (Line l : lines) {
+                int inCol = 0, inColNumeric = 0;
+                for (Word w : l.words) {
+                    if (colOf(w.cx(), bounds) != c) continue;
+                    inCol++;
+                    if (w.numeric) inColNumeric++;
+                }
+                if (inCol > 0) {
+                    occupied++;
+                    if (inColNumeric == inCol) allNumeric++;
+                }
+            }
+            if (occupied > 0 && (double) allNumeric / occupied >= NUMERIC_DATA_ROW_MAJORITY) {
+                numericDataCols++;
+            }
+        }
+        return numericDataCols;
     }
 
     private static double clamp01(double v) { return v < 0 ? 0 : v > 1 ? 1 : v; }

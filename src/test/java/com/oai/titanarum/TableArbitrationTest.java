@@ -303,15 +303,23 @@ class TableArbitrationTest {
     }
 
     // ==========================================================================================
-    // F1. A LOST CONTEST MUST BE OBSERVABLE.
+    // F1. A LOST CONTEST MUST BE OBSERVABLE -- BUT ONLY A CONTENT-LOSING ONE MAY SET truncated.
     //
     // Arbitration is the only path in TableExtractor that discards a fully-built, successfully
     // extracted table on a QUALITY judgement rather than on a cap or an error. Every sibling drop
     // path (extractTagged's three catches, the per-page lattice catches, the document lattice
-    // budget, extractStreamPage's caps, capTablesPerPage) sets Result.truncated. Arbitration used
-    // to take no Result at all, so a region whose correct table was arbitrated away was
-    // byte-identical in report.json to a region that never had a table -- which is exactly why the
-    // eu-003 corpus regression (adjacency F1 1.0000 -> 0.7149) went unexplained.
+    // budget, extractStreamPage's caps, capTablesPerPage) sets Result.truncated on a genuine
+    // hostile-input cap or error. Arbitration used to take no Result at all, so a region whose
+    // correct table was arbitrated away was byte-identical in report.json to a region that never
+    // had a table -- which is exactly why the eu-003 corpus regression (adjacency F1 1.0000 ->
+    // 0.7149) went unexplained. THAT fix (round 1) set truncated on EITHER side losing, which
+    // over-corrected: a ruled/tagged win is arbitration's ORDINARY, HEALTHY outcome (it wins the
+    // large majority of real contests), and the output for that region is then byte-identical to
+    // what the flag-off pipeline would have produced -- nothing the user would otherwise have seen
+    // is missing. Flagging tablesTruncated there is noise, measured on 25 of the 77-document
+    // ICDAR/tabula corpus (44 total minus 19 genuine). The counter and the advisory per-hit markers
+    // below are UNCONDITIONAL (either side losing is always counted and always flagged on the
+    // winner); only Result.truncated is conditioned on which side lost.
     // ==========================================================================================
 
     @Test
@@ -323,8 +331,9 @@ class TableArbitrationTest {
 
         assertEquals(List.of(s), out, "sanity: the partially ruled grid loses this contest");
         assertTrue(r.truncated,
-                "a fully-built table discarded on a quality judgement must surface as truncated, "
-                        + "exactly as every other drop path in TableExtractor does");
+                "a drawn-ruling table discarded in favor of a stream candidate is content the "
+                        + "flag-off pipeline would have emitted and this output does not have: "
+                        + "truncated must fire, exactly as every other drop path in TableExtractor does");
         assertEquals(1, r.arbitrationDisplaced, "exactly one candidate was displaced");
         assertEquals(Boolean.TRUE, s.displacedRuledCandidate,
                 "the surviving stream hit must record that it replaced a drawn-ruling candidate");
@@ -332,24 +341,34 @@ class TableArbitrationTest {
     }
 
     @Test
-    void aStreamCandidateLostToTheRulingsIsReportedNotSilent() {
+    void aStreamCandidateLostToTheRulingsDoesNotSetTruncated() {
+        // THE CENTRAL CASE THIS FIX PINS. The complete drawn grid is the BETTER answer and wins on
+        // the merits -- this is exactly what the flag-off (ruled/tagged-only) pipeline would also
+        // have emitted for this region, so nothing the user would otherwise have seen is missing.
+        // The contest is still fully TRACKED (arbitrationDisplaced, the advisory marker) so a
+        // consumer or a test can still see it happened; it must not be reported as truncated,
+        // which every other path in this class reserves for genuine incompleteness.
         TableExtractor.TableHit l = lattice(0, 0, 100, 100, 10, 3, 30);   // occupancy 1.00
         TableExtractor.TableHit s = stream(0, 0, 100, 100, 10, 3, 0.95);
         TableExtractor.Result r = new TableExtractor.Result();
         List<TableExtractor.TableHit> out = TableExtractor.arbitrate(List.of(l), List.of(s), r);
 
         assertEquals(List.of(l), out, "sanity: the complete drawn grid wins this contest");
-        assertTrue(r.truncated, "the discarded stream candidate is output that did not reach the report");
-        assertEquals(1, r.arbitrationDisplaced);
+        assertFalse(r.truncated,
+                "the ruled side won: this document's tables are byte-identical to what "
+                        + "--stream-tables off would have produced here, so nothing is truncated");
+        assertEquals(1, r.arbitrationDisplaced,
+                "the contest is still counted even though it did not cost any content");
         assertEquals(Boolean.TRUE, l.displacedStreamCandidate,
-                "the surviving ruled hit must record that it displaced a borderless candidate");
+                "the surviving ruled hit must still record that it displaced a borderless candidate");
         assertNull(l.displacedRuledCandidate);
     }
 
     @Test
     void everyDiscardedCandidateOfALostComponentIsCounted() {
         // Three ruling fragments lose one region to a single stream candidate: the count is the
-        // number of candidates that did not reach the output, not the number of regions.
+        // number of candidates that did not reach the output, not the number of regions. This is
+        // the content-losing direction (ruled fragments dropped), so truncated must also fire.
         TableExtractor.TableHit f1 = lattice(0, 0, 100, 30, 5, 2, 10);
         TableExtractor.TableHit f2 = lattice(0, 30, 100, 60, 5, 2, 10);
         TableExtractor.TableHit f3 = lattice(0, 60, 100, 100, 5, 2, 10);
@@ -358,7 +377,7 @@ class TableArbitrationTest {
         List<TableExtractor.TableHit> out =
                 TableExtractor.arbitrate(List.of(f1, f2, f3), List.of(s), r);
         assertEquals(List.of(s), out);
-        assertTrue(r.truncated);
+        assertTrue(r.truncated, "three ruled fragments are missing from this output: truncated must fire");
         assertEquals(3, r.arbitrationDisplaced, "all three discarded fragments must be counted");
         assertEquals(Boolean.TRUE, s.displacedRuledCandidate);
     }
@@ -460,6 +479,9 @@ class TableArbitrationTest {
                     "a COMPLETE drawn grid, asserted correct elsewhere in this suite, must not be "
                             + "discarded as 'partially ruled' because one of its cells is merged");
             assertEquals(1, r.arbitrationDisplaced, "the stream candidate is what lost here");
+            assertFalse(r.truncated,
+                    "the ruled side won: output here matches the flag-off pipeline, so truncated "
+                            + "must not fire even though the contest is still counted");
         }
     }
 
@@ -513,6 +535,9 @@ class TableArbitrationTest {
         assertTrue(has(out, t3));
         assertEquals(3, out.size(), "the merged stream candidate is the one that loses");
         assertEquals(1, r.arbitrationDisplaced);
+        assertFalse(r.truncated,
+                "the ruled side won: output here matches the flag-off pipeline, so truncated "
+                        + "must not fire even though the contest is still counted");
     }
 
     @Test
@@ -713,14 +738,21 @@ class TableArbitrationTest {
     }
 
     @Test
-    void aStreamCandidateLostToTheTaggedVetoIsStillReported() {
+    void aStreamCandidateLostToTheTaggedVetoIsTrackedButDoesNotSetTruncated() {
+        // The veto keeps the tagged answer -- the author's own structure tree -- which is exactly
+        // what the flag-off pipeline emits for this region too. Nothing the user would otherwise
+        // have seen is missing, so this must not be reported as truncated (see the F1 block comment
+        // above): the drop is still VISIBLE (arbitrationDisplaced, the advisory marker), just not
+        // through the field that means "content may be missing".
         TableExtractor.TableHit tagged = hit("tagged", 1, 0, 0, 400, 700, 2, 2, 4, null);
         TableExtractor.TableHit s = stream(20, 100, 380, 600, 30, 5, 0.85);
         TableExtractor.Result r = new TableExtractor.Result();
         TableExtractor.arbitrate(List.of(tagged), List.of(s), r);
-        assertTrue(r.truncated,
-                "the veto is a hard suppression; it must at least not be an invisible one");
-        assertEquals(1, r.arbitrationDisplaced);
+        assertFalse(r.truncated,
+                "the tagged answer won: output here matches the flag-off pipeline, so truncated "
+                        + "must not fire");
+        assertEquals(1, r.arbitrationDisplaced, "the veto is a hard suppression; it must at least "
+                + "not be an invisible one");
         assertEquals(Boolean.TRUE, tagged.displacedStreamCandidate);
     }
 

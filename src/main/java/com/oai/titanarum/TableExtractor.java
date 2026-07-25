@@ -582,8 +582,13 @@ final class TableExtractor {
          * extractStreamPage's caps, capTablesPerPage) surfaces itself through {@link
          * Result#truncated}; arbitration used to be invisible, so a region whose correct table was
          * arbitrated away was byte-identical in report.json to a region that had no table at all.
-         * {@link Result#truncated} now also fires (plus one WARNING per affected page), and these
-         * two flags say WHICH hit the surviving answer replaced.
+         * These two flags now always say WHICH hit the surviving answer replaced, on BOTH sides of a
+         * contest -- unlike {@link Result#truncated} (see {@link #arbitrate}'s own doc), which fires
+         * only when {@code displacedRuledCandidate} is the one set, because only that direction drops
+         * content the flag-off pipeline would have emitted. A report.json consumer that wants to know
+         * "did a borderless guess ever replace a drawn-ruling answer on this document", independent of
+         * whether {@code tablesTruncated} is set, can still answer it by scanning {@code tables} for
+         * {@code displacedRuledCandidate: true} -- these markers are not gated by that decision.
          */
         public Boolean displacedRuledCandidate;
 
@@ -643,9 +648,18 @@ final class TableExtractor {
         long streamWorkCharged = 0;
         /**
          * How many fully-built candidates {@link #arbitrate} discarded on this document because they
-         * lost a contested region. Not serialized (this class is internal) -- it exists so the tests
-         * and measurement probes can read the exact count through the real entry point instead of
-         * inferring it from {@link #truncated}, which many other paths also set.
+         * lost a contested region -- BOTH directions (a stream candidate losing to the ruled/tagged
+         * side, and a ruled/lattice candidate losing to a confident stream one), unlike {@link
+         * #truncated} which {@code arbitrate} only sets for the latter (see that method's doc for why:
+         * only that direction removes content the flag-off pipeline would have emitted). Not
+         * serialized (this class is internal) -- it exists so the tests and measurement probes can
+         * read the exact count through the real entry point instead of inferring it from {@link
+         * #truncated}, which many other paths also set and which no longer even tracks the same
+         * total. A report.json consumer cannot recover this exact integer (it is not serialized), but
+         * can still tell WHETHER either direction occurred anywhere in the document: scan {@code
+         * tables} for an entry carrying {@code displacedRuledCandidate} (content-losing) or {@code
+         * displacedStreamCandidate} (not) -- one flag per WINNING hit, not per discarded candidate, so
+         * it answers "did this happen", not "how many".
          */
         int arbitrationDisplaced = 0;
     }
@@ -2585,9 +2599,10 @@ final class TableExtractor {
             List<TableHit> merged;
             try {
                 // The 3-arg form: a candidate that LOSES a contested region is a fully-built table
-                // discarded on a quality judgement, and must be surfaced (result.truncated + one
-                // WARNING per affected page + an advisory marker on the winner) exactly as every
-                // other drop path in this class surfaces itself. See arbitrate's own javadoc.
+                // discarded on a quality judgement, and must be surfaced (arbitrationDisplaced + an
+                // advisory marker on the winner, always; result.truncated + a WARNING only when the
+                // discarded side is the ruled/lattice one, since only that direction drops content the
+                // flag-off pipeline would have emitted). See arbitrate's own javadoc.
                 merged = arbitrate(new ArrayList<>(result.tables), streamHits, result);
             } catch (RulingOverflowException e) {
                 // Arbitration's work budget tripped. This is unreachable on any legitimate document
@@ -3255,17 +3270,31 @@ final class TableExtractor {
      * used to do so invisibly: a region whose correct table was arbitrated away was byte-identical in
      * report.json to a region that never had a table. Every discarded candidate now
      * <ul>
-     *   <li>sets {@code result.truncated} (which {@code PdfTitanArumApp} surfaces as
-     *       {@code tablesTruncated}), exactly as every sibling drop path in this class does,</li>
      *   <li>increments {@link Result#arbitrationDisplaced}, and</li>
      *   <li>leaves an ADVISORY marker on the WINNER ({@link TableHit#displacedRuledCandidate} /
      *       {@link TableHit#displacedStreamCandidate}) so a consumer can see which hit replaced
      *       what -- the same "flag, never suppress silently" pattern as
      *       {@link TableHit#likelyDuplicateOfTagged}.</li>
      * </ul>
-     * One WARNING is emitted per affected PAGE (not per region: a hostile document sitting at both
+     * regardless of which side won, so a contest is never invisible to a consumer reading
+     * report.json's {@code tables} array. {@code result.truncated} (surfaced by {@code
+     * PdfTitanArumApp} as {@code tablesTruncated}) is set ONLY when the discarded side is the
+     * ruled/lattice one -- i.e. only when a STREAM candidate won the region and a drawn-ruling
+     * candidate the flag-off pipeline would have emitted is missing from this output. When the
+     * ruled/tagged side wins (the common case) the discarded stream candidate never appeared in the
+     * flag-off output either, so this document's {@code tables} are byte-identical to what {@code
+     * --stream-tables} off would have produced for that region, and {@code truncated} -- which every
+     * OTHER path in this class uses to mean "content may be missing" -- must not fire on a page where
+     * nothing is. (History: the first fix here set {@code truncated} on EITHER direction, which meant
+     * arbitration's own normal, healthy operation -- the ruled/tagged answer winning, which it does on
+     * the large majority of contests -- reported the same signal as a genuine cap trip. Measured: 44
+     * of the 77-document ICDAR/tabula scoring corpus reported {@code tablesTruncated} under that rule,
+     * of which only 19 actually lost a ruled/lattice candidate; the other 25 were the ruled/tagged
+     * side winning every contest on the document, output unchanged from flag-off, flagged anyway.)
+     * One message is emitted per affected PAGE (not per region: a hostile document sitting at both
      * per-page candidate caps has up to 50 components per page, and the sibling drop paths log
-     * per-page too).
+     * per-page too) -- a WARNING when the page lost real content, an INFO line (deliberately not a
+     * WARNING, and deliberately not reflected in {@code truncated}) when it did not.
      *
      * <p>Surviving candidate OBJECTS may therefore have those two advisory fields set; nothing else
      * about them is touched.
@@ -3335,7 +3364,12 @@ final class TableExtractor {
             List<Integer> sIdx = streamByPage.get(e.getKey());
             if (sIdx == null || sIdx.isEmpty()) continue;
             int lp = rIdx.size(), sp = sIdx.size();
-            int pageDisplaced = 0;
+            // Tracked SEPARATELY, not as one pageDisplaced total: only content-losing displacement
+            // (a ruled/lattice candidate discarded because a stream candidate won the region) may set
+            // Result.truncated. A ruled/tagged win that discards a stream candidate loses nothing the
+            // flag-off pipeline would have shown, so it must not. See the two branches below.
+            int pageDisplacedContentLoss = 0;
+            int pageDisplacedHealthy = 0;
 
             // Contest graph for this page, in page-local indices. The budget is charged BEFORE the
             // adjacency matrix is allocated: charging afterwards would let a hostile candidate list
@@ -3399,7 +3433,13 @@ final class TableExtractor {
                         keepRuled[i] = false;
                     }
                     if (dropped > 0) {
-                        pageDisplaced += dropped;
+                        // CONTENT LOSS: a drawn-ruling/lattice candidate that the flag-off pipeline
+                        // would have emitted is gone from the output, replaced by the stream answer.
+                        // This is the one arbitration outcome that makes report.json differ from what
+                        // --stream-tables off would have produced, so it is the one that sets
+                        // Result.truncated -- see the block comment above this method for why the
+                        // OTHER branch (ruled/tagged keeps the region) must not.
+                        pageDisplacedContentLoss += dropped;
                         for (int j : compS) stream.get(j).displacedRuledCandidate = Boolean.TRUE;
                     }
                 } else {
@@ -3409,17 +3449,39 @@ final class TableExtractor {
                         keepStream[j] = false;
                     }
                     if (dropped > 0) {
-                        pageDisplaced += dropped;
+                        // NO CONTENT LOSS: the ruled/tagged candidate keeps the region, exactly as the
+                        // flag-off pipeline would have emitted it -- the discarded stream candidate
+                        // never appears in the flag-off output at all, so nothing the user would
+                        // otherwise have seen is missing. Counted (arbitrationDisplaced) and flagged on
+                        // the winner (displacedStreamCandidate) so the contest is still visible to a
+                        // consumer or test, but must NOT set Result.truncated: that field means
+                        // "content may be missing," and here it is not.
+                        pageDisplacedHealthy += dropped;
                         for (int i : compR) ruled.get(i).displacedStreamCandidate = Boolean.TRUE;
                     }
                 }
             }
+            int pageDisplaced = pageDisplacedContentLoss + pageDisplacedHealthy;
             if (pageDisplaced > 0) {
-                result.truncated = true;
                 result.arbitrationDisplaced += pageDisplaced;
-                System.err.println("WARNING: table path arbitration discarded " + pageDisplaced
-                        + " contested table candidate(s) on page " + e.getKey()
-                        + " (a drawn-ruling and a borderless candidate answered the same region)");
+                if (pageDisplacedContentLoss > 0) {
+                    // Only a genuine content-losing displacement (a stream candidate displacing a
+                    // ruled/lattice one) surfaces as Result.truncated -- see this method's own javadoc
+                    // ("REPORTING THE LOSS") for why the healthy-win case below must stay off it.
+                    result.truncated = true;
+                    System.err.println("WARNING: table path arbitration discarded " + pageDisplacedContentLoss
+                            + " drawn-ruling candidate(s) on page " + e.getKey()
+                            + " in favor of a more confident borderless candidate (content the "
+                            + "flag-off pipeline would have emitted is missing from this output)");
+                }
+                if (pageDisplacedHealthy > 0) {
+                    // Informational only -- deliberately NOT a "WARNING" and deliberately NOT reflected
+                    // in Result.truncated: the ruled/tagged answer kept the region, so this document's
+                    // output is byte-identical to what --stream-tables off would have produced here.
+                    System.err.println("INFO: table path arbitration kept the drawn-ruling/tagged answer "
+                            + "over " + pageDisplacedHealthy + " borderless candidate(s) on page "
+                            + e.getKey() + " (no content lost; output matches the flag-off pipeline)");
+                }
             }
         }
 

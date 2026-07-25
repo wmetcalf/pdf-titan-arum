@@ -221,22 +221,28 @@ class TableStreamWiringTest {
     }
 
     /**
-     * THE ARBITRATION DROP MUST REACH THE Result, THROUGH THE REAL WIRING.
+     * THE ARBITRATION DROP MUST REACH THE Result, THROUGH THE REAL WIRING -- BUT tablesTruncated
+     * MUST STAY OFF WHEN THE TAGGED ANSWER IS WHAT SURVIVES.
      *
      * <p>{@code arbitrate} used to take no {@link TableExtractor.Result} parameter at all, so a
-     * candidate that lost a contested region set nothing: {@code tablesTruncated} stayed absent from
-     * report.json and no per-hit marker existed either, which made a table arbitrated away
-     * byte-identical to a region that never had a table. Every SIBLING drop path in the class
-     * (extractTagged's three catches, the per-page lattice catches, the document lattice budget,
-     * extractStreamPage's caps, capTablesPerPage) surfaces itself; this pins that arbitration now
-     * does too, and does so through {@code extract()} rather than only in the unit test that drives
-     * {@code arbitrate} directly.
+     * candidate that lost a contested region set nothing: neither {@code arbitrationDisplaced} nor
+     * either per-hit marker existed, which made a table arbitrated away byte-identical to a region
+     * that never had a table. That is fixed, and this test pins that {@code arbitrationDisplaced}
+     * and the advisory marker reach the {@link TableExtractor.Result} through the real wiring
+     * ({@code extract()}), not only in the unit test that drives {@code arbitrate} directly.
+     *
+     * <p>{@code tablesTruncated} is a DIFFERENT question: whether OUTPUT differs from the flag-off
+     * pipeline. Here the tagged answer wins the veto and survives -- the same tagged table the
+     * flag-off {@code off} run below also produces -- so {@code on.tables} carries exactly the same
+     * tagged content {@code off.tables} does; the discarded stream candidates never existed in the
+     * flag-off world to begin with. Nothing is missing, so {@code tablesTruncated} must stay false
+     * (see {@code TableExtractor.arbitrate}'s own javadoc, "REPORTING THE LOSS").
      *
      * <p>Same fixture as the test above, chosen because its contest is real and its OUTCOME is
      * already asserted there: two genuine stream candidates lose to the tagged answer.
      */
     @Test
-    void aContestLostInsideExtractIsSurfacedOnTheResult() throws Exception {
+    void aContestLostInsideExtractIsTrackedButDoesNotSurfaceAsTruncated() throws Exception {
         Path pdf = tmp.resolve("tagged.pdf");
         TableTestPdfs.taggedHollowMiddleTwoDenseBlocksPlusDistinctRuledTableInGap(pdf);
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
@@ -248,11 +254,8 @@ class TableStreamWiringTest {
             assertEquals(0, off.arbitrationDisplaced);
 
             TableExtractor.Result on = TableExtractor.extract(doc, pages, glyphs, true);
-            assertTrue(on.truncated,
-                    "two fully-built stream candidates were discarded on a quality judgement: "
-                            + "report.json must say tablesTruncated, not stay silent");
             assertEquals(2, on.arbitrationDisplaced,
-                    "both discarded candidates must be counted, exactly");
+                    "both discarded stream candidates must still be counted, exactly");
             TableExtractor.TableHit tagged = on.tables.stream()
                     .filter(t -> "tagged".equals(t.extractionMethod)).findFirst().orElseThrow();
             assertEquals(Boolean.TRUE, tagged.displacedStreamCandidate,
@@ -262,6 +265,21 @@ class TableStreamWiringTest {
                 assertNull(t.displacedRuledCandidate,
                         "no candidate here displaced a drawn-ruling answer: " + sig(t));
             }
+            assertFalse(on.truncated,
+                    "the tagged answer won every contest here: on.tables matches off.tables for this "
+                            + "region byte for byte, so report.json must not say tablesTruncated -- "
+                            + "the counter and marker above are how a consumer still sees the contest");
+            List<String> taggedOn = new ArrayList<>();
+            for (TableExtractor.TableHit t : on.tables) {
+                if ("tagged".equals(t.extractionMethod)) taggedOn.add(sig(t));
+            }
+            List<String> taggedOff = new ArrayList<>();
+            for (TableExtractor.TableHit t : off.tables) {
+                if ("tagged".equals(t.extractionMethod)) taggedOff.add(sig(t));
+            }
+            assertEquals(taggedOff, taggedOn,
+                    "sanity backing the claim above: the surviving tagged table is byte-identical "
+                            + "flag-on vs flag-off");
         }
     }
 

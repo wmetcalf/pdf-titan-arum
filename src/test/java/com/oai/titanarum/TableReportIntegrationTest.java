@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -108,13 +109,40 @@ class TableReportIntegrationTest {
 
     @Test
     void streamTablesFlowsThroughTheJobDescriptor() throws Exception {
-        // The blastbox engine writes job.json; stream_tables must ride the same path skip_tables does.
+        // The blastbox engine writes job.json; stream_tables must ride the same path skip_tables
+        // does ALL THE WAY to the extractor, not merely reach the setter -- a bare field store
+        // (the old version of this test: assertDoesNotThrow(() -> app.setStreamTables(...))) cannot
+        // fail no matter what setStreamTables does, so it covered nothing. This drives the real
+        // job.json -> JobDescriptor -> setStreamTables -> callWith -> TableExtractor.extract path
+        // against a borderless fixture and asserts the stream table actually comes out the other end.
         String json = "{\"input_path\":\"/x\",\"output_dir\":\"/y\",\"stream_tables\":true}";
         PdfTitanArumApp.JobDescriptor job =
                 new ObjectMapper().readValue(json, PdfTitanArumApp.JobDescriptor.class);
         assertTrue(job.streamTables(), "job.json's stream_tables must bind to the descriptor");
+
+        Path pdf = tmp.resolve("borderless.pdf");
+        TableTestPdfs.borderless3Col(pdf);
+        Path out = tmp.resolve("outJobDescriptor");
+        Files.createDirectories(out);
+
         PdfTitanArumApp app = new PdfTitanArumApp();
-        assertDoesNotThrow(() -> app.setStreamTables(job.streamTables()));
+        app.setSkipScreenshots(true);
+        app.setSkipImages(true);
+        app.setSkipPageExport(true);
+        app.setStreamTables(job.streamTables()); // the line actually under test
+
+        byte[] pdfBytes = Files.readAllBytes(pdf);
+        PdfTitanArumApp.AnalysisReport report = app.callWith(
+                pdfBytes, "borderless.pdf", out, 150f, "1",
+                /* skipQrScan */ true, /* addLinkAnnotations */ false,
+                /* modifiedPdfOutput */ null, /* password */ null);
+
+        assertEquals(1, report.tables.size(),
+                "job.json's stream_tables=true must reach TableExtractor.extract and surface the "
+                        + "borderless table, not merely land in a setter: " + report.tables);
+        TableExtractor.TableHit t = report.tables.get(0);
+        assertEquals("stream", t.extractionMethod);
+        assertNotNull(t.confidence, "a stream table emitted via the job.json path still carries confidence");
     }
 
     @Test

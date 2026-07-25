@@ -306,6 +306,105 @@ final class TableTestPdfs {
     }
 
     /**
+     * The user's own bug report, minimized: a 3-row x 3-column ruled table whose LAST row (a TOTAL
+     * band) has NO interior vertical rulings, so the lattice grid finds ONE wide cell there instead
+     * of three narrow ones and joins the row's three column-aligned values into a single cell
+     * ("TOTAL 453,515 895,111"). Every other row is fully ruled, so the table's real column
+     * boundaries ARE recoverable from the rows that do have interior verticals.
+     *
+     * <p>Geometry (bottom-left origin, as PDF content streams use): horizontals at y=700/670/640/610
+     * across x=50..350; interior verticals at x=150/250 only from y=700 down to y=640 (rows 0-1);
+     * the two OUTER verticals x=50/350 run the full y=700..610 so the totals band is still a closed
+     * cell.
+     */
+    static void ruledTotalsRowMissingInteriorVerticals(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 350}) line(cs, x, 700, x, 610);   // outer, full height
+                for (float x : new float[]{150, 250}) line(cs, x, 700, x, 640);  // interior, stops short
+                text(cs, 55, 680, "Region");
+                text(cs, 155, 680, "Exports");
+                text(cs, 255, 680, "Imports");
+                text(cs, 55, 650, "North");
+                text(cs, 155, 650, "453,102");
+                text(cs, 255, 650, "895,004");
+                // the under-ruled TOTAL band: three column-aligned values, one wide lattice cell
+                text(cs, 55, 620, "TOTAL");
+                text(cs, 155, 620, "453,515");
+                text(cs, 255, 620, "895,111");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * The user's bug report at FULL shape: the reported totals row held TWO separate clumps in the
+     * SAME row -- {@code col0 = "TOTAL 453,515 895,111"} and {@code col3 = "456,431 718,382 487,183
+     * 886,211"} -- because ONE interior vertical (the col2/col3 boundary) did extend down into the
+     * band while the others did not. A 7-column, 3-row grid reproduces that: the totals band keeps
+     * only the x=250 interior vertical, so it is two wide cells rather than one. Columns are 70pt
+     * wide so a 7-character 10pt figure fits inside its own cell with margin.
+     */
+    static void ruledTotalsRowWithTwoClumpsInOneRow(Path file) throws IOException {
+        float[] xs = {40, 110, 180, 250, 320, 390, 460, 530};
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, xs[0], y, xs[7], y);
+                for (float x : xs) line(cs, x, 700, x, 640);          // interior: rows 0-1 only
+                for (float x : new float[]{xs[0], 250, xs[7]}) {
+                    line(cs, x, 700, x, 610);                        // the three that reach the band
+                }
+                String[] head = {"Region", "Jan", "Feb", "Mar", "Apr", "May", "Jun"};
+                String[] data = {"North", "451,001", "895,002", "456,003", "718,004", "487,005", "886,006"};
+                String[] tot = {"TOTAL", "453,515", "895,111", "456,431", "718,382", "487,183", "886,211"};
+                for (int c = 0; c < 7; c++) {
+                    text(cs, xs[c] + 3, 680, head[c]);
+                    text(cs, xs[c] + 3, 650, data[c]);
+                    text(cs, xs[c] + 3, 620, tot[c]);
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * The GUARD case for {@link #ruledTotalsRowMissingInteriorVerticals}: the same 3x3 ruled table
+     * geometry, except it is the FIRST row that has no interior verticals and that row holds a
+     * genuine SPANNING TEXT TITLE ("Quarterly Fisheries Export Summary") rather than
+     * column-aligned data. The title's glyphs straddle more than one of the table's columns, so a
+     * column-alignment test alone would happily chop it into pieces; its tokens are entirely
+     * NON-NUMERIC, which is what must keep it intact as one logical value.
+     */
+    static void ruledSpanningTextHeaderMissingInteriorVerticals(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 350}) line(cs, x, 700, x, 610);   // outer, full height
+                for (float x : new float[]{150, 250}) line(cs, x, 670, x, 610);  // interior rows 1-2 only
+                // spanning, non-numeric title in the under-ruled band
+                text(cs, 55, 680, "Quarterly Fisheries Export Summary");
+                text(cs, 55, 650, "North");
+                text(cs, 155, 650, "453,102");
+                text(cs, 255, 650, "895,004");
+                text(cs, 55, 620, "South");
+                text(cs, 155, 620, "453,515");
+                text(cs, 255, 620, "895,111");
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * Two independently-ruled 2x2 tables whose cell geometry genuinely OVERLAPS: table A is a 2x2
      * grid (x in {50,250,450}, y in {600,650,700}), and table B is a SEPARATE, smaller 2x2 grid
      * (x in {100,150,200}, y in {660,675,690}) nested entirely inside A's own (row0,col0) cell

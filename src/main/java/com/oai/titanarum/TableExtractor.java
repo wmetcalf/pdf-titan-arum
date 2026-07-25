@@ -112,6 +112,32 @@ final class TableExtractor {
     // grid at that size completes in low hundreds of thousands of pair checks, comfortably under
     // 1% of this budget). Counts each touches() pair evaluation across the whole call.
     static final long MAX_GROUPING_WORK = 60_000_000;
+    // ---- over-clumped-cell split (see splitClumpedCells) -----------------------------------
+    // Candidate cap: the most clumped cells ONE lattice table may re-split. A real under-ruled
+    // band is one row (the reported bug) up to a whole under-ruled table BODY (measured on the
+    // scoring corpus: eu-016 p3 and eu-017 p2 have 30 and 26 such rows respectively -- every data
+    // row of the table). 512 is ~17x the worst REAL case measured and still bounds the
+    // O(candidates x words) assignment loop below. Over the cap the split pass gives up on the
+    // whole table and leaves it EXACTLY as it is today -- never drops it.
+    static final int MAX_CLUMP_CANDIDATES_PER_TABLE = 512;
+    // Work budget for the split pass, counted cumulatively across every table on ONE page:
+    // (a) one (glyph -> candidate-union bbox) containment test per page glyph per table that has
+    // any candidate at all, and (b) one (candidate, word) containment test per pair. (b) is the
+    // quadratic-shaped one and is what this budget exists for.
+    //
+    // MEASURED, replaying extractLatticePage's exact sequence over every page of the 77-PDF
+    // scoring corpus and reading this counter directly (ClumpWorkProbe): 15 pages charge anything
+    // at all, p50 = 2,465 units, WORST REAL PAGE = 6,051 units (eu-001 p1) = 0.076% of this
+    // budget, and the pass costs 19.0ms summed over every page of every PDF in the corpus.
+    //
+    // MEASURED at the hostile end (TableClumpSplitDosTest): the worst shape a single Letter page
+    // can actually carry -- this class's candidate cap (512 clumped cells) crossed with a 20,000-run
+    // glyph bomb (40,000 glyphs -> ~10,000 words) -- charges 5,160,000 units in ~34ms, i.e. 64% of
+    // this budget. So the budget is set to LET THE WORST REAL PAGE THROUGH with ~1,300x headroom
+    // while capping the worst hostile page at tens of milliseconds; beyond it the pass gives up and
+    // the table ships exactly as it does today. Charged per unit of REAL work examined, like every
+    // sibling budget in this class.
+    static final long MAX_CLUMP_SPLIT_WORK = 8_000_000;
     // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the MEMORY side.
     //
     // round-6 (THIS fix, supersedes rounds 3-5 below): fillCellsByRegion no longer uses
@@ -1031,6 +1057,319 @@ final class TableExtractor {
         return t;
     }
 
+    // ------------------------------------------------- over-clumped lattice cell re-splitting
+
+    /**
+     * Chop over-clumped lattice cells by the table's OWN column alignment.
+     *
+     * <p>THE DEFECT (reported by the user from real output). In an UNDER-RULED band -- typically a
+     * TOTAL row whose interior vertical rulings do not extend down into it -- the ruling grid
+     * genuinely contains one WIDE cell where the page shows N narrow ones, so several
+     * column-aligned values get joined into a single cell. Verbatim, from a real fisheries-export
+     * PDF (a 15x14 table whose rows 1-13 each came out with every number in its own cell):
+     * <pre>
+     *   row14 col0 = "TOTAL 453,515 895,111"
+     *   row14 col3 = "456,431 718,382 487,183 886,211"
+     * </pre>
+     * The defect is isolated to bands where the ruling grid is incomplete, and the table's real
+     * column boundaries are therefore ALREADY KNOWN from the rows that ARE fully ruled. That is
+     * what makes this recoverable without inventing geometry: the boundaries come from this same
+     * table's own single-column cell edges, never from a heuristic over the page.
+     *
+     * <p>WHAT THIS IS NOT. It is not a second segmentation pass and it never changes {@code
+     * rowCount}/{@code colCount}, the table's bbox, or which cells exist outside the clumped band.
+     * It only ever REPLACES one spanning cell with per-column cells at column indices that already
+     * exist in this table, and only when the replacement is a pure re-partition of that cell's own
+     * text (see the integrity check below). {@code MAX_CELLS_PER_TABLE} is enforced on the result.
+     *
+     * <p>THE FIVE CONDITIONS a cell must meet ({@link #isClumpCandidate} plus the per-candidate
+     * tests below). Each exists to keep a genuine value intact:
+     * <ol>
+     *   <li>{@code colSpan >= 2} and at least two of the columns inside that span are RESOLVED
+     *       (some single-column cell elsewhere in the table pins their left/right edges). Without
+     *       two resolved columns there is nothing to split against.</li>
+     *   <li>The cell's text is a SINGLE visual line. A multi-line clump (an entire under-ruled
+     *       table BODY collapsed into one cell -- measured: 1 such cell on the scoring corpus,
+     *       {@code indictb1h_14.pdf} p1, holding 174 tokens over 29 lines) needs its ROWS split
+     *       too, which this pass deliberately does not do; splitting it by column alone would
+     *       leave 6 cells of still-wrong multi-line text, i.e. FABRICATED structure. Skipped.</li>
+     *   <li>Its words map to >= 2 DISTINCT columns. A spanning title whose glyphs all land in one
+     *       column is one logical value in one column and stays put.</li>
+     *   <li>A strict MAJORITY of its whitespace-separated tokens are NUMERIC -- the totals/data
+     *       signature. This is the guard that keeps a genuine spanning TEXT header ("Quarterly
+     *       Fisheries Export Summary", or "Fisheries Exports 2013" -- 1 numeric of 3) intact even
+     *       though its glyphs straddle several columns. Measured on the scoring corpus: of 113
+     *       cells meeting condition 1, this test rejects 33.</li>
+     *   <li>INTEGRITY: the words assigned to the cell must reconstruct that cell's own text
+     *       exactly (whitespace-insensitive), and their column assignment must be non-decreasing
+     *       in reading order. Text is then carved out of the ORIGINAL string by character offset,
+     *       so no character is ever invented, dropped, reordered or re-spaced. If the word scan and
+     *       {@link #joinText}'s glyph scan disagree about the cell's content for any reason
+     *       (differing space thresholds, an exotic font, overlapping draws), the cell is left
+     *       alone -- MISSING a split, never FABRICATING one.</li>
+     * </ol>
+     *
+     * <p>Word formation reuses {@link StreamTableExtractor#buildWords} and its numeric test
+     * ({@link StreamTableExtractor#isNumericToken}) rather than re-deriving either.
+     *
+     * <p>FRAMES. {@code buildWords} works in the glyph DIRECTION frame that {@code
+     * getXDirAdj()/getYDirAdj()} report (which is /Rotate-blind), while cell rects live in the
+     * page's VISUAL, /Rotate-applied frame. Each word's box is therefore mapped through {@link
+     * #applyPageRotation} -- exact for an axis-aligned box under a 0/90/180/270 rotation, since
+     * those map axes onto axes -- before any comparison with a cell, exactly as {@link
+     * #fillCellsFromPositions} maps glyph midpoints.
+     *
+     * <p>NEVER THROWS, and never costs the caller a table. Its own budget
+     * ({@link #MAX_CLUMP_SPLIT_WORK}) and {@code buildWords}' glyph/word caps both surface as
+     * {@link RulingOverflowException}; catching it HERE (rather than letting it reach {@link
+     * #renderKeptTables}' catch) is deliberate: this pass is a post-process on a table the
+     * extractor has ALREADY successfully built, so aborting it must leave that table exactly as it
+     * would have been without this code -- propagating would let a hostile page DELETE a table
+     * that ships today. The mutation of {@code t.cells} happens once, at the very end, after every
+     * check has passed, so a mid-pass abort cannot leave a partially split table either.
+     *
+     * @param work shared cumulative counter for the whole page (see {@link #MAX_CLUMP_SPLIT_WORK})
+     */
+    static void splitClumpedCells(TableHit t, List<TextPosition> positions, int rotation,
+                                  float unrotatedW, float unrotatedH, long[] work, long budget) {
+        try {
+            splitClumpedCellsChecked(t, positions, rotation, unrotatedW, unrotatedH, work, budget);
+        } catch (RulingOverflowException e) {
+            // budget or glyph/word cap hit -- leave the table exactly as it already is
+        } catch (RuntimeException e) {
+            // defense in depth on a brand-new hostile-input surface: an enhancement must never be
+            // the reason a successfully-extracted table is lost.
+            System.err.println("WARNING: clumped-cell split skipped on page " + (t == null ? -1 : t.page)
+                    + ": " + e);
+        }
+    }
+
+    private static void splitClumpedCellsChecked(TableHit t, List<TextPosition> positions, int rotation,
+                                                 float unrotatedW, float unrotatedH,
+                                                 long[] work, long budget) {
+        if (t == null || t.cells == null || t.cells.isEmpty() || t.colCount < 2) return;
+        if (positions == null || positions.isEmpty()) return;
+
+        // (1) The table's own column bands, from its single-column cells only. A column with no
+        // single-column cell anywhere in the table is UNRESOLVED (NaN) and never a split target.
+        float[] colL = new float[t.colCount];
+        float[] colR = new float[t.colCount];
+        java.util.Arrays.fill(colL, Float.NaN);
+        java.util.Arrays.fill(colR, Float.NaN);
+        for (CellHit c : t.cells) {
+            if (c.colSpan != 1 || c.col < 0 || c.col >= t.colCount || c.bbox == null) continue;
+            colL[c.col] = Float.isNaN(colL[c.col]) ? c.bbox[0] : Math.min(colL[c.col], c.bbox[0]);
+            colR[c.col] = Float.isNaN(colR[c.col]) ? c.bbox[2] : Math.max(colR[c.col], c.bbox[2]);
+        }
+        // Prefix count of resolved columns, so the per-cell span test below is O(1) rather than
+        // O(colSpan) -- otherwise a 10,000-cell table of wide spans costs O(cells x colCount).
+        int[] resolvedUpTo = new int[t.colCount + 1];
+        for (int j = 0; j < t.colCount; j++) {
+            resolvedUpTo[j + 1] = resolvedUpTo[j] + (Float.isNaN(colL[j]) ? 0 : 1);
+        }
+
+        // (2) Candidates, plus the (row,col) slots already taken by cells we are NOT touching.
+        List<CellHit> candidates = new ArrayList<>();
+        for (CellHit c : t.cells) {
+            if (!isClumpCandidate(c, t, resolvedUpTo)) continue;
+            candidates.add(c);
+            if (candidates.size() > MAX_CLUMP_CANDIDATES_PER_TABLE) return;
+        }
+        if (candidates.isEmpty()) return;
+        // IDENTITY sets, not equals-based ones: CellHit has no equals/hashCode, and two distinct
+        // cells of one table can carry identical field values (e.g. two empty cells), so an
+        // equals-based membership test would be both wrong and O(n) per probe.
+        Set<CellHit> candidateSet = Collections.newSetFromMap(new IdentityHashMap<>());
+        candidateSet.addAll(candidates);
+        Set<Long> occupied = new HashSet<>();
+        for (CellHit c : t.cells) {
+            if (candidateSet.contains(c)) continue;
+            for (int j = c.col; j < c.col + Math.max(1, c.colSpan); j++) {
+                occupied.add(((long) c.row << 32) | (j & 0xffffffffL));
+            }
+        }
+
+        // (3) Glyphs inside the union of the candidate bboxes, in document order (buildWords needs
+        // the original order to form words at all). One pass over the page's positions.
+        float ux0 = Float.MAX_VALUE, uy0 = Float.MAX_VALUE, ux1 = -Float.MAX_VALUE, uy1 = -Float.MAX_VALUE;
+        for (CellHit c : candidates) {
+            ux0 = Math.min(ux0, c.bbox[0]); uy0 = Math.min(uy0, c.bbox[1]);
+            ux1 = Math.max(ux1, c.bbox[2]); uy1 = Math.max(uy1, c.bbox[3]);
+        }
+        List<TextPosition> inBand = new ArrayList<>();
+        for (TextPosition tp : positions) {
+            if (++work[0] > budget) throw new RulingOverflowException();
+            float mx = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
+            float my = tp.getYDirAdj() - tp.getHeightDir() / 2;
+            float[] v = applyPageRotation(mx, my, rotation, unrotatedW, unrotatedH);
+            if (v[0] >= ux0 && v[0] <= ux1 && v[1] >= uy0 && v[1] <= uy1) inBand.add(tp);
+        }
+        if (inBand.isEmpty()) return;
+
+        // (4) Words, mapped into the visual frame the cell rects live in.
+        List<StreamTableExtractor.Word> words = StreamTableExtractor.buildWords(inBand);
+        if (words.isEmpty()) return;
+        float[][] wbox = new float[words.size()][];
+        for (int i = 0; i < words.size(); i++) {
+            StreamTableExtractor.Word w = words.get(i);
+            float[] a = applyPageRotation(w.x0, w.y0, rotation, unrotatedW, unrotatedH);
+            float[] b = applyPageRotation(w.x1, w.y1, rotation, unrotatedW, unrotatedH);
+            wbox[i] = new float[]{Math.min(a[0], b[0]), Math.min(a[1], b[1]),
+                                  Math.max(a[0], b[0]), Math.max(a[1], b[1])};
+        }
+
+        // (5) Per candidate: assign words, run every guard, and stage the replacement cells.
+        List<CellHit> replacements = new ArrayList<>();
+        Set<CellHit> consumed = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (CellHit c : candidates) {
+            List<Integer> mine = new ArrayList<>();
+            for (int i = 0; i < words.size(); i++) {
+                if (++work[0] > budget) throw new RulingOverflowException();
+                float cx = (wbox[i][0] + wbox[i][2]) * 0.5f;
+                float cy = (wbox[i][1] + wbox[i][3]) * 0.5f;
+                if (cx >= c.bbox[0] && cx <= c.bbox[2] && cy >= c.bbox[1] && cy <= c.bbox[3]) {
+                    mine.add(i);
+                }
+            }
+            if (mine.size() < 2) continue;
+            // reading order: one visual line by construction, so left-to-right settles it
+            final float[][] wb = wbox;
+            mine.sort(java.util.Comparator.comparingDouble(i -> wb[i][0]));
+
+            List<CellHit> split = splitOneClump(c, t, mine, words, wbox, colL, colR, occupied);
+            if (split == null) continue;
+            consumed.add(c);
+            replacements.addAll(split);
+            // Claim the slots this candidate just took, so a LATER candidate in the same row (the
+            // reported bug had two clumps in one row) can never be split onto a column another
+            // candidate already occupies -- renderViews would silently drop one of the two.
+            for (CellHit n : split) occupied.add(((long) n.row << 32) | (n.col & 0xffffffffL));
+        }
+        if (consumed.isEmpty()) return;
+
+        // (6) MAX_CELLS_PER_TABLE on the RESULT. Over the cap, change nothing.
+        long after = (long) t.cells.size() - consumed.size() + replacements.size();
+        if (after > MAX_CELLS_PER_TABLE) return;
+
+        List<CellHit> out = new ArrayList<>((int) after);
+        for (CellHit c : t.cells) if (!consumed.contains(c)) out.add(c);
+        out.addAll(replacements);
+        out.sort(java.util.Comparator.<CellHit>comparingInt(c -> c.row).thenComparingInt(c -> c.col));
+        t.cells = out;
+    }
+
+    /** Conditions 1 and 2 of {@link #splitClumpedCells}: geometry + single-line + >= 2 tokens. */
+    private static boolean isClumpCandidate(CellHit c, TableHit t, int[] resolvedUpTo) {
+        if (c.colSpan < 2 || c.rowSpan < 1 || c.bbox == null || c.text == null) return false;
+        if (c.col < 0 || c.col >= t.colCount) return false;
+        if (c.text.indexOf('\n') >= 0) return false;           // multi-line clump: not ours to split
+        String s = c.text.strip();
+        if (s.isEmpty()) return false;
+        boolean hasGap = false;
+        for (int i = 0; i < s.length(); i++) if (Character.isWhitespace(s.charAt(i))) { hasGap = true; break; }
+        if (!hasGap) return false;                             // one token: nothing to distribute
+        int hi = Math.min(t.colCount, c.col + c.colSpan);
+        return resolvedUpTo[hi] - resolvedUpTo[c.col] >= 2;
+    }
+
+    /**
+     * Conditions 3-5 of {@link #splitClumpedCells} for one candidate, returning the per-column
+     * replacement cells or {@code null} to leave the candidate untouched. Text for each emitted
+     * cell is carved out of {@code c.text} by character offset (never rebuilt from the words), so
+     * the emitted cells' concatenation is {@code c.text} with only the inter-column whitespace
+     * removed.
+     */
+    private static List<CellHit> splitOneClump(CellHit c, TableHit t, List<Integer> mine,
+                                               List<StreamTableExtractor.Word> words, float[][] wbox,
+                                               float[] colL, float[] colR, Set<Long> occupied) {
+        int lo = c.col, hi = Math.min(t.colCount, c.col + c.colSpan);
+
+        // INTEGRITY (condition 5a): the words must reconstruct this cell's text exactly, ignoring
+        // whitespace, AND we record each word's character span in the ORIGINAL text as we go.
+        String text = c.text;
+        int[] wordStart = new int[mine.size()];
+        int[] wordEnd = new int[mine.size()];
+        int p = 0;
+        for (int k = 0; k < mine.size(); k++) {
+            String wt = words.get(mine.get(k)).text;
+            while (p < text.length() && Character.isWhitespace(text.charAt(p))) p++;
+            if (p >= text.length()) return null;
+            wordStart[k] = p;
+            for (int q = 0; q < wt.length(); q++) {
+                char want = wt.charAt(q);
+                if (Character.isWhitespace(want)) continue;     // buildWords already trims, belt+braces
+                if (p >= text.length() || text.charAt(p) != want) return null;
+                p++;
+            }
+            wordEnd[k] = p;
+        }
+        while (p < text.length() && Character.isWhitespace(text.charAt(p))) p++;
+        if (p != text.length()) return null;                    // cell holds text no word accounted for
+
+        // Condition 3: >= 2 distinct columns, assignment non-decreasing in reading order.
+        int[] colOf = new int[mine.size()];
+        int prev = -1, distinct = 0;
+        for (int k = 0; k < mine.size(); k++) {
+            int i = mine.get(k);
+            float cx = (wbox[i][0] + wbox[i][2]) * 0.5f;
+            int j = nearestResolvedColumn(cx, colL, colR, lo, hi);
+            if (j < 0) return null;
+            if (j < prev) return null;                          // out-of-order: not a column layout
+            if (j > prev) distinct++;
+            colOf[k] = j;
+            prev = j;
+        }
+        if (distinct < 2) return null;                          // a spanning value inside one column
+
+        // Condition 4: strict numeric majority over the cell's own whitespace-separated tokens.
+        int numeric = 0, tokens = 0;
+        for (String tok : text.strip().split("\\s+")) {
+            if (tok.isEmpty()) continue;
+            tokens++;
+            if (StreamTableExtractor.isNumericToken(tok)) numeric++;
+        }
+        if (tokens < 2 || numeric * 2 <= tokens) return null;   // a text title stays one value
+
+        // Emit one cell per occupied column, text carved from the original string.
+        List<CellHit> out = new ArrayList<>();
+        int k = 0;
+        while (k < mine.size()) {
+            int j = colOf[k], end = k;
+            while (end + 1 < mine.size() && colOf[end + 1] == j) end++;
+            if (occupied.contains(((long) c.row << 32) | (j & 0xffffffffL))) return null;
+            CellHit n = new CellHit();
+            n.row = c.row;
+            n.col = j;
+            n.rowSpan = c.rowSpan;
+            n.colSpan = 1;
+            n.text = text.substring(wordStart[k], wordEnd[end]).strip();
+            n.bbox = new float[]{Math.max(c.bbox[0], colL[j]), c.bbox[1],
+                                 Math.min(c.bbox[2], colR[j]), c.bbox[3]};
+            if (n.text.isEmpty() || n.bbox[2] <= n.bbox[0]) return null;
+            out.add(n);
+            k = end + 1;
+        }
+        return out;
+    }
+
+    /**
+     * Column in {@code [lo, hi)} whose resolved band contains {@code x}, else the nearest resolved
+     * band by distance from {@code x} to the band interval (a value centred in a GUTTER between two
+     * of the table's own columns belongs to the nearer one). -1 when no column in range is
+     * resolved. Ties go to the lower column index, matching {@link #nearestIndex}.
+     */
+    private static int nearestResolvedColumn(float x, float[] colL, float[] colR, int lo, int hi) {
+        int best = -1;
+        float bestD = Float.MAX_VALUE;
+        for (int j = lo; j < hi; j++) {
+            if (Float.isNaN(colL[j])) continue;
+            float d = x < colL[j] ? colL[j] - x : (x > colR[j] ? x - colR[j] : 0f);
+            if (d < bestD) { bestD = d; best = j; }
+            if (d == 0f) break;
+        }
+        return best;
+    }
+
     /**
      * Index of the boundary closest to {@code v}. {@code boundaries} is always sorted ascending
      * (built from a TreeSet by every caller), so this binary-searches rather than scanning
@@ -1616,8 +1955,9 @@ final class TableExtractor {
      * longer uses PDFTextStripterByArea at all (a confirmed correctness bug: a glyph inside two or
      * more overlapping/nested cell regions used to be silently dropped from all but one of them).
      */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
-        fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_TEXTFILL_WORK);
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result)
+            throws IOException {
+        return fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_TEXTFILL_WORK);
     }
 
     /** Package-private overload taking an explicit glyph-collection budget (see {@link
@@ -1626,20 +1966,21 @@ final class TableExtractor {
      * float, long[], long)}'s test-only budget override, letting a test pin {@link
      * #MAX_REGION_GLYPHS} deterministically without needing a real multi-million-glyph PDF
      * fixture. */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result, long glyphBudget)
-            throws IOException {
-        fillCellsByRegion(tables, page, result, glyphBudget, MAX_TEXTFILL_WORK);
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
+                                                long glyphBudget) throws IOException {
+        return fillCellsByRegion(tables, page, result, glyphBudget, MAX_TEXTFILL_WORK);
     }
 
     /** Package-private overload taking BOTH explicit budgets -- lets a test pin the
      * position-collection cap AND the bucketing-work cap ({@link #fillCellsFromPositions}'s own
      * budget) deterministically without needing a real fixture large enough to trip either at the
      * production budget. */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
-                                  long glyphBudget, long workBudget) throws IOException {
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
+                                                long glyphBudget, long workBudget) throws IOException {
         long totalCells = 0;
         for (List<CellRect> comp : tables) totalCells += comp.size();
-        if (totalCells == 0) return; // nothing to fill -- avoid registering a bogus bbox below
+        // nothing to fill -- avoid registering a bogus bbox below
+        if (totalCells == 0) return Collections.emptyList();
 
         int rotation = page.getRotation();
         PDRectangle cropBox = page.getCropBox();
@@ -1666,6 +2007,10 @@ final class TableExtractor {
         for (List<CellRect> comp : tables) {
             fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, workBudget);
         }
+        // Returned (not just used) so extractLatticePage can hand the SAME glyphs to the
+        // over-clumped-cell split pass without a second content-stream walk. Callers that only
+        // want the fill are free to ignore it.
+        return positions;
     }
 
     // ---------------------------------------------------------------- entry point
@@ -1991,16 +2336,23 @@ final class TableExtractor {
         // sub-grids instead of one bogus merged grid.
         List<List<CellRect>> kept = selectKeptTables(groupIntoTables(cells), pageNum, result);
 
+        // The glyph list the cell text was actually filled from -- reused (read-only) by the
+        // over-clumped-cell split pass in renderKeptTables so it can re-derive WORDS inside an
+        // under-ruled band without a second content-stream walk. On the region-fill path this is
+        // the (bbox-prefiltered) list fillCellsByRegion collected, a superset of any candidate
+        // cell's own glyphs, so the pass sees exactly the same text either way.
+        List<TextPosition> filledFrom = null;
         if (positions != null && !positions.isEmpty()) {
             long[] work = {0};
             for (List<CellRect> comp : kept) {
                 fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work);
             }
+            filledFrom = positions;
         } else if (!kept.isEmpty()) {
-            fillCellsByRegion(kept, page, result);
+            filledFrom = fillCellsByRegion(kept, page, result);
         }
 
-        renderKeptTables(pageNum, kept, result);
+        renderKeptTables(pageNum, kept, result, filledFrom, rotation, unrotatedW, unrotatedH);
     }
 
     /**
@@ -2030,9 +2382,26 @@ final class TableExtractor {
      * source to guard against in this loop.
      */
     static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result) {
+        renderKeptTables(pageNum, kept, result, null, 0, 0f, 0f);
+    }
+
+    /**
+     * As {@link #renderKeptTables(int, List, Result)}, additionally running the over-clumped-cell
+     * split pass ({@link #splitClumpedCells}) on each built table. {@code positions} is the page's
+     * glyph list in the frame {@code getXDirAdj()/getYDirAdj()} report (i.e. what {@link
+     * #fillCellsFromPositions} was given, or what {@link #fillCellsByRegion} collected); pass
+     * {@code null} to skip the pass entirely. The split budget is shared across every table on the
+     * page via one {@code work} counter, so a hostile page cannot multiply it by table count.
+     */
+    static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result,
+                                 List<TextPosition> positions, int rotation,
+                                 float unrotatedW, float unrotatedH) {
+        long[] clumpWork = {0};
         for (List<CellRect> comp : kept) {
             try {
                 TableHit t = buildTable(pageNum, comp, "lattice");
+                splitClumpedCells(t, positions, rotation, unrotatedW, unrotatedH,
+                        clumpWork, MAX_CLUMP_SPLIT_WORK);
                 renderViews(t);
                 // PROSE FALSE POSITIVES (lever 4): a drawn grid whose text all anchors in ONE column
                 // is a boxed paragraph / banner-rule pair -- see MIN_LATTICE_TEXTFUL_COLUMNS.

@@ -106,8 +106,19 @@ final class StreamTableExtractor {
     private static void finishWord(Word w, List<Word> out) {
         w.text = w.text.trim();
         if (w.text.isEmpty()) return;
-        w.numeric = w.text.matches("[-+(]?[\\d.,%$)]+") && w.text.chars().anyMatch(Character::isDigit);
+        w.numeric = isNumericToken(w.text);
         out.add(w);
+    }
+
+    /**
+     * This class's single definition of a NUMERIC token: digits plus the punctuation numbers are
+     * actually written with, and at least one real digit (so "%", "$", "(.)" alone are not numeric).
+     * Extracted verbatim out of {@link #finishWord} -- unchanged behaviour -- so {@link
+     * TableExtractor#splitClumpedCells}' numeric-majority guard asks the SAME question about a
+     * token that word building already asks, instead of re-deriving a second, drifting definition.
+     */
+    static boolean isNumericToken(String s) {
+        return s.matches("[-+(]?[\\d.,%$)]+") && s.chars().anyMatch(Character::isDigit);
     }
 
     static List<Line> buildLines(List<Word> words, float medianFontSize) {

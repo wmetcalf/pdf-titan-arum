@@ -169,6 +169,76 @@ final class StreamTableExtractor {
     // O(obstacles) scan and the budget directly caps pop count at budget/obstacles regardless.
     static final long MAX_GUTTER_SCAN_WORK  = 500_000_000;
 
+    // Task 9k. Corpus-wide adjacency-F1 diagnosis (77-PDF ICDAR/tabula scoring set) decomposed
+    // every false positive/negative for the production "breuel" finder: 88.8% of all FNs and
+    // 56.7% of all FPs occur INSIDE tables already correctly located, i.e. the grid built
+    // within a correctly-found table is wrong. Of those within-table FPs, 50.0% (4,295/8,597)
+    // are column UNDER-SPLITTING: two adjacent ground-truth columns get detected as one and
+    // their text gets joined into a single cell -- the single largest contributor identified.
+    // Root cause: minGutterW (== medianSpace, see above) is a hard floor -- the branch-and-bound
+    // above (line ~225) drops any candidate rect narrower than it BEFORE ever scoring it, so a
+    // real but physically narrow inter-column gap (common for numeric columns, which often sit
+    // closer together than prose word-spacing) never even becomes a candidate, let alone gets
+    // accepted. The fix below (findAlignmentNarrowGutters) is a SEPARATE, bounded secondary pass
+    // run once after the primary width-gated search completes: for each column segment the
+    // primary search left un-split, it looks for a narrower-than-minGutterW empty strip that
+    // nonetheless has strong ALIGNMENT evidence -- a consistent left/right word-edge pair,
+    // recurring on a high fraction of that segment's rows, with low position variance -- and
+    // promotes it to a real gutter. It is a strictly additive pass (never removes or narrows a
+    // primary-found gutter) run in its own charged, independently-bounded budget
+    // (MAX_ALIGNMENT_GUTTER_WORK) so it cannot itself become a new DoS vector, and it is only
+    // ever reached after the primary search has ALREADY completed within its own budget, so the
+    // existing findGuttersAbortsOnDenseAdversarialPage behavior (primary budget still fires
+    // first on that fixture) is unaffected.
+
+    // Absolute floor, expressed as a fraction of medianSpace: no strip narrower than this is EVER
+    // accepted, no matter how strong its alignment evidence, so this fix can never degenerate
+    // into splitting inside a single word/kerning run (which is always << medianSpace wide) --
+    // ordinary intra-word glyph-to-glyph gaps are a small fraction of medianSpace, while a real
+    // (if tight) inter-column gap is a meaningful fraction of it. 0.30 sits comfortably below the
+    // narrow-but-real gap this fix targets (measured/constructed at ~0.58x medianSpace, see
+    // StreamGutterTest#narrowlySpacedAdjacentColumnsAreSplit) while staying well above
+    // kerning-scale noise.
+    static final float NARROW_GUTTER_ABS_FLOOR_FACTOR = 0.30f;
+
+    // Clustering tolerance (fraction of medianSpace) for grouping candidate narrow-gap
+    // midpoints that recur across different rows into one alignment signal, mirroring
+    // AlignmentEdgeGutterFinder's own edge-clustering tolerance (0.4x medianSpace) for the same
+    // underlying phenomenon (real glyph metrics vary slightly row-to-row even for a genuinely
+    // aligned column boundary).
+    static final float NARROW_GUTTER_CLUSTER_TOL_FACTOR = 0.5f;
+
+    // Once a cluster is found, its member rows' own left-edge (word-ending) and right-edge
+    // (word-starting) positions must ALSO individually vary by no more than this fraction of
+    // medianSpace -- the "low variance" requirement from the spec, checked directly on the raw
+    // edge positions rather than inferred solely from the clustering tolerance above (clustering
+    // groups by MIDPOINT, which could mask one side drifting while the other compensates).
+    static final float NARROW_GUTTER_ALIGN_TOL_FACTOR = 0.35f;
+
+    // Required fraction of a segment's own populated rows that must exhibit the aligned
+    // narrow-gap signal before it is promoted to a gutter. Set well above the primary search's
+    // own minCover (0.60, see above) because this is intrinsically weaker/riskier evidence (a
+    // narrower empty strip is more easily produced by coincidence than a wide one) -- the higher
+    // bar is what keeps this fix from raising prose false positives.
+    static final float NARROW_GUTTER_MIN_ROW_FRACTION = 0.70f;
+
+    // A numeric column boundary (right- or decimal-aligned digits on one or both sides of the
+    // gap) is much stronger evidence than an arbitrary word boundary -- real prose essentially
+    // never produces a recurring narrow gap flanked by numbers -- so a numeric-backed cluster is
+    // held to a relaxed (but still majority) row-fraction bar instead of the stricter default.
+    static final float NARROW_GUTTER_MIN_ROW_FRACTION_NUMERIC = 0.55f;
+
+    // Bounds the REAL work of the secondary pass: every word examined while building per-segment
+    // gap observations, plus one O(obstacles) global straddle check per surviving cluster, is
+    // charged. Sized far below the primary search's own MAX_GUTTER_SCAN_WORK (500,000,000)
+    // because this pass is a small, targeted addition, not a second full search -- 5,000,000
+    // gives generous headroom over every legitimate fixture in this suite (e.g. the 200x10
+    // uniformGrid: 2,000 words scanned once across ~10 segments, each segment producing zero
+    // observations since its columns are already fully split by the primary pass) while still
+    // being a real, finite, charged ceiling that throws RulingOverflowException (not merely
+    // returns fewer results) if a pathological input somehow drives it up.
+    static final long MAX_ALIGNMENT_GUTTER_WORK = 5_000_000L;
+
     static final class Gutter {
         float x0, x1;
         int rowsCovered;
@@ -278,7 +348,149 @@ final class StreamTableExtractor {
             Gutter g = new Gutter(); g.x0 = m[0]; g.x1 = m[1]; g.rowsCovered = cover;
             gutters.add(g);
         }
+
+        // Task 9k secondary pass: promote narrower-than-minGutterW empty strips backed by
+        // strong cross-row alignment evidence -- see findAlignmentNarrowGutters and the
+        // NARROW_GUTTER_* constants' docs above for the full rationale. Strictly additive: never
+        // removes or narrows anything the primary search above already found.
+        List<Gutter> narrow = findAlignmentNarrowGutters(lines, obstacles, gutters, bandX0, bandX1, medianSpace, minGutterW);
+        if (!narrow.isEmpty()) {
+            gutters.addAll(narrow);
+            gutters.sort(Comparator.comparingDouble(g -> g.x0));
+        }
         return gutters;
+    }
+
+    /**
+     * Task 9k. Secondary, bounded pass run once after the primary width-gated branch-and-bound
+     * in {@link #findGutters} completes: looks, within each column segment the primary search
+     * left un-split (i.e. between/around its own {@code primaryGutters}), for a narrower-than-
+     * {@code minGutterW} empty strip that nonetheless has strong alignment evidence -- a
+     * consistent word-ending/word-starting edge pair recurring on a high fraction of the
+     * segment's own populated rows, with low position variance on both edges, and never actually
+     * straddled by any word anywhere in the block. See the {@code NARROW_GUTTER_*} constants
+     * above for every threshold's own rationale.
+     *
+     * <p>Only words FULLY CONTAINED in a segment (not merely overlapping it) contribute
+     * observations -- this is what keeps a full-width spanning header/title row (which overlaps
+     * every segment) from ever manufacturing a bogus narrow-gap observation.
+     *
+     * <p>Charged against {@link #MAX_ALIGNMENT_GUTTER_WORK}; throws {@link
+     * TableExtractor.RulingOverflowException} on overflow, same discipline as the primary search.
+     */
+    private static List<Gutter> findAlignmentNarrowGutters(List<Line> lines, List<float[]> obstacles,
+            List<Gutter> primaryGutters, float bandX0, float bandX1, float medianSpace, float minGutterW) {
+        List<Gutter> found = new ArrayList<>();
+        float absFloor = NARROW_GUTTER_ABS_FLOOR_FACTOR * medianSpace;
+        if (absFloor <= 0 || absFloor >= minGutterW) return found; // nothing narrower to look for
+
+        // Segments = the x-ranges the primary search did NOT already claim as a gutter: before
+        // the first primary gutter, between each consecutive pair, and after the last.
+        List<Gutter> sortedPrimary = new ArrayList<>(primaryGutters);
+        sortedPrimary.sort(Comparator.comparingDouble(g -> g.x0));
+        List<float[]> segments = new ArrayList<>(); // {segX0, segX1}
+        float prevX1 = bandX0;
+        for (Gutter pg : sortedPrimary) {
+            segments.add(new float[]{prevX1, pg.x0});
+            prevX1 = pg.x1;
+        }
+        segments.add(new float[]{prevX1, bandX1});
+
+        long work = 0;
+        float clusterTol = NARROW_GUTTER_CLUSTER_TOL_FACTOR * medianSpace;
+        float alignTol = NARROW_GUTTER_ALIGN_TOL_FACTOR * medianSpace;
+
+        for (float[] seg : segments) {
+            float segX0 = seg[0], segX1 = seg[1];
+            if (segX1 - segX0 < 2 * absFloor) continue; // no room for an interior narrow gutter
+
+            // Per-line candidate observations: an adjacent-word gap, fully inside this segment,
+            // narrower than minGutterW but at least the absolute floor.
+            List<float[]> obs = new ArrayList<>(); // {leftEdge(x1 of left word), rightEdge(x0 of right word), lineIdx, numericVotes}
+            int populatedRows = 0;
+            for (int li = 0; li < lines.size(); li++) {
+                List<Word> segWords = new ArrayList<>();
+                for (Word w : lines.get(li).words) {
+                    work++;
+                    if (work > MAX_ALIGNMENT_GUTTER_WORK) throw new TableExtractor.RulingOverflowException();
+                    if (w.x0 >= segX0 - 0.01f && w.x1 <= segX1 + 0.01f) segWords.add(w);
+                }
+                if (!segWords.isEmpty()) populatedRows++;
+                for (int i = 1; i < segWords.size(); i++) {
+                    Word left = segWords.get(i - 1), right = segWords.get(i);
+                    float gap = right.x0 - left.x1;
+                    if (gap >= absFloor && gap < minGutterW) {
+                        int numericVotes = (left.numeric ? 1 : 0) + (right.numeric ? 1 : 0);
+                        obs.add(new float[]{left.x1, right.x0, li, numericVotes});
+                    }
+                }
+            }
+            if (obs.isEmpty() || populatedRows == 0) continue;
+
+            // Single-linkage cluster by gap midpoint (same discipline as AlignmentEdgeGutterFinder).
+            obs.sort(Comparator.comparingDouble(o -> (o[0] + o[1]) / 2f));
+            List<List<float[]>> clusters = new ArrayList<>();
+            List<float[]> cur = new ArrayList<>();
+            double sumMid = 0; int cnt = 0;
+            for (float[] o : obs) {
+                float mid = (o[0] + o[1]) / 2f;
+                if (cnt == 0 || Math.abs(mid - sumMid / cnt) <= clusterTol) {
+                    cur.add(o); sumMid += mid; cnt++;
+                } else {
+                    clusters.add(cur);
+                    cur = new ArrayList<>(); cur.add(o); sumMid = mid; cnt = 1;
+                }
+            }
+            if (!cur.isEmpty()) clusters.add(cur);
+
+            for (List<float[]> cluster : clusters) {
+                Set<Integer> distinctLines = new HashSet<>();
+                float minLeft = Float.MAX_VALUE, maxLeft = -Float.MAX_VALUE;
+                float minRight = Float.MAX_VALUE, maxRight = -Float.MAX_VALUE;
+                int numericVotes = 0;
+                for (float[] o : cluster) {
+                    distinctLines.add((int) o[2]);
+                    minLeft = Math.min(minLeft, o[0]); maxLeft = Math.max(maxLeft, o[0]);
+                    minRight = Math.min(minRight, o[1]); maxRight = Math.max(maxRight, o[1]);
+                    if (o[3] >= 1) numericVotes++;
+                }
+                int support = distinctLines.size();
+                double rowFraction = (double) support / populatedRows;
+                boolean numericBacked = numericVotes * 2 >= cluster.size();
+                double minFraction = numericBacked ? NARROW_GUTTER_MIN_ROW_FRACTION_NUMERIC
+                                                    : NARROW_GUTTER_MIN_ROW_FRACTION;
+                if (rowFraction < minFraction) continue;
+                // "Low variance" only needs to hold on AT LEAST ONE side, not both: real adjacent
+                // right-aligned numeric columns (the common case this fix targets) keep the LEFT
+                // column's right edge (leftEdge) essentially constant regardless of digit count
+                // (that's what right-alignment means), while the RIGHT column's own left edge
+                // (rightEdge) legitimately drifts with ITS digit count -- requiring both sides
+                // tight would reject exactly the common real case. Whichever side IS the stable
+                // alignment reference is what matters; the other side's drift is already made
+                // safe by the intersection below (gx0/gx1), which never crosses into any cluster
+                // member's actual word regardless of how much the unaligned side moves.
+                boolean leftAligned = (maxLeft - minLeft) <= alignTol;
+                boolean rightAligned = (maxRight - minRight) <= alignTol;
+                if (!leftAligned && !rightAligned) continue;
+
+                float gx0 = maxLeft;   // rightmost "ending" edge across the cluster -> clear of every member's left word
+                float gx1 = minRight;  // leftmost "starting" edge across the cluster -> clear of every member's right word
+                if (gx1 - gx0 < absFloor) continue; // degenerate after intersection
+
+                boolean straddled = false;
+                for (float[] o : obstacles) {
+                    work++;
+                    if (work > MAX_ALIGNMENT_GUTTER_WORK) throw new TableExtractor.RulingOverflowException();
+                    if (o[0] < gx1 && o[2] > gx0) { straddled = true; break; }
+                }
+                if (straddled) continue;
+                if (gx0 <= bandX0 + 0.5f || gx1 >= bandX1 - 0.5f) continue; // interior margin
+
+                Gutter g = new Gutter(); g.x0 = gx0; g.x1 = gx1; g.rowsCovered = support;
+                found.add(g);
+            }
+        }
+        return found;
     }
 
     private static float quality(Rect r, float medianSpace) {

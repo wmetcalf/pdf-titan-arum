@@ -234,6 +234,42 @@ class StreamGutterTest {
      * the fix for the dominant remaining defect measured against ground truth: findGutters
      * under-splitting dense/narrow numeric column blocks.
      */
+    /**
+     * Task 9k: the dominant measured defect in the corpus-wide adjacency-F1 diagnosis is
+     * column UNDER-SPLITTING -- two adjacent ground-truth columns get detected as one because
+     * the true inter-column gap is narrower than {@code minGutterW} (= medianSpace here, 6f),
+     * so the branch-and-bound never even considers that x-range as a candidate gutter. This
+     * fixture reproduces exactly that shape: col0/col1 have an ordinary 20pt gutter (65-45=20,
+     * well above minGutterW, trivially found), but col1/col2 have only a 3.5pt gap (0.58x
+     * medianSpace) -- narrower than minGutterW=6 -- repeated identically (byte-for-byte aligned
+     * left/right edges) across 20 rows. A real narrow-but-consistently-aligned numeric column
+     * boundary like this is exactly what the diagnosis's "augment the width floor with an
+     * alignment-based signal" fix targets: the gap is real and rock-steady across every row,
+     * just physically narrow. Pre-fix, findGutters has no path to accept a sub-minGutterW rect
+     * at all (it's dropped at the width check before ever being scored), so only the col0/col1
+     * gutter is found -- 1 interior gutter versus the true 2 (3 columns). This test asserts the
+     * full 2-gutter/3-column split and documents the pre-fix RED count in the assertion message.
+     */
+    @Test
+    void narrowlySpacedAdjacentColumnsAreSplit() {
+        List<StreamTableExtractor.Word> ws = new ArrayList<>();
+        int rows = 20;
+        for (int r = 0; r < rows; r++) {
+            float y = r * 15f;
+            ws.add(w(10, 45, y, "Row" + r));                 // col0: label, [10,45]
+            ws.add(w(65, 85, y, String.valueOf(10 + r)));    // col1: [65,85] -- 20pt gutter to col0
+            ws.add(w(88.5f, 108.5f, y, String.valueOf(90 + r))); // col2: [88.5,108.5] -- ONLY 3.5pt gap to col1
+        }
+        List<StreamTableExtractor.Line> lines = StreamTableExtractor.buildLines(ws, 10f);
+        assertEquals(rows, lines.size());
+        List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 10, 108.5f, 6f);
+        assertEquals(2, g.size(),
+            "expect 2 interior gutters -> 3 columns (narrow-but-aligned col1/col2 boundary must "
+                + "still be found); got " + g.size() + " -- narrow gap under-split if this is 1");
+        assertTrue(g.get(0).cx() > 45 && g.get(0).cx() < 65, "gutter0 between col0 and col1");
+        assertTrue(g.get(1).cx() > 85 && g.get(1).cx() < 88.5f, "gutter1 (narrow) between col1 and col2");
+    }
+
     @Test
     void denseNumericTableYieldsAllColumns() {
         int rows = 40, cols = 11;

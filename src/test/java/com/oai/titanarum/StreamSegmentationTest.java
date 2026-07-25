@@ -182,4 +182,115 @@ class StreamSegmentationTest {
             assertEquals(0, hits.size(), "scattered prose paragraphs (each < 3 lines per block) must yield no stream tables");
         }
     }
+
+    // ---------------------------------------------------------------- Task 9h: debris vs. header
+
+    private static StreamTableExtractor.Word w(float x0, float x1, float y, String t) {
+        StreamTableExtractor.Word wd = new StreamTableExtractor.Word();
+        wd.x0 = x0; wd.x1 = x1; wd.y0 = y; wd.y1 = y + 10; wd.text = t;
+        return wd;
+    }
+
+    private static StreamTableExtractor.Gutter gutter(float x0, float x1) {
+        StreamTableExtractor.Gutter g = new StreamTableExtractor.Gutter();
+        g.x0 = x0; g.x1 = x1;
+        return g;
+    }
+
+    private static String concat(StreamTableExtractor.Line l) {
+        StringBuilder sb = new StringBuilder();
+        for (StreamTableExtractor.Word wd : l.words) { if (sb.length() > 0) sb.append(' '); sb.append(wd.text); }
+        return sb.toString();
+    }
+
+    /**
+     * Task 9h: two DIFFERENT kinds of leading debris glued to a clean 3-column table, each
+     * requiring a different one of the strengthened {@code trimEdgeLines} signals (per the task
+     * brief's "use several, don't rely on one") --
+     * <ul>
+     *   <li>a centered caption line ("ANNUAL SUMMARY") whose words fall entirely inside ONE
+     *       column while the block's other lines occupy 2+ -- the pre-existing single-column
+     *       signal, unchanged by this task, still catches this on its own;</li>
+     *   <li>a short unit-caption line ("(in millions)") that populates 2 DIFFERENT columns
+     *       (not single-column) and straddles no gutter (its words land cleanly inside existing
+     *       column bands) -- exactly the shape that survived trimming before this task (see
+     *       eu-004's real "(measured in hundreds)" line in the task-9h report). It is caught only
+     *       by the NEW combined signal: it sits hard against a gap to the header (45pt, 2.25x the
+     *       block's own 20pt median line pitch -- over {@link
+     *       StreamTableExtractor#EDGE_LINE_GAP_OUTLIER_FACTOR}) AND has far fewer words (2) than
+     *       the block's own median (3) -- {@link StreamTableExtractor#EDGE_FEW_WORDS_FACTOR}.</li>
+     * </ul>
+     * RED before this task's fix (with the new signal absent): the unit-caption line survived
+     * trimming as a phantom row, so {@code trimmed.size()} was 5 (not 4) and {@code
+     * trimmed.get(0)} was "(in millions)", not the real header.
+     */
+    @Test
+    void captionDebrisIsTrimmedNotTurnedIntoRows() {
+        List<StreamTableExtractor.Line> block = new ArrayList<>();
+        List<StreamTableExtractor.Word> l0 = List.of(w(110, 142, 0, "ANNUAL"), w(144, 158, 0, "SUMMARY"));
+        List<StreamTableExtractor.Word> l1 = List.of(w(10, 30, 20, "(in"), w(110, 145, 20, "millions)"));
+        List<StreamTableExtractor.Word> header = List.of(w(10, 55, 65, "Region"), w(110, 150, 65, "Votes"), w(210, 240, 65, "Pct"));
+        List<StreamTableExtractor.Word> d1 = List.of(w(10, 40, 85, "North"), w(110, 140, 85, "1200"), w(210, 235, 85, "41.2"));
+        List<StreamTableExtractor.Word> d2 = List.of(w(10, 40, 105, "South"), w(110, 135, 105, "900"), w(210, 235, 105, "30.9"));
+        List<StreamTableExtractor.Word> d3 = List.of(w(10, 35, 125, "East"), w(110, 135, 125, "450"), w(210, 235, 125, "15.4"));
+        for (List<StreamTableExtractor.Word> ws : List.of(l0, l1, header, d1, d2, d3)) {
+            StreamTableExtractor.Line ln = new StreamTableExtractor.Line();
+            ln.yTop = ws.get(0).y0; ln.yBot = ws.get(0).y1;
+            ln.words.addAll(ws);
+            block.add(ln);
+        }
+        List<StreamTableExtractor.Gutter> gutters = List.of(gutter(60, 110), gutter(160, 210));
+
+        List<StreamTableExtractor.Line> trimmed = StreamTableExtractor.trimEdgeLines(block, gutters, 10, 260, 6f);
+
+        assertEquals(4, trimmed.size(), "both debris lines must be trimmed, leaving header + 3 data rows; got: "
+                + trimmed.stream().map(StreamSegmentationTest::concat).toList());
+        assertEquals("Region Votes Pct", concat(trimmed.get(0)), "row 0 must be the table's real header, not caption debris");
+    }
+
+    /**
+     * Task 9h defect fix: a genuinely stacked/hierarchical 2-line header -- line 1 has two
+     * merged/spanning group labels ("Domestic" over columns 1-2, "Foreign" over columns 3-4),
+     * each individually CENTERED over its own multi-column span and so straddling that span's
+     * own internal gutter (exactly us-018's real "Actual"/"Projected" shape: 2 words, each
+     * straddling one gutter, each landing in a DIFFERENT column bucket); line 2 is the ordinary
+     * per-column header ("Category","2020"..."2023", one word per column, no straddle). Neither
+     * line is single-column (each populates 2+ distinct columns), and both sit at the block's
+     * normal line pitch (no outlier gap) -- i.e. this is a clean table with NO debris at all.
+     * {@code trimEdgeLines} must not remove either header line.
+     * <p>RED before this task's fix: the unconditional "any word straddles a gutter" check had
+     * no exemption for a column-shaped (wide-internal-gap) line, so line 1 ("Domestic Foreign")
+     * was unconditionally non-conforming and got trimmed away -- {@code trimmed.size()} was 3
+     * (not 4) and {@code trimmed.get(0)} was the per-column header line, not the stacked one.
+     * This is the exact defect measured on us-018 page 1 (its own "Actual"/"Projected" line).
+     */
+    @Test
+    void stackedHeaderRowsSurviveTrimming() {
+        List<StreamTableExtractor.Line> block = new ArrayList<>();
+        List<StreamTableExtractor.Word> line1 = List.of(w(125, 165, 0, "Domestic"), w(245, 285, 0, "Foreign"));
+        List<StreamTableExtractor.Word> line2 = List.of(
+                w(15, 55, 20, "Category"), w(115, 135, 20, "2020"), w(155, 175, 20, "2021"),
+                w(235, 255, 20, "2022"), w(275, 295, 20, "2023"));
+        List<StreamTableExtractor.Word> d1 = List.of(
+                w(15, 55, 40, "Widget"), w(115, 135, 40, "12"), w(155, 175, 40, "8"),
+                w(235, 255, 40, "5"), w(275, 295, 40, "3"));
+        List<StreamTableExtractor.Word> d2 = List.of(
+                w(15, 55, 60, "Gadget"), w(115, 135, 60, "9"), w(155, 175, 60, "7"),
+                w(235, 255, 60, "4"), w(275, 295, 60, "2"));
+        for (List<StreamTableExtractor.Word> ws : List.of(line1, line2, d1, d2)) {
+            StreamTableExtractor.Line ln = new StreamTableExtractor.Line();
+            ln.yTop = ws.get(0).y0; ln.yBot = ws.get(0).y1;
+            ln.words.addAll(ws);
+            block.add(ln);
+        }
+        List<StreamTableExtractor.Gutter> gutters = List.of(
+                gutter(60, 110), gutter(140, 150), gutter(180, 230), gutter(260, 270));
+
+        List<StreamTableExtractor.Line> trimmed = StreamTableExtractor.trimEdgeLines(block, gutters, 10, 300, 6f);
+
+        assertEquals(4, trimmed.size(), "no line is debris -- nothing should be trimmed; got: "
+                + trimmed.stream().map(StreamSegmentationTest::concat).toList());
+        assertEquals("Domestic Foreign", concat(trimmed.get(0)), "the stacked/spanning header line must survive");
+        assertEquals("Category 2020 2021 2022 2023", concat(trimmed.get(1)), "the per-column header line must survive");
+    }
 }

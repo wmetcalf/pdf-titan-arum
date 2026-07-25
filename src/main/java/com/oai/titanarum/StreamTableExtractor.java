@@ -575,6 +575,51 @@ final class StreamTableExtractor {
     // which does not touch this cap at all.
     static final int MAX_EDGE_TRIM_ITERATIONS = 3;
 
+    // Task 9h: exempts a leading/trailing candidate line from the straddles-a-gutter check below
+    // when it has the GEOMETRIC SHAPE of a real (if visually sparse) table row rather than prose
+    // -- specifically, at least one gap between two adjacent words on the line that is much wider
+    // than ordinary word-to-word reading-flow spacing. Measured directly off this corpus
+    // (task-9h-debris-trim-report.md): ordinary prose/caption/title lines -- even ones that run
+    // the full width of the table and so incidentally straddle several gutters -- have UNIFORMLY
+    // small inter-word gaps (~1x medianSpace: us-018's own title line measures 2.50pt gaps against
+    // a medianSpace of 2.27, ratio 1.1x; its widest single gap, where "years" wraps to "2003–04",
+    // is still only 4.55x). A genuine table row/header line, even a 2-word merged/spanning header
+    // label, ALWAYS has at least one gap that is the visual GUTTER between two cells -- tens of
+    // points wide (us-018's "Actual    Projected" header: 194.9pt = 85.9x; eu-004's "1996  1991
+    // growth in share" header: 101.1pt = 33.2x; the narrowest genuine-row gap measured in this
+    // corpus, eu-004's "national   stores   national   stores" header fragment, is still 34.4pt =
+    // 11.3x). 8x sits with comfortable margin between the largest measured prose-line ratio (4.55x)
+    // and the smallest measured genuine-row ratio (11.3x). This is what lets a genuinely stacked
+    // header line -- multiple columns, individual labels centered over their own column-group and
+    // so incidentally straddling their span's OWN internal gutter -- survive trimming without
+    // reopening the header-flattening regression this exemption must not touch: it only WAIVES the
+    // straddle check, it does not waive the single-column-while-body-is-multi-column check below,
+    // which is what still catches a genuinely single-column caption fragment regardless of its own
+    // internal word spacing.
+    static final float EDGE_COLUMN_GAP_FACTOR = 8f;
+
+    // Task 9h: a SECOND, independent debris signal for leading/trailing lines that neither
+    // straddle a gutter NOR populate just one column, but are still clearly not a table row --
+    // e.g. eu-004's "(measured in hundreds)" unit-caption line, which sits at 2 populated columns
+    // (not 1) and straddles nothing (its few words happen to land cleanly inside existing column
+    // bands), yet is followed by a distinctly larger-than-usual vertical gap before the real
+    // header line resumes (measured: 26.6pt vs. this block's own 13.6pt median row pitch, a 1.95x
+    // outlier) -- the residual "half blank line" of extra leading a caption block typically gets,
+    // just under Step A's own BLOCK_GAP_FACTOR (1.6x) which would otherwise have split it off as
+    // its own block. Deliberately requires BOTH signals together (not either alone): a large gap
+    // alone is not decisive (a real header can legitimately have a bit more leading before the
+    // data rows start), and few words alone is not decisive either (a real, sparse numeric table
+    // can easily have short 2-3-word data rows) -- but a short line ALSO sitting hard against an
+    // outlier gap is not part of the table's own row rhythm. EDGE_LINE_GAP_OUTLIER_FACTOR reuses
+    // BLOCK_GAP_FACTOR's own value/rationale (same phenomenon, a section break too small for Step
+    // A to have caught on its own) rather than inventing a second, differently-tuned threshold for
+    // the same thing. EDGE_FEW_WORDS_FACTOR=0.75 is the smallest value that still catches
+    // "(measured in hundreds)" (3 words against this block's 4-word median, ratio 0.75) without
+    // going low enough to flag a typical short-but-real data row's word count on its own (this
+    // signal never fires alone -- see the AND above).
+    static final float EDGE_LINE_GAP_OUTLIER_FACTOR = BLOCK_GAP_FACTOR;
+    static final float EDGE_FEW_WORDS_FACTOR = 0.75f;
+
     // Bounds the footnote-marker scan below: how many of the block's OWN trailing lines (after
     // the ordinary capped trim above has already run) get examined for a footnote/legend-start
     // marker. Generous (a real footnote block is rarely more than a handful of lines, but this
@@ -651,24 +696,75 @@ final class StreamTableExtractor {
      * Step C: iteratively drop leading/trailing lines of {@code block} that don't conform to
      * the column model implied by {@code gutters} -- a title/caption/footnote line glued to a
      * table block by a gap too small for Step A to have split off on its own. A line is
-     * non-conforming if: it has fewer than 2 words, OR any of its words straddles a gutter
-     * center, OR all its words fall into a single column while the block's OTHER (remaining)
-     * lines occupy 2+ columns. Trimming is capped at {@link #MAX_EDGE_TRIM_ITERATIONS} per end.
-     * {@code gutters}/{@code bandX0}/{@code bandX1} (the block's own column model) are NOT
-     * recomputed as lines are dropped -- only the surviving line list changes.
+     * non-conforming if: it has fewer than 2 words; OR any of its words straddles a gutter
+     * center AND it lacks the wide-internal-gap shape of a real (if sparse) row/header line
+     * ({@link #EDGE_COLUMN_GAP_FACTOR} -- see that field's doc for why this exemption cannot
+     * reopen the header-flattening regression); OR all its words fall into a single column
+     * while the block's OTHER (remaining) lines occupy 2+ columns; OR it sits hard against a
+     * larger-than-typical vertical gap to its remaining neighbor AND has very few words relative
+     * to the block's own median ({@link #EDGE_LINE_GAP_OUTLIER_FACTOR}/{@link
+     * #EDGE_FEW_WORDS_FACTOR} -- a second, independent signal for debris that neither straddles
+     * a gutter nor is single-column, e.g. a short unit-caption line like "(measured in
+     * hundreds)"). Trimming is capped at {@link #MAX_EDGE_TRIM_ITERATIONS} per end. {@code
+     * gutters}/{@code bandX0}/{@code bandX1} (the block's own column model) and the block-wide
+     * median line pitch/words-per-line stats are all computed ONCE, up front, from the original
+     * (untrimmed) {@code block} -- NOT recomputed as lines are dropped -- only the surviving
+     * line list changes.
      */
-    static List<Line> trimEdgeLines(List<Line> block, List<Gutter> gutters, float bandX0, float bandX1) {
+    static List<Line> trimEdgeLines(List<Line> block, List<Gutter> gutters, float bandX0, float bandX1,
+                                     float medianSpace) {
         List<Line> cur = new ArrayList<>(block);
         float[] bounds = colBoundsOf(gutters, bandX0, bandX1);
+        EdgeStats stats = EdgeStats.of(block);
         for (int i = 0; i < MAX_EDGE_TRIM_ITERATIONS && cur.size() > 1; i++) {
-            if (!isNonConformingEdge(cur.get(0), cur, bounds, gutters)) break;
+            float neighborGap = cur.get(1).yTop - cur.get(0).yTop;
+            if (!isNonConformingEdge(cur.get(0), cur, bounds, gutters, medianSpace, stats, neighborGap)) break;
             cur.remove(0);
         }
         for (int i = 0; i < MAX_EDGE_TRIM_ITERATIONS && cur.size() > 1; i++) {
-            if (!isNonConformingEdge(cur.get(cur.size() - 1), cur, bounds, gutters)) break;
+            float neighborGap = cur.get(cur.size() - 1).yTop - cur.get(cur.size() - 2).yTop;
+            if (!isNonConformingEdge(cur.get(cur.size() - 1), cur, bounds, gutters, medianSpace, stats, neighborGap)) break;
             cur.remove(cur.size() - 1);
         }
         return stripTrailingFootnoteBlock(cur);
+    }
+
+    /** Block-wide median line-pitch and median words-per-line, computed once from the ORIGINAL
+     *  (untrimmed) block -- the reference stats {@link #isNonConformingEdge}'s two new signals
+     *  compare each edge candidate against. Kept as a tiny immutable holder rather than two loose
+     *  parameters threaded through every call. */
+    private static final class EdgeStats {
+        final float medianPitch;
+        final float medianWords;
+        private EdgeStats(float medianPitch, float medianWords) {
+            this.medianPitch = medianPitch; this.medianWords = medianWords;
+        }
+        static EdgeStats of(List<Line> lines) {
+            if (lines.size() < 2) return new EdgeStats(1f, 1f);
+            float[] pitches = new float[lines.size() - 1];
+            for (int i = 1; i < lines.size(); i++) pitches[i - 1] = lines.get(i).yTop - lines.get(i - 1).yTop;
+            Arrays.sort(pitches);
+            float medianPitch = Math.max(pitches[pitches.length / 2], 0.5f);
+            int[] wordCounts = new int[lines.size()];
+            for (int i = 0; i < lines.size(); i++) wordCounts[i] = lines.get(i).words.size();
+            Arrays.sort(wordCounts);
+            float medianWords = Math.max(wordCounts[wordCounts.length / 2], 1f);
+            return new EdgeStats(medianPitch, medianWords);
+        }
+    }
+
+    /** True if {@code line} has at least one adjacent-word gap wider than {@link
+     *  #EDGE_COLUMN_GAP_FACTOR} times {@code medianSpace} -- the shape of a real column gutter
+     *  between two cells, as opposed to ordinary reading-flow word spacing. {@code line.words}
+     *  is already sorted by {@code x0} (see {@link #buildLines}), so a single adjacent pass
+     *  suffices. */
+    private static boolean hasColumnShapedGap(Line line, float medianSpace) {
+        float threshold = EDGE_COLUMN_GAP_FACTOR * Math.max(medianSpace, 0.1f);
+        List<Word> words = line.words;
+        for (int i = 1; i < words.size(); i++) {
+            if (words.get(i).x0 - words.get(i - 1).x1 > threshold) return true;
+        }
+        return false;
     }
 
     /**
@@ -701,11 +797,16 @@ final class StreamTableExtractor {
         return bounds;
     }
 
-    private static boolean isNonConformingEdge(Line line, List<Line> context, float[] bounds, List<Gutter> gutters) {
+    private static boolean isNonConformingEdge(Line line, List<Line> context, float[] bounds,
+            List<Gutter> gutters, float medianSpace, EdgeStats stats, float neighborGap) {
         if (line.words.size() < 2) return true;
-        for (Word w : line.words) {
-            for (Gutter g : gutters) if (w.x0 < g.cx() && w.x1 > g.cx()) return true;
+
+        if (!hasColumnShapedGap(line, medianSpace)) {
+            for (Word w : line.words) {
+                for (Gutter g : gutters) if (w.x0 < g.cx() && w.x1 > g.cx()) return true;
+            }
         }
+
         Set<Integer> ownCols = new HashSet<>();
         for (Word w : line.words) ownCols.add(colOf(w.cx(), bounds));
         if (ownCols.size() == 1) {
@@ -716,6 +817,11 @@ final class StreamTableExtractor {
             }
             if (otherCols.size() >= 2) return true;
         }
+
+        boolean bigGap = neighborGap > EDGE_LINE_GAP_OUTLIER_FACTOR * stats.medianPitch;
+        boolean fewWords = line.words.size() <= EDGE_FEW_WORDS_FACTOR * stats.medianWords;
+        if (bigGap && fewWords) return true;
+
         return false;
     }
 
@@ -774,7 +880,7 @@ final class StreamTableExtractor {
                 }
 
                 List<Gutter> gutters = finder.find(block, bandX0, bandX1, medianSpace);
-                List<Line> trimmed = trimEdgeLines(block, gutters, bandX0, bandX1);
+                List<Line> trimmed = trimEdgeLines(block, gutters, bandX0, bandX1, medianSpace);
                 if (trimmed.size() < 3) continue;               // Step C left too little to be a table -> reject block
 
                 Grid grid = scoreGrid(trimmed, gutters, bandX0, bandX1);

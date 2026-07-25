@@ -58,8 +58,11 @@ function fmtNum(v, digits) {
 // UPPERCASE env-shaped (the dispatcher drops anything not ^[A-Z][A-Z0-9_]*$
 // before the allowlist); they must also be in
 // BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS (default: TITANARUM_SKIP_SCREENSHOTS,
-// TITANARUM_SKIP_IMAGES, TITANARUM_DPI, TITANARUM_PAGES). Params outside the
-// operator's allowlist are silently dropped by the dispatcher, not rejected.
+// TITANARUM_SKIP_IMAGES, TITANARUM_DPI, TITANARUM_PAGES, TITANARUM_STREAM_TABLES,
+// TITANARUM_SKIP_TABLES). Params outside the operator's allowlist are
+// silently dropped by the dispatcher, not rejected. This form does not expose
+// stream_tables/skip_tables toggles today; they can still be set via a raw
+// `params` field or a blastbox job.json.
 function appendJobParams(fd) {
   const skipShots  = document.getElementById('toggle-skip-screenshots').checked;
   const skipImages = document.getElementById('toggle-skip-images').checked;

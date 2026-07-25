@@ -282,6 +282,11 @@ Each job's `report.json` (and the web UI) will include an `aiAnalysis` block:
 | `GET`    | `/api/jobs/{id}/artifacts/{path}` | Serve individual artifact file.                               |
 | `GET`    | `/api/jobs/{id}/status`           | SSE stream of live job status updates.                        |
 
+Table-extraction knobs (`skipTables`, `streamTables`) are **not currently exposed on the REST API** —
+they are missing from the `POST /api/jobs` field list above, not merely undocumented. Today the only
+ways to enable borderless (stream) table extraction are the CLI's `--stream-tables` flag or a blastbox
+job.json's `stream_tables` field (see [Borderless tables are opt-in — and why](#borderless-tables-are-opt-in--and-why)); there is no REST-facing equivalent yet.
+
 ---
 
 ## Blastbox fleet engine
@@ -415,9 +420,10 @@ keys are dropped before the allowlist). They map onto the same knobs as the CLI 
 | `TITANARUM_PASSWORD` | password for encrypted PDFs (cleared after the worker reads it) | — |
 
 **Allowlist:** the compose stack forwards only `TITANARUM_SKIP_SCREENSHOTS`, `TITANARUM_SKIP_IMAGES`,
-`TITANARUM_DPI`, `TITANARUM_PAGES` **by default** (`BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS` in
-`docker-compose.yml` / `.env`). To forward any other row above, add its key to that allowlist —
-unlisted (and any lowercase) keys are dropped before they reach the worker.
+`TITANARUM_DPI`, `TITANARUM_PAGES`, `TITANARUM_STREAM_TABLES`, `TITANARUM_SKIP_TABLES` **by default**
+(`BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS` in `docker-compose.yml` / `.env`). To forward any other row
+above, add its key to that allowlist — unlisted (and any lowercase) keys are dropped before they
+reach the worker, SILENTLY (no error, no rejected job — the job just runs without that knob).
 
 Stack-level env (`deploy/docker/.env.example`): `POSTGRES_PASSWORD` (required), `TITANARUM_PORT`
 (8004), `TITANARUM_BIND_ADDR` (set `127.0.0.1` to keep it off the network — **the api does not
@@ -605,26 +611,33 @@ gridness confidence). A `tagged` candidate is never arbitrated away.
 path. It is **off by default**, deliberately. Measured on the ICDAR 2013 competition set
 (adjacency-relation F1, end-to-end, document-pooled, de-duplicated ground truth, macro over 77 units):
 
-| Configuration | Macro F1 |
-|---|---|
-| default (`tagged` + `lattice`) | 0.4718 |
-| `--stream-tables` (all pages scored) | **0.8111** |
-| `--stream-tables`, shipping `--pages default` (first 4 + last) | 0.7920 |
-| published comparators | TABFIND 0.6962 · Acrobat 0.7685 · TEXUS 0.8259 · Nurminen 0.8374 · FineReader 0.8772 |
+| Configuration | Macro F1, all pages scored | Macro F1, shipping `--pages default` (first 4 + last) |
+|---|---|---|
+| default (`tagged` + `lattice`) | 0.5113 | 0.4938 |
+| `--stream-tables` (full arbitrated pipeline) | **0.8118** | **0.7927** |
+
+Published comparators on the same benchmark: TABFIND 0.6962 · Acrobat 0.7685 · TEXUS 0.8259 ·
+Nurminen 0.8374 · FineReader 0.8772.
 
 So it is a very large recall win — the corpus is full of borderless tables the ruled paths cannot see
 at all (`lattice`+`tagged` recall on that subset is 0.0000) — but it still lands below the best
 heuristic extractors, and the size of the gain depends entirely on how many of *your* documents have
 borderless tables. Against that, on a 200-PDF sample of real-world (phishing-corpus) PDFs, the share
-of documents where the pipeline emits **at least one table at all** rises:
+of documents where the pipeline emits **at least one table at all**, measured under the shipping
+page selection (first 4 pages + last, i.e. what a user actually gets), rises:
 
-| | flag off | flag on |
-|---|---|---|
-| page 1 only | 0.1050 | 0.1250 |
-| shipping page selection (first 4 + last) | 0.1050 | 0.1300 |
+| | flag off | flag on | relative change |
+|---|---|---|---|
+| 200-PDF sample | 0.0350 | 0.0650 | **+86%** |
+| 1,599-PDF population | 0.0475 | 0.0826 | +74% |
 
-For a tool that runs unattended over untrusted, hostile PDFs, a table that is not really there costs
-more than a table that is missing — so the conservative default is off and an operator opts in.
+The 200-PDF sample understates the population rate, so treat it as a sample, not the ceiling. In
+absolute terms the increase looks modest (a few percentage points); in *relative* terms — the terms
+that matter for the decision this opt-in default exists to make — turning the flag on very nearly
+**doubles** the rate at which the pipeline reports a table on ordinary prose that has none. For a
+tool that runs unattended over untrusted, hostile PDFs, a table that is not really there costs more
+than a table that is missing — so the conservative default is off and an operator opts in with that
+trade-off in view.
 
 Stream hits carry a `confidence` float in `[0,1]` (omitted entirely on `tagged`/`lattice` hits), so a
 downstream consumer can filter them further.

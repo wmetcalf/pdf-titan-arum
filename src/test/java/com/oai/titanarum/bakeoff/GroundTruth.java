@@ -330,9 +330,22 @@ public final class GroundTruth {
             String segment = body.substring(segStart, segEnd);
 
             Map<String, String> attrs = parseAttrs(cellAttrsList.get(i));
-            int startRow = parseIntAttr(attrs, "start-row", -1);
-            int startCol = parseIntAttr(attrs, "start-col", -1);
-            if (startRow < 0 || startCol < 0) {
+            // A NEGATIVE declared start-row/start-col is LEGAL in this corpus and must not be
+            // confused with a missing one. The region's own row-increment/col-increment rebases the
+            // cell coordinates, and the official evaluator adds the increment BEFORE placing the
+            // cell (dataset-tools Table.addCell: `startRow += rowIncrement; endRow += rowIncrement;`
+            // and only then setCell(c, r, ...)), so a cell declared at start-row='-1' inside a
+            // <region row-increment='1'> lands on row 0 and is a perfectly ordinary header cell.
+            // Rejecting the raw value dropped two real cells of us-019's first table -- the
+            // "Variable"/"Assumption" header row -- and with them 3 ground-truth relations, which was
+            // the entire residual disagreement between this implementation, the independent Python
+            // port and the official tool's own printed output (all three now agree at 25,320).
+            // ABSENT is a sentinel no coordinate can take, so "attribute not present (or
+            // unparseable)" and "attribute present and negative" stay distinguishable.
+            final int absent = Integer.MIN_VALUE;
+            int startRow = parseIntAttr(attrs, "start-row", absent);
+            int startCol = parseIntAttr(attrs, "start-col", absent);
+            if (startRow == absent || startCol == absent) {
                 continue; // malformed/unusable cell, skip rather than corrupt the grid
             }
             int endRow = parseIntAttr(attrs, "end-row", startRow);
@@ -348,6 +361,13 @@ public final class GroundTruth {
             int c0 = startCol + colInc;
             int r1 = Math.max(endRow, startRow) + rowInc;
             int c1 = Math.max(endCol, startCol) + colInc;
+            if (r0 < 0 || c0 < 0) {
+                // Still outside the grid AFTER the region's rebase. No file in the shipped corpus
+                // reaches this (the official tool would throw IndexOutOfBoundsException from
+                // setCell's `cellMatrix.get(row)` if one did, i.e. it has no defined behaviour here),
+                // so skipping is the conservative reading for a hostile or broken annotation.
+                continue;
+            }
 
             float bx1 = 0f, by1 = 0f, bx2 = 0f, by2 = 0f;
             boolean hasBox = false;

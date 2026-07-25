@@ -222,4 +222,103 @@ class GroundTruthTest {
         assertEquals(0, joinedVsSpaced.falsePositives());
         assertEquals(0, joinedVsSpaced.falseNegatives());
     }
+
+    // ------------------------------------ negative start-row + region row-increment --
+
+    /**
+     * A cell may declare a NEGATIVE {@code start-row}/{@code start-col}; the enclosing
+     * {@code <region>}'s {@code row-increment}/{@code col-increment} rebases it. The official ICDAR
+     * 2013 evaluator adds the increment BEFORE placing the cell (dataset-tools
+     * {@code Table.addCell}: {@code startRow += rowIncrement; ... setCell(c, r, textObj)}), so such a
+     * cell is an ordinary cell, not a malformed one.
+     *
+     * <p>This is not hypothetical: {@code us-019-str.xml}'s first table is a
+     * {@code <region row-increment='1'>} whose header row is declared at {@code start-row='-1'}.
+     * Rejecting the raw coordinate silently dropped that header row and 3 ground-truth relations with
+     * it -- the whole residual disagreement between this loader, an independent Python port of the
+     * official algorithm and the official tool's own printed output.
+     */
+    @Test
+    void negativeStartRowIsRebasedByTheRegionRowIncrementNotDiscarded() throws IOException {
+        Path tmp = Files.createTempFile("gt-rowinc", "-str.xml");
+        try {
+            Files.writeString(tmp, """
+                    <document filename='x.pdf'>
+                      <table id='1'>
+                        <region id='1' col-increment='0' row-increment='1' page='2'>
+                          <cell id='1' start-row='-1' start-col='0'>
+                            <bounding-box x1='40' y1='729' x2='72' y2='739'/>
+                            <content>Variable</content>
+                          </cell>
+                          <cell id='2' start-row='-1' start-col='1'>
+                            <bounding-box x1='517' y1='729' x2='566' y2='739'/>
+                            <content>Assumption</content>
+                          </cell>
+                          <cell id='3' start-row='0' start-col='0'>
+                            <bounding-box x1='40' y1='714' x2='156' y2='724'/>
+                            <content>Fertility</content>
+                          </cell>
+                          <cell id='4' start-row='0' start-col='1'>
+                            <bounding-box x1='318' y1='714' x2='563' y2='724'/>
+                            <content>2.0</content>
+                          </cell>
+                        </region>
+                      </table>
+                    </document>
+                    """);
+
+            List<GroundTruth.Table> tables = GroundTruth.fromIcdarStructureXml(tmp);
+            assertEquals(1, tables.size());
+            GroundTruth.Table t = tables.get(0);
+
+            assertEquals(4, t.cells().size(),
+                    "all four cells must survive: start-row='-1' + row-increment='1' = row 0");
+            assertEquals(2, t.rowCount(), "the rebased grid is 2 rows, not 1");
+            assertEquals(2, t.colCount());
+            assertTrue(t.cells().stream().anyMatch(c -> "Variable".equals(c.text())),
+                    "the header cell declared at start-row='-1' must be present");
+            assertTrue(t.cells().stream().allMatch(c -> c.startRow() >= 0 && c.startCol() >= 0),
+                    "and every surviving cell must sit at a non-negative rebased coordinate");
+
+            // 2x2 fully populated -> 2 RIGHT + 2 DOWN = 4 relations. Dropping the header row would
+            // leave a 1x2 grid and only 1 relation, which is exactly the loss this test guards.
+            assertEquals(4, TableScore.officialRelationCount(
+                            TableScore.gridCellsFromGroundTruth(t), false,
+                            TableScore.Semantics.MULTISET),
+                    "the rebased header row contributes its RIGHT relation and both DOWN relations");
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
+
+    /** A cell with NO start-row attribute at all is still discarded -- absent != negative. */
+    @Test
+    void cellWithMissingStartRowAttributeIsStillDiscarded() throws IOException {
+        Path tmp = Files.createTempFile("gt-noattr", "-str.xml");
+        try {
+            Files.writeString(tmp, """
+                    <document filename='x.pdf'>
+                      <table id='1'>
+                        <region id='1' col-increment='0' row-increment='0' page='1'>
+                          <cell id='1' start-col='0'>
+                            <content>NoRowAttribute</content>
+                          </cell>
+                          <cell id='2' start-row='0' start-col='1'>
+                            <content>Keep</content>
+                          </cell>
+                        </region>
+                      </table>
+                    </document>
+                    """);
+
+            List<GroundTruth.Table> tables = GroundTruth.fromIcdarStructureXml(tmp);
+            assertEquals(1, tables.size());
+            List<GroundTruth.Cell> cells = tables.get(0).cells();
+            assertEquals(1, cells.size(),
+                    "the cell with no start-row is unusable and must still be skipped");
+            assertEquals("Keep", cells.get(0).text());
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+    }
 }

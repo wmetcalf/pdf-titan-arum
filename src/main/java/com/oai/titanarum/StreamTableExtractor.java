@@ -391,6 +391,24 @@ final class StreamTableExtractor {
     }
 
     static List<Gutter> findGutters(List<Line> lines, float bandX0, float bandX1, float medianSpace) {
+        return findGutters(lines, bandX0, bandX1, medianSpace, new long[1]);
+    }
+
+    /**
+     * As above, but ACCUMULATES this call's charged search work into {@code workOut[0]} instead of
+     * discarding it, so a caller can levy a page- or document-level budget on gutter-search cost as
+     * well as on its own per-call {@link #MAX_GUTTER_SCAN_WORK}. The accumulator is the live counter
+     * the budget check below reads, so the work done BEFORE an abort is recorded too (an aborted
+     * search still burned that CPU, and a document-level budget that forgave it would be a free
+     * multiplier for a hostile document: 64 pages x 6 blocks x an aborting search is real time).
+     *
+     * <p>{@code workOut[0]} is used as the accumulator directly rather than added at the end, which
+     * is also why the per-call budget is checked against {@code workOut[0] - entry} -- the per-call
+     * semantics of {@link #MAX_GUTTER_SCAN_WORK} are unchanged by the presence of a caller's running
+     * total.
+     */
+    static List<Gutter> findGutters(List<Line> lines, float bandX0, float bandX1, float medianSpace,
+                                    long[] workOut) {
         if (lines.isEmpty() || bandX1 - bandX0 <= 0) return List.of();
         float yTop = Float.MAX_VALUE, yBot = -Float.MAX_VALUE;
         List<float[]> obstacles = new ArrayList<>(); // {x0,y0,x1,y1}
@@ -426,15 +444,19 @@ final class StreamTableExtractor {
         // it) was measured to make the search run substantially longer per candidate on such
         // ordinary tables and reintroduce exactly the completion regression this fix targets.
         int duplicatesSkipped = 0;
-        long work = 0;
+        // The caller's running total IS the accumulator (see the 5-arg overload's doc); the per-call
+        // MAX_GUTTER_SCAN_WORK budget is levied on this call's own delta from it, so threading a
+        // caller total through cannot change when any single search aborts.
+        final long workAtEntry = workOut[0];
         while (!pq.isEmpty() && accepted.size() + duplicatesSkipped < MAX_GUTTER_CANDIDATES) {
             Rect r = pq.poll();
             if (r.w() < minGutterW || r.h() < 0.60f * bandH) continue;
             if (coveredByAccepted(r, accepted)) { duplicatesSkipped++; continue; }
             // Real cost is the O(obstacles) linear scan below, run once per surviving pop --
             // charge that (not the pop itself) so the budget bounds actual CPU.
-            work += obstacles.size();
-            if (work > MAX_GUTTER_SCAN_WORK) throw new TableExtractor.RulingOverflowException();
+            workOut[0] += obstacles.size();
+            if (workOut[0] - workAtEntry > MAX_GUTTER_SCAN_WORK)
+                throw new TableExtractor.RulingOverflowException();
             float[] pivot = firstObstacleInside(r, obstacles);
             if (pivot == null) {
                 accepted.add(r);                       // maximal empty & tall enough
@@ -500,8 +522,9 @@ final class StreamTableExtractor {
             int straddling = 0;
             for (Line l : lines) {
                 for (Word w : l.words) {
-                    work++;
-                    if (work > MAX_GUTTER_SCAN_WORK) throw new TableExtractor.RulingOverflowException();
+                    workOut[0]++;
+                    if (workOut[0] - workAtEntry > MAX_GUTTER_SCAN_WORK)
+                        throw new TableExtractor.RulingOverflowException();
                     if (w.x0 < m[1] && w.x1 > m[0]) { straddling++; break; }
                 }
             }
@@ -528,7 +551,26 @@ final class StreamTableExtractor {
         // strong cross-row alignment evidence -- see findAlignmentNarrowGutters and the
         // NARROW_GUTTER_* constants' docs above for the full rationale. Strictly additive: never
         // removes or narrows anything the primary search above already found.
-        List<Gutter> narrow = findAlignmentNarrowGutters(lines, obstacles, gutters, bandX0, bandX1, medianSpace, minGutterW);
+        //
+        // ...and, since this fix, strictly additive on OVERFLOW too. The pass's own budget
+        // (MAX_ALIGNMENT_GUTTER_WORK) used to throw straight out of findGutters, which threw away
+        // the primary search's ALREADY-VALID result and, with it, the whole block -- a purely
+        // ADDITIVE secondary pass destroying the primary answer. That is a recall cliff on
+        // LEGITIMATE input, not a hostile-input defence: MEASURED on a clean cols x 3 numeric grid
+        // with gutters wide enough for the primary search to accept every one of them, the block
+        // completed at cols=1,000 and THREW at cols=2,000, discarding 1,999 correctly-found gutters.
+        // The pass has nothing to contribute in that regime anyway (every boundary is already a
+        // primary gutter, so its segments are all too narrow to hold another one) -- it is charged
+        // for scanning them and then aborts. Swallowing its overflow HERE degrades exactly as far as
+        // the pass's own contribution and no further, which is what "additive" has to mean. The
+        // primary search's own budget is untouched and still aborts the block.
+        List<Gutter> narrow;
+        try {
+            narrow = findAlignmentNarrowGutters(lines, obstacles, gutters, bandX0, bandX1, medianSpace,
+                                                minGutterW, workOut);
+        } catch (TableExtractor.RulingOverflowException e) {
+            return gutters;                                  // keep the primary result, add nothing
+        }
         if (!narrow.isEmpty()) {
             gutters.addAll(narrow);
             gutters.sort(Comparator.comparingDouble(g -> g.x0));
@@ -551,10 +593,13 @@ final class StreamTableExtractor {
      * every segment) from ever manufacturing a bogus narrow-gap observation.
      *
      * <p>Charged against {@link #MAX_ALIGNMENT_GUTTER_WORK}; throws {@link
-     * TableExtractor.RulingOverflowException} on overflow, same discipline as the primary search.
+     * TableExtractor.RulingOverflowException} on overflow, same discipline as the primary search --
+     * but its caller now swallows that throw and keeps the primary gutter set (see the call site).
+     * Its charged work is ALSO accumulated into {@code workOut} so a page/document budget sees it.
      */
     private static List<Gutter> findAlignmentNarrowGutters(List<Line> lines, List<float[]> obstacles,
-            List<Gutter> primaryGutters, float bandX0, float bandX1, float medianSpace, float minGutterW) {
+            List<Gutter> primaryGutters, float bandX0, float bandX1, float medianSpace, float minGutterW,
+            long[] workOut) {
         List<Gutter> found = new ArrayList<>();
         float absFloor = NARROW_GUTTER_ABS_FLOOR_FACTOR * medianSpace;
         if (absFloor <= 0 || absFloor >= minGutterW) return found; // nothing narrower to look for
@@ -571,7 +616,7 @@ final class StreamTableExtractor {
         }
         segments.add(new float[]{prevX1, bandX1});
 
-        long work = 0;
+        long work = 0;                                    // this pass's OWN budget (per-call)
         float clusterTol = NARROW_GUTTER_CLUSTER_TOL_FACTOR * medianSpace;
         float alignTol = NARROW_GUTTER_ALIGN_TOL_FACTOR * medianSpace;
 
@@ -586,7 +631,7 @@ final class StreamTableExtractor {
             for (int li = 0; li < lines.size(); li++) {
                 List<Word> segWords = new ArrayList<>();
                 for (Word w : lines.get(li).words) {
-                    work++;
+                    work++; workOut[0]++;
                     if (work > MAX_ALIGNMENT_GUTTER_WORK) throw new TableExtractor.RulingOverflowException();
                     if (w.x0 >= segX0 - 0.01f && w.x1 <= segX1 + 0.01f) segWords.add(w);
                 }
@@ -654,7 +699,7 @@ final class StreamTableExtractor {
 
                 boolean straddled = false;
                 for (float[] o : obstacles) {
-                    work++;
+                    work++; workOut[0]++;
                     if (work > MAX_ALIGNMENT_GUTTER_WORK) throw new TableExtractor.RulingOverflowException();
                     if (o[0] < gx1 && o[2] > gx0) { straddled = true; break; }
                 }
@@ -1091,9 +1136,34 @@ final class StreamTableExtractor {
         return grid;
     }
 
-    private static int colOf(float x, float[] bounds) {
-        for (int c = 0; c < bounds.length - 1; c++) if (x < bounds[c + 1]) return c;
-        return bounds.length - 2;
+    /**
+     * Which column of {@code bounds} the x-coordinate {@code x} falls in: the smallest {@code c} in
+     * {@code [0, bounds.length-2]} with {@code x < bounds[c+1]}, or the last column when there is
+     * none. {@code bounds} is ascending by construction ({@link #colBoundsOf} writes the band edges
+     * at the ends and the gutter centres, already sorted left-to-right, in between).
+     *
+     * <p>DoS FIX (was a LINEAR scan of all {@code cols+1} bounds). This is the innermost operation
+     * of every {@code (cols x lines x words)} pass in {@link #scoreGrid}, {@link
+     * #numericDataColumnCount} and the prose veto, so a linear scan here multiplied those passes'
+     * own {@code cols} factor by a SECOND one: the measured end-to-end cost of scoring one block was
+     * <b>cubic in the column count</b> (one 3-row block: 600 cols 198ms, 1,000 cols 795ms, 1,500
+     * cols 2,303ms, 2,000 cols 5,312ms, 3,000 cols 17,457ms), and a single-page 135KB PDF holding
+     * six such 3,000-column blocks cost <b>215 seconds</b> of CPU. Because the predicate {@code x <
+     * bounds[c+1]} is MONOTONE in {@code c} for an ascending {@code bounds} (including when it
+     * carries duplicate values -- a boolean that is false then true), a binary search for the first
+     * {@code c} satisfying it returns EXACTLY the index the linear scan returned, for every input,
+     * with no threshold or tolerance of its own. Pure cost reduction, no behavioural change --
+     * pinned by {@code colOfBinarySearchMatchesLinearScanExhaustively} in {@code StreamGridDosTest},
+     * which brute-forces the two definitions against each other over adversarial bounds arrays
+     * (duplicates, negatives, NaN-free extremes) and every interesting probe point.
+     */
+    static int colOf(float x, float[] bounds) {           // package-private for the equivalence test
+        int lo = 0, hi = bounds.length - 2;               // candidate column indices
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (x < bounds[mid + 1]) hi = mid; else lo = mid + 1;
+        }
+        return lo;
     }
 
     // ------------------------------------------------------- the cols==2 gate's own numeric test
@@ -1336,17 +1406,245 @@ final class StreamTableExtractor {
     // gridness scoring + edge trimming) summed across every candidate block on one page.
     // Each individual block's own findGutters call is already independently bounded
     // (MAX_GUTTER_SCAN_WORK), and buildWords/buildLines already cap total page glyphs/words/
-    // lines (MAX_STREAM_GLYPHS/MAX_STREAM_WORDS/MAX_STREAM_LINES) -- so the REMAINING linear
-    // (scoreGrid/trimEdgeLines are O(block word count)) per-block work, summed across every
-    // block on the page, can never exceed a small constant multiple of MAX_STREAM_WORDS
-    // (60,000) even in the pathological case of thousands of tiny blocks each independently
-    // processed. Charging each block's own word count against a running page total and
-    // stopping once it's exhausted (WITHOUT discarding hits already built from prior blocks --
-    // see the loop below) makes that bound explicit and enforced, rather than merely implied
-    // by the upstream caps. Sized at 10x MAX_STREAM_WORDS: comfortably above the worst
-    // legitimate case (every page word landing in blocks that all get fully processed, i.e.
-    // a total charge of exactly MAX_STREAM_WORDS) while still being a real, finite ceiling.
+    // lines (MAX_STREAM_GLYPHS/MAX_STREAM_WORDS/MAX_STREAM_LINES).
+    //
+    // KEPT, BUT NO LONGER THE REAL BOUND. The premise this constant was sized on -- quoted from
+    // its own superseded doc, "the REMAINING linear (scoreGrid/trimEdgeLines are O(block word
+    // count)) per-block work" -- was WRONG, and wrong in the direction that matters. scoreGrid,
+    // numericDataColumnCount, the prose veto and trimEdgeLines are each O(cols x words), not
+    // O(words): five of scoreGrid's own passes iterate every column against every word. Charging
+    // one unit per WORD therefore priced a 3,000-column block exactly the same as a 3-column one
+    // while the real cost differed by three orders of magnitude. MEASURED through the production
+    // TableExtractor.extract: a 135,316-byte SINGLE-PAGE PDF holding six 3-row x 3,000-column
+    // blocks of size-0.4 digits (54,000 glyphs = 18% of MAX_STREAM_GLYPHS) cost 215.2 SECONDS of
+    // CPU, returned six tables, reported truncated=false, and charged 9% of this budget.
+    //
+    // This constant is retained UNCHANGED as the cheap word-linear floor (it still bounds the
+    // number of blocks a page may process at all, which nothing else does); the real ceiling on
+    // per-block cost is now MAX_STREAM_PAGE_GRID_WORK below, charged in the (column x word) unit
+    // the work is actually done in.
     static final long MAX_STREAM_PAGE_BLOCK_WORK = 10L * MAX_STREAM_WORDS;
+
+    // ------------------------------------------------------------------ Step D': grid work bounds
+    //
+    // THE DEFECT THESE TWO CONSTANTS CLOSE. `cols = gutters.size() + 1`, and EVERY per-block stage
+    // downstream of the gutter search is super-linear in cols:
+    //
+    //   scoreGrid       column consistency  O(rows x cols + words x cols)   (per-word straddle scan
+    //                                                                        over every gutter)
+    //                   prose fill          O(words)
+    //                   numeric lean        O(cols x words)
+    //                   prose veto          O(cols x words)
+    //   numericDataColumnCount              O(cols x words)
+    //   trimEdgeLines / isNonConformingEdge O(iterations x (words + lineWords x cols))
+    //   buildHit                            O(rows x cols + words)
+    //
+    // so the honest denomination of per-block cost is (column x word), and the dominant term is
+    // ~5 x cols x words. Nothing bounded it: MAX_GUTTER_SCAN_WORK bounds the SEARCH, but the search
+    // is cheap precisely when gutters are easy to accept (measured: 2,999 gutters accepted from
+    // 9,000 words for 279ms of charged search, followed by 2,928ms of unbudgeted scoring), and
+    // MAX_GUTTER_CANDIDATES was raised 16 -> 20,000 for search-convergence reasons (see its own
+    // doc), which removed the only thing that had ever incidentally bounded the COLUMN COUNT. At 16
+    // the O(cols x words) shape downstream was harmless; at 20,000 it is a 3.8-hour document.
+    //
+    // MEASURED cost of one (column x word) unit, after the colOf binary-search fix (see colOf).
+    // Within the range MAX_STREAM_GRID_COLS admits: 16.6 ns/unit at the worst shape (256 columns x
+    // 59,904 words = 15,395,328 units in 254.8 ms), 16.4 ns at 256x25,600, ~10 ns/unit on real
+    // corpus shapes (20 columns x 60,000 words). Outside it, the residual growth is colOf's own
+    // log(cols) plus cache pressure: 59 ns/unit at cols=1,000 and 106 ns/unit at cols=3,000. The
+    // sizing below uses 32 ns/unit -- roughly 2x the measured worst inside the admitted range, i.e.
+    // deliberately pessimistic.
+
+    /**
+     * Hard ceiling on the COLUMN COUNT of a candidate grid ({@code gutters.size() + 1}). A block
+     * whose gutter search accepts more than this many boundaries is refused outright -- the whole
+     * block is skipped and {@link PageAccount#truncated} is set, so the omission surfaces as
+     * {@code tablesTruncated} in report.json rather than as a silent 3.8-hour scoring run.
+     *
+     * <p>SIZING, from measurement rather than taste. Measured over 503 pages of 297 real documents:
+     * every PDF under the tabula-java test-resource tree (which contains the 77-unit ICDAR/tabula
+     * scoring corpus), ALL pages, plus the deterministic 200-PDF real-world prose sample, ALL pages,
+     * each run through the real per-page pipeline with the budgets set to infinity so that DEMAND
+     * was measured rather than what a cap allowed. Accepted column count per page: p50 1, p95 10,
+     * p99 15, <b>WORST {@value #REAL_CORPUS_WORST_COLS}</b> (us-001 p3; us-001 p1 is 19,
+     * failing_sort.pdf p1 is 18). 256 is <b>12.8x</b> that worst real observation, and still far
+     * above any plausible real table: {@link TableExtractor#MAX_CELLS_PER_TABLE} (10,000) alone
+     * means a 256-column table can carry at most 39 rows.
+     *
+     * <p>WHY A COLUMN CAP AS WELL AS A WORK BUDGET. The work budget below bounds the AGGREGATE, but
+     * a single block at cols=20,000 would consume the entire page budget by itself and abort, so the
+     * page would lose every OTHER (possibly perfectly good) block on it. Refusing the absurd block
+     * cheaply, before it is charged, keeps the rest of the page working -- the same reason the
+     * lattice path has both {@link TableExtractor#MAX_CELLS_PER_TABLE} and {@link
+     * TableExtractor#MAX_LATTICE_DOC_WORK}.
+     */
+    static final int MAX_STREAM_GRID_COLS = 256;
+
+    /** Worst accepted column count measured on any block of any page of the 277-PDF real sample
+     *  (77-unit ICDAR/tabula scoring corpus + 200-PDF prose sample). Recorded as a constant so the
+     *  headroom claim on {@link #MAX_STREAM_GRID_COLS} is checkable by a test rather than only by
+     *  reading a report. */
+    static final int REAL_CORPUS_WORST_COLS = 20;
+
+    /**
+     * Units of REAL grid work -- (column x word) pairs, the unit the O(cols x words) scoring passes
+     * are actually done in -- that the per-block stages of ONE page may charge before the page stops
+     * processing further blocks and flags {@link PageAccount#truncated}. Charged per block BEFORE
+     * that block's trimming/scoring runs (so an over-budget block does no partial work and emits no
+     * partial output), covering both the Step A' merge probes and the per-block emit loop, which run
+     * the same stages.
+     *
+     * <p>SIZING, measured over the same 503 real pages described on {@link #MAX_STREAM_GRID_COLS}:
+     * p50 1,118, p90 5,850, p95 9,315, p99 16,172, <b>WORST {@value
+     * #REAL_CORPUS_WORST_PAGE_GRID_WORK}</b> (us-001 p1). At 8,000,000 this budget is <b>192x</b>
+     * the worst real page, and ZERO of the 503 pages is refused by it (measured directly, not
+     * inferred: the harness counts pages the production caps flag, and the count is 0; and the ALL-77
+     * and shipping-scope adjacency F1 plus the prose false-positive count are all unchanged). On the
+     * hostile side, at the pessimistic 32 ns/unit this caps per-page grid cost at <b>~0.26 s</b>,
+     * against the 215.2 s ONE page measured before this budget existed.
+     *
+     * <p>WHY NOT TIGHTER: the worst real page is worst by a wide margin over the p99, and this
+     * project's rule is that a bound must be generous over the worst LEGITIMATE input it has
+     * measured, not merely over the median. Two orders of magnitude of headroom over the worst real
+     * page still buys a sub-second hostile page.
+     */
+    static final long MAX_STREAM_PAGE_GRID_WORK = 8_000_000L;
+
+    /** Worst per-page grid-work charge measured over the 277-PDF real sample, ALL pages. Recorded
+     *  as a constant so {@link #MAX_STREAM_PAGE_GRID_WORK}'s headroom claim is test-checkable. */
+    static final long REAL_CORPUS_WORST_PAGE_GRID_WORK = 41_555L;
+
+    /** Worst per-DOCUMENT total stream work ({@link PageAccount#totalWork()} summed over all pages)
+     *  measured over the 277-PDF real sample, ALL pages. Recorded as a constant so {@link
+     *  TableExtractor#MAX_STREAM_DOC_WORK}'s headroom claim is test-checkable. */
+    static final long REAL_CORPUS_WORST_DOC_WORK = 316_622L;
+
+    /**
+     * The (column x word) cost of running the per-block stages -- {@link #trimEdgeLines} + {@link
+     * #scoreGrid} (which includes {@link #numericDataColumnCount} and the prose veto) + {@link
+     * #buildHit} -- on a block of {@code words} words at {@code cols} columns.
+     *
+     * <p>Deliberately the PRODUCT, not the sum of words and cols: five of those passes are genuine
+     * {@code for(cols) for(lines) for(words)} nests, so the product IS the shape of the work. The
+     * {@code +words} term prices the cols-independent passes (prose fill, buildHit's cell walk) so a
+     * 1-column block is not charged zero.
+     */
+    static long gridWorkFor(long cols, long words) {
+        return cols * words + words;
+    }
+
+    /**
+     * Per-page stream accounting: the channel a cap trip uses to reach {@link
+     * TableExtractor.Result#truncated}, plus the page's charged grid work so the document-level
+     * budget ({@link TableExtractor#MAX_STREAM_DOC_WORK}) can be levied on real work instead of on a
+     * page count.
+     *
+     * <p>WHY THIS EXISTS. {@link #extractPage} used to return only a {@code List<TableHit>}, so
+     * there was structurally NO channel from a cap trip to {@code Result.truncated}: the page-global
+     * glyph/word/line caps, the per-block gutter-search abort, the {@link
+     * TableExtractor#MAX_CELLS_PER_TABLE} throw in {@link #buildHit} and the page block-work budget
+     * ALL degraded silently. MEASURED consequences, both through the production {@code extract}:
+     * (1) a page whose text is {@code MAX_STREAM_WORDS + 1} space-separated filler tokens (120,002
+     * glyphs = 40% of the glyph cap, so {@code TableExtractor.extractStreamPage}'s glyph pre-check
+     * passes) dropped a REAL borderless table that the same page without the filler extracts
+     * correctly -- 1 table -> 0 tables, {@code truncated} false both times; (2) the six-block hostile
+     * page above returns six tables at cols=3,000 and ZERO at cols=4,000, {@code truncated} false
+     * both times, i.e. the cap trip was exactly the difference between emitting content and not.
+     *
+     * <p>Cap trips set {@link #truncated}. DEGENERATE-CONTENT rejects deliberately do NOT -- a block
+     * that trims below three lines, or scores below the confidence bar, is an extraction JUDGEMENT,
+     * not a refusal to do bounded work, and flagging those would make {@code tablesTruncated} fire
+     * on ordinary prose pages and so mean nothing. This is the same distinction {@link
+     * TableExtractor} already draws on its lattice path (see the "degenerate-content decision, not a
+     * hostile-input cap" note on its clump-split reject).
+     */
+    /**
+     * Charged gutter-SEARCH units ONE page's finder calls may consume in total before the page stops
+     * processing further blocks and flags {@link PageAccount#truncated}.
+     *
+     * <p>WHY THIS IS SEPARATELY NEEDED. {@link #MAX_GUTTER_SCAN_WORK} bounds ONE finder call
+     * (500,000,000 units, measured ~335 ms). Nothing bounded how many calls one page makes: Step A'
+     * probes each base block plus each merge candidate, and the per-block loop searches any block
+     * Step A' did not cache. The per-page {@link #MAX_BLOCK_MERGE_WORK} bound is charged in OBSTACLES
+     * handed to the finder, which prices a call's INPUT, not the branch-and-bound it drives -- so a
+     * page split into K blocks that each drive the search to its own per-call budget costs K x 335 ms
+     * with only the obstacle total bounded. Constructible: the reference brick-offset shape (no two
+     * rows sharing a column boundary, so the search never accepts and never terminates cheaply) fits
+     * inside {@code MAX_STREAM_WORDS} at K = 200 blocks of 300 words each, i.e. ~67 s on ONE page.
+     * The document budget cannot help, because it is levied BETWEEN pages by design.
+     *
+     * <p>SIZING, measured. Worst raw finder charge on any page of the 277-PDF real sample:
+     * <b>{@value #REAL_CORPUS_WORST_PAGE_FINDER_WORK}</b> units. At 64,000,000 this budget is
+     * ~{@code 64e6/REAL_CORPUS_WORST_PAGE_FINDER_WORK}x that, and it caps a page's search cost at
+     * <b>64,000,000 + 500,000,000 = ~0.38 s</b> at the measured 0.67 ns/unit -- the +500,000,000
+     * being the one in-flight call that can overrun the check, since a call's cost is not knowable
+     * before it runs (the same reason the document budgets are checked between pages, not inside
+     * one).
+     */
+    static final long MAX_STREAM_PAGE_FINDER_WORK = 64_000_000L;
+
+    /** Worst raw gutter-search charge measured on any page of the 277-PDF real sample. Recorded as a
+     *  constant so {@link #MAX_STREAM_PAGE_FINDER_WORK}'s headroom claim is test-checkable. */
+    static final long REAL_CORPUS_WORST_PAGE_FINDER_WORK = 3_187_950L;
+
+    static final class PageAccount {
+        /** A hostile-input cap refused work that could have produced output on this page. */
+        boolean truncated;
+        /** (column x word) units charged by this page's per-block stages. */
+        long gridWork;
+        /** Charged units of gutter-SEARCH work (obstacle scans) this page's finder calls consumed. */
+        final long[] finderWork = {0};
+        private final long gridBudget;
+        private final long finderBudget;
+
+        PageAccount() { this(MAX_STREAM_PAGE_GRID_WORK, MAX_STREAM_PAGE_FINDER_WORK); }
+
+        /** Explicit budgets in place of the production constants. For tests and the corpus-sizing
+         *  harness only -- the same convention {@code TableExtractor#extract(PDDocument, List, Map,
+         *  boolean, long)} already uses, so the page-level cut can be pinned deterministically on a
+         *  small fixture instead of by wall-clock scale, and so demand can be MEASURED (budgets set to
+         *  infinity) rather than inferred from what a cap allowed. */
+        PageAccount(long gridBudget, long finderBudget) {
+            this.gridBudget = gridBudget; this.finderBudget = finderBudget;
+        }
+
+        /** Reserve {@code units} of grid work. False (nothing charged) when the page budget cannot
+         *  cover it -- the caller must then skip/stop WITHOUT doing the work, and has already been
+         *  flagged {@link #truncated}. */
+        boolean afford(long units) {
+            if (gridWork + units > gridBudget) { truncated = true; return false; }
+            gridWork += units;
+            return true;
+        }
+
+        /** True when this page's finder calls have already spent their whole budget, i.e. no further
+         *  block may be searched. Checked BETWEEN finder calls (a call's cost is not knowable before
+         *  it runs; {@link #MAX_GUTTER_SCAN_WORK} bounds the overrun to one call). */
+        boolean finderExhausted() {
+            if (finderWork[0] <= finderBudget) return false;
+            truncated = true;
+            return true;
+        }
+
+        /** Total charged stream work for this page, in the one denomination the document-level
+         *  budget is levied in: grid units, with search work converted by {@link
+         *  #FINDER_WORK_PER_GRID_UNIT}. */
+        long totalWork() { return gridWork + finderWork[0] / FINDER_WORK_PER_GRID_UNIT; }
+    }
+
+    /**
+     * How many charged gutter-SEARCH units are billed as ONE charged GRID unit, so the two can be
+     * summed into one document-level budget that means something in wall clock.
+     *
+     * <p>MEASURED rates: the search runs at 0.67 ns/unit (its 500,000,000-unit per-call budget is
+     * exhausted in ~335 ms); grid work at 16.6 ns/unit at the worst shape {@link
+     * #MAX_STREAM_GRID_COLS} admits (256 columns x 59,904 words = 15,395,328 units in 254.8 ms), and
+     * ~10 ns/unit on real corpus shapes. Time-equivalence would therefore be ~25 search units per
+     * grid unit. 32 is used: a power of two, and DELIBERATELY on the over-charging side of
+     * equivalence (32 search units = 21.4 ns of real time billed as one 32 ns grid unit), because the
+     * whole class of defect this fix addresses is a budget that under-charges what it prices.
+     */
+    static final long FINDER_WORK_PER_GRID_UNIT = 32L;
 
     /**
      * Median line-to-line pitch of an ordered (top-to-bottom) line list -- the one shared
@@ -1734,12 +2032,23 @@ final class StreamTableExtractor {
     /** Runs exactly the per-block detection stages {@link #extractPage} runs (band -> finder ->
      *  {@link #trimEdgeLines} -> {@link #scoreGrid}), so a merge decision is made against the
      *  score the merged block would ACTUALLY get. A DoS abort from the finder means "do not
-     *  merge" -- never lose the page. */
-    private static Probe probeBlock(List<Line> block, GutterFinder finder, float medianSpace) {
+     *  merge" -- never lose the page.
+     *
+     *  <p>Charges the SAME grid work against the SAME per-page budget as the emit loop does, because
+     *  it runs the same O(cols x words) stages: one page budget covers both, so a page cannot buy a
+     *  second full helping of scoring by routing it through Step A'. Over-budget or over-wide (see
+     *  {@link #MAX_STREAM_GRID_COLS}) means "do not merge", the same conservative answer an abort
+     *  already gives. */
+    private static Probe probeBlock(List<Line> block, GutterFinder finder, float medianSpace,
+                                    PageAccount account) {
         try {
+            if (account.finderExhausted()) return Probe.FAILED;
             float[] b = bandOf(block);
-            List<Gutter> gutters = finder.find(block, b[0], b[1], medianSpace);
+            List<Gutter> gutters = finder.find(block, b[0], b[1], medianSpace, account.finderWork);
             if (block.size() < 3) return new Probe(gutters, -1, gutters.size() + 1);
+            int cols = gutters.size() + 1;
+            if (cols > MAX_STREAM_GRID_COLS) { account.truncated = true; return Probe.FAILED; }
+            if (!account.afford(gridWorkFor(cols, obstacleCountOf(block)))) return Probe.FAILED;
             List<Line> trimmed = trimEdgeLines(block, gutters, b[0], b[1], medianSpace);
             if (trimmed.size() < 3) return new Probe(gutters, -1, gutters.size() + 1);
             Grid g = scoreGrid(trimmed, gutters, b[0], b[1]);
@@ -1786,6 +2095,17 @@ final class StreamTableExtractor {
     static List<BlockGroup> mergeAgreeingBlocks(List<List<Line>> base, GutterFinder finder,
                                                 float medianSpace, float medianPitch, long maxWork,
                                                 ConfidenceBar mergeBar) {
+        return mergeAgreeingBlocks(base, finder, medianSpace, medianPitch, maxWork, mergeBar,
+                                   new PageAccount());
+    }
+
+    /** As above, charging its probes' grid work against the caller's per-page {@code account} and
+     *  its finder calls' search work into the same account (see {@link PageAccount}). The 6-arg
+     *  overload passes a throwaway account, so every existing caller keeps a full, page-private
+     *  budget and unchanged behaviour. */
+    static List<BlockGroup> mergeAgreeingBlocks(List<List<Line>> base, GutterFinder finder,
+                                                float medianSpace, float medianPitch, long maxWork,
+                                                ConfidenceBar mergeBar, PageAccount account) {
         if (base.size() < 2) return unmerged(base, null);
 
         // Per-base-block column models. Sub-3-line blocks are never merge candidates (the
@@ -1798,7 +2118,7 @@ final class StreamTableExtractor {
             long cost = obstacleCountOf(b);
             if (work + cost > maxWork) return unmerged(base, baseProbes);   // budget out -> no merging
             work += cost;
-            baseProbes.add(probeBlock(b, finder, medianSpace));
+            baseProbes.add(probeBlock(b, finder, medianSpace, account));
         }
 
         float gapCap = BLOCK_MERGE_MAX_GAP_FACTOR * medianPitch;
@@ -1822,7 +2142,7 @@ final class StreamTableExtractor {
                 long cost = obstacleCountOf(candidate);
                 if (work + cost > maxWork) return unmerged(base, baseProbes);  // budget out -> no merging
                 work += cost;
-                Probe cand = probeBlock(candidate, finder, medianSpace);
+                Probe cand = probeBlock(candidate, finder, medianSpace, account);
                 if (cand.confidence >= mergeBar.barFor(cand.cols)) {
                     cur = candidate;
                     curProbe = cand;
@@ -1915,14 +2235,39 @@ final class StreamTableExtractor {
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs,
                                                      GutterFinder finder, ConfidenceBar emitBar,
                                                      ConfidenceBar mergeBar, List<Candidate> sink) {
-        return extractPage(pageNum, glyphs, finder, PageFrame.IDENTITY, emitBar, mergeBar, sink);
+        return extractPage(pageNum, glyphs, finder, PageFrame.IDENTITY, emitBar, mergeBar, sink,
+                           new PageAccount());
     }
 
-    /** Full form: the diagnostic seam above plus the reporting {@link PageFrame}. */
+    /** Full form: the diagnostic seam above plus the reporting {@link PageFrame}, delegating to the
+     *  account-reporting full form below with a throwaway {@link PageAccount} -- so this overload
+     *  keeps its previous "no cap-trip reporting" behaviour for every harness that calls it. */
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs,
                                                      GutterFinder finder, PageFrame frame,
                                                      ConfidenceBar emitBar,
                                                      ConfidenceBar mergeBar, List<Candidate> sink) {
+        return extractPage(pageNum, glyphs, finder, frame, emitBar, mergeBar, sink, new PageAccount());
+    }
+
+    /**
+     * As the 7-arg form above, but reports through {@code account} (see {@link PageAccount}) whether a
+     * hostile-input cap refused work that could have produced output on this page, and how much real
+     * work the page charged. This is the overload {@link TableExtractor#extractStreamPage} uses, so
+     * that a cap trip reaches {@link TableExtractor.Result#truncated} instead of vanishing; every other
+     * overload passes a throwaway account and so behaves exactly as before for every harness.
+     *
+     * <p>THREE page-global caps live in the try below, not one. {@link #buildWords} enforces {@link
+     * #MAX_STREAM_GLYPHS} and {@link #MAX_STREAM_WORDS}; {@link #buildLines} enforces {@link
+     * #MAX_STREAM_LINES}. All three abort the whole page with no partial output (a breach means the
+     * line data itself could not be safely built), and all three must therefore be REPORTED --
+     * {@code extractStreamPage}'s own pre-check covers only the first of them, and the other two are
+     * reachable far below the 300,000-glyph cap.
+     */
+    static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs,
+                                                     GutterFinder finder, PageFrame frame,
+                                                     ConfidenceBar emitBar,
+                                                     ConfidenceBar mergeBar, List<Candidate> sink,
+                                                     PageAccount account) {
         List<Word> words;
         List<Line> lines;
         try {
@@ -1932,13 +2277,14 @@ final class StreamTableExtractor {
             lines = buildLines(words, mfs);
             if (lines.size() < 3) return List.of();
         } catch (TableExtractor.RulingOverflowException e) {
+            account.truncated = true;                          // glyph / word / line cap -> LOUD, not silent
             return List.of();                                  // page-global DoS budget breached -> abort page
         }
         float medianSpace = 0.5f * medianFontSize(words);
 
         List<BlockGroup> blocks = mergeAgreeingBlocks(splitIntoBlocks(lines), finder, medianSpace,
                                                       pageMedianPitch(lines), MAX_BLOCK_MERGE_WORK,
-                                                      mergeBar);
+                                                      mergeBar, account);
         List<TableExtractor.TableHit> hits = new ArrayList<>();
         long pageWork = 0;
 
@@ -1948,12 +2294,16 @@ final class StreamTableExtractor {
             if (block.size() < 3) continue;
 
             long charge = block.stream().mapToLong(l -> l.words.size()).sum();
-            if (pageWork + charge > MAX_STREAM_PAGE_BLOCK_WORK) break; // page budget exhausted -> keep prior hits, stop
+            if (pageWork + charge > MAX_STREAM_PAGE_BLOCK_WORK) {
+                account.truncated = true;                      // page block budget exhausted -> LOUD
+                break;                                         // keep prior hits, stop
+            }
             pageWork += charge;
 
             // Step A' already ran the finder on this block's own band; skipping an overflowed
-            // block here is exactly what the catch clause below would have done.
-            if (group.gutterSearchOverflowed) continue;
+            // block here is exactly what the catch clause below would have done -- and, like that
+            // catch, it costs this block's output, so it is reported.
+            if (group.gutterSearchOverflowed) { account.truncated = true; continue; }
 
             try {
                 float bandX0 = Float.MAX_VALUE, bandX1 = -Float.MAX_VALUE;
@@ -1961,8 +2311,19 @@ final class StreamTableExtractor {
                     bandX0 = Math.min(bandX0, w.x0); bandX1 = Math.max(bandX1, w.x1);
                 }
 
+                if (group.gutters == null && account.finderExhausted()) break;  // page search budget out
                 List<Gutter> gutters = group.gutters != null ? group.gutters
-                                     : finder.find(block, bandX0, bandX1, medianSpace);
+                                     : finder.find(block, bandX0, bandX1, medianSpace, account.finderWork);
+
+                // Step D': price the O(cols x words) stages below BEFORE running any of them, in the
+                // (column x word) unit they are actually done in -- and refuse an absurd column count
+                // outright. Both trips cost this block's output, so both set truncated. Charging up
+                // front (rather than metering inside scoreGrid) is what makes an over-budget block do
+                // NO partial work and emit NO partial output.
+                int cols = gutters.size() + 1;
+                if (cols > MAX_STREAM_GRID_COLS) { account.truncated = true; continue; }
+                if (!account.afford(gridWorkFor(cols, charge))) break;   // page grid budget out -> stop
+
                 List<Line> trimmed = trimEdgeLines(block, gutters, bandX0, bandX1, medianSpace);
                 if (trimmed.size() < 3) continue;               // Step C left too little to be a table -> reject block
 
@@ -1979,6 +2340,12 @@ final class StreamTableExtractor {
                 // produced. This is the fix for the eu-001 failure mode in task-9c: a whole-page
                 // search over 356 words/56 lines (prose + 7 small tables) used to blow
                 // MAX_GUTTER_SCAN_WORK and silently lose every real table on the page.
+                //
+                // Skipping the block is still the right degradation, but it is no longer SILENT: the
+                // difference between this catch firing and not firing was measured to be exactly the
+                // difference between emitting six tables and emitting none (the same hostile page at
+                // cols=3,000 vs cols=4,000), and report.json said nothing either way.
+                account.truncated = true;
             }
         }
         return hits;

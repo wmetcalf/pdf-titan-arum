@@ -72,21 +72,79 @@ final class TableExtractor {
      * document measured here is affected, while the worst case a hostile document can buy from the
      * stream stage is bounded at 64 x 411ms = ~26s instead of growing without limit.
      *
+     * <p>RETRACTED PREMISE (this is the important part of this doc). The paragraph below used to
+     * justify measuring this stage in PAGES rather than in work by asserting that "the stream stage's
+     * per-page cost is nearly flat (411ms whatever the page holds, so pages are a good proxy for
+     * work)". That is <b>wrong by roughly 500x</b>, and the argument built on it was wrong with it.
+     * MEASURED through the production {@link #extract}: a single page of six 3-row x 3,000-column
+     * blocks of size-0.4 digits (a 135,316-byte file, 54,000 glyphs = 18% of {@code
+     * MAX_STREAM_GLYPHS}) cost <b>215.2 seconds</b>, not 411ms. Cost is linear in page count (1 page
+     * 9.2s, 4 pages 35.6s at cols=1,000). And because several {@code /Page} objects may SHARE one
+     * {@code /Contents} stream, page count is nearly free in FILE BYTES -- exactly the property the
+     * sibling {@link #MAX_LATTICE_DOC_WORK} doc cites as why lattice needed a WORK budget instead of a
+     * page count. Both together, measured end to end: EIGHT {@code /Page} objects sharing ONE
+     * {@code /Contents} stream, a <b>135,399-byte</b> file (83 bytes larger than the one-page
+     * version), cost <b>1,690,639 ms = 28.2 MINUTES</b> and reported {@code truncated=false}. At that
+     * measured 211 s/page, this constant's own 64-page allowance was <b>~3.8 HOURS</b> of CPU on a
+     * ~135KB file against the ~26 s bound claimed two paragraphs above -- with {@code --timeout}
+     * defaulting to 0 and the interrupt observed only BETWEEN pages, so even a configured timeout
+     * overruns by a whole page.
+     *
+     * <p>WHAT THIS CONSTANT IS NOW. Pages are no longer the instrument that bounds this stage; {@link
+     * #MAX_STREAM_DOC_WORK} is, levied on real charged work exactly like the lattice sibling. This
+     * page cap is RETAINED as a cheap secondary structural ceiling (it bounds the number of times the
+     * per-page fixed costs -- word/line clustering, block splitting -- are paid, which the work budget
+     * prices but does not itself limit), and its value is unchanged so no document's output moves
+     * because of this fix. It is no longer load-bearing for the DoS argument.
+     *
      * <p>SUPERSEDED NOTE. This constant's doc used to record, as a deliberate non-claim, that it
      * left the stream stage MORE tightly bounded than the lattice path, "whose own per-page cost
      * (measured 157ms on a hostile page that drives {@link #MAX_TEXTFILL_WORK}) is still linear in
      * page count with no document-level cap". That asymmetry is CLOSED: see {@link
-     * #MAX_LATTICE_DOC_WORK}. The two bounds are still different INSTRUMENTS -- pages here, real work
-     * there -- because the stream stage's per-page cost is nearly flat (411ms whatever the page
-     * holds, so pages are a good proxy for work) while the lattice path's varies by two orders of
-     * magnitude between a real page and a hostile one (so work is the only instrument that separates
-     * them). Both cut the document tail in page order and both set {@link Result#truncated}.
+     * #MAX_LATTICE_DOC_WORK}. Both cut the document tail in page order and both set {@link
+     * Result#truncated}.
      *
      * <p>A legitimate 100-page document with borderless tables past page 64 loses them, with
      * {@code tablesTruncated} set in report.json -- missing a table loudly, which this threat model
      * prefers to either fabricating one or hanging.
      */
     static final int MAX_STREAM_PAGES_PER_DOC = 64;
+    /**
+     * Units of REAL borderless ("stream") work ONE document may charge before the stream stage stops
+     * processing further pages and flags {@link Result#truncated}. The work-budget sibling of {@link
+     * #MAX_LATTICE_DOC_WORK}, and the constant that actually bounds this stage (see the retracted
+     * premise on {@link #MAX_STREAM_PAGES_PER_DOC} for why its page count does not).
+     *
+     * <p>DENOMINATION. {@link StreamTableExtractor.PageAccount#totalWork()} -- the page's charged
+     * (column x word) grid work plus its charged gutter-search work scaled into the same unit by
+     * {@link StreamTableExtractor#FINDER_WORK_PER_GRID_UNIT}. Checked and accumulated BETWEEN pages,
+     * never inside one: the per-page budgets ({@link StreamTableExtractor#MAX_STREAM_PAGE_GRID_WORK},
+     * {@link StreamTableExtractor#MAX_GUTTER_SCAN_WORK}) already bound a single page, and stopping
+     * mid-page is the one thing this class never does.
+     *
+     * <p>SIZING, measured over the 277 real PDFs this project uses (77-unit ICDAR/tabula scoring
+     * corpus + 200-PDF real-world prose sample) -- 503 pages of 297 documents, ALL pages. Per-document
+     * total: p50 485, p90 20,548, p95 46,239, <b>WORST {@value
+     * StreamTableExtractor#REAL_CORPUS_WORST_DOC_WORK}</b> (us-018.pdf). At 24,000,000 this budget is
+     * <b>75x</b> the worst real document; even 64 pages each as expensive as the worst real PAGE
+     * measured (107,655) would reach only 6.9M, 29% of it. No document of either sample is affected --
+     * verified by re-running the full ICDAR adjacency benchmark at both page scopes under both
+     * protocols and the prose false-positive sample, and getting identical numbers.
+     *
+     * <p>WHAT IT BUYS, in wall clock. Every unit of this budget is at most ~32 ns of real time (grid
+     * work measured at 16.6 ns/unit at the worst shape the column cap admits; search work billed at
+     * 32 raw units = 21.4 ns per budget unit), so 24,000,000 units is <b>~0.8 s</b>, and the
+     * between-pages check lets one final page overrun by at most its own per-page budgets (~0.26 s of
+     * grid + ~0.38 s of search), for a worst case of <b>~1.4 s</b> of stream work per document.
+     *
+     * <p>WHAT THIS DELIBERATELY DOES NOT CLAIM. Like its lattice sibling, it does not bound PDFBox's
+     * own text-extraction cost: the CLI harvests glyphs for every selected page before {@link
+     * #extract} is called, and no budget in this class bounds that. It also does not price a
+     * bake-off-only {@link GutterFinder} implementation's search work (only the production {@link
+     * BreuelGutterFinder} reports it -- see {@link GutterFinder#find(java.util.List, float, float,
+     * float, long[])}), which is a measurement-harness concern, not a production one.
+     */
+    static final long MAX_STREAM_DOC_WORK = 24_000_000L;
     /**
      * Units of REAL lattice work ONE document may charge before the lattice path stops processing
      * further pages and flags {@link Result#truncated}. Charged and checked between pages in
@@ -575,6 +633,14 @@ final class TableExtractor {
          * inferring it from wall-clock time.
          */
         long latticeWorkCharged = 0;
+        /**
+         * Units of REAL borderless ("stream") work this document charged against {@link
+         * #MAX_STREAM_DOC_WORK}, summed over every page the stream path ran on. Same purpose and
+         * same non-serialization as {@link #latticeWorkCharged}: it lets the DoS tests and the
+         * corpus-sizing harness read the actual charge through the real entry point rather than
+         * inferring it from wall-clock time.
+         */
+        long streamWorkCharged = 0;
         /**
          * How many fully-built candidates {@link #arbitrate} discarded on this document because they
          * lost a contested region. Not serialized (this class is internal) -- it exists so the tests
@@ -2375,6 +2441,10 @@ final class TableExtractor {
         // against latticeDocWorkBudget (production: MAX_LATTICE_DOC_WORK).
         long[] latticeWork = {0};
         boolean latticeBudgetReported = false;
+        // Cumulative REAL stream work across every page of this document, gated between pages against
+        // MAX_STREAM_DOC_WORK -- the work-budget sibling of latticeWork above.
+        long[] streamWork = {0};
+        boolean streamBudgetReported = false;
         try {
             extractTagged(doc, new HashSet<>(pagesToProcess), result);
         } catch (StackOverflowError e) {
@@ -2484,14 +2554,29 @@ final class TableExtractor {
                 }
             }
             if (streamHits != null) {
-                if (streamPagesRun >= MAX_STREAM_PAGES_PER_DOC) {
+                if (streamWork[0] >= MAX_STREAM_DOC_WORK) {
+                    // DOCUMENT-LEVEL STREAM WORK BOUND (see MAX_STREAM_DOC_WORK). Same discipline as
+                    // the lattice bound just above: cut the document TAIL in page order, keep every
+                    // page already processed intact, never stop mid-page, and surface the loss as
+                    // tablesTruncated. This -- not MAX_STREAM_PAGES_PER_DOC, whose flat-per-page-cost
+                    // premise was measured wrong by ~500x -- is what bounds this stage.
                     result.truncated = true;
-                } else if (extractStreamPage(doc, pageNum, positionsByPage.get(pageNum), streamHits, result)) {
+                    if (!streamBudgetReported) {
+                        streamBudgetReported = true;
+                        System.err.println("WARNING: borderless (stream) table extraction stopped at page "
+                                + pageNum + " of " + pagesToProcess.size() + " (document work cap "
+                                + MAX_STREAM_DOC_WORK + " reached; charged " + streamWork[0] + ")");
+                    }
+                } else if (streamPagesRun >= MAX_STREAM_PAGES_PER_DOC) {
+                    result.truncated = true;
+                } else if (extractStreamPage(doc, pageNum, positionsByPage.get(pageNum), streamHits, result,
+                                             streamWork)) {
                     streamPagesRun++;
                 }
             }
         }
         result.latticeWorkCharged = latticeWork[0];
+        result.streamWorkCharged = streamWork[0];
         result.tables.sort(java.util.Comparator
                 .<TableHit>comparingInt(t -> t.page)
                 .thenComparingDouble(t -> t.bbox == null ? 0 : t.bbox[1]));
@@ -2556,6 +2641,18 @@ final class TableExtractor {
      * #contestsSameRegion} -- a bbox intersection ACROSS those two frames -- saw no contest, so both
      * contradictory answers for one region survived arbitration.
      *
+     * <p>THE PRE-CHECK IS NOT ENOUGH, and used to be all there was. It covers ONE of the THREE
+     * page-global caps {@code extractPage}'s own try wraps: {@code MAX_STREAM_GLYPHS} (300,000) is
+     * pre-checked, but {@code MAX_STREAM_WORDS} (60,000) and {@code MAX_STREAM_LINES} (8,000) are
+     * reachable FAR below the glyph cap and were still swallowed with {@code truncated} left false.
+     * MEASURED: a page carrying an ordinary 5x3 borderless numeric table extracts it correctly (1
+     * table); add 60,001 one-character filler tokens to the SAME page -- 60,071 glyphs, only 20% of
+     * the glyph cap, so this pre-check passes -- and the real table is silently dropped (0 tables,
+     * {@code truncated} false). Nor were the per-BLOCK cap trips reportable: {@code extractPage} took
+     * no {@code Result}, so there was structurally no channel at all. Both are closed by threading a
+     * {@link StreamTableExtractor.PageAccount} in and copying its verdict onto {@code result} below;
+     * see that class's doc for the full list of trips it now reports.
+     *
      * @return true when the whitespace detector actually ran for this page, i.e. when the page
      *         consumed a unit of the document-level {@link #MAX_STREAM_PAGES_PER_DOC} budget. A page
      *         with no glyphs, or one refused by the glyph cap, does no detection work and is
@@ -2563,7 +2660,7 @@ final class TableExtractor {
      *         budget.
      */
     private static boolean extractStreamPage(PDDocument doc, int pageNum, List<TextPosition> positions,
-                                             List<TableHit> out, Result result) {
+                                             List<TableHit> out, Result result, long[] docWork) {
         if (positions == null || positions.isEmpty()) return false;
         if (positions.size() > StreamTableExtractor.MAX_STREAM_GLYPHS) {
             result.truncated = true;
@@ -2571,9 +2668,11 @@ final class TableExtractor {
                     + " (glyph cap)");
             return false;
         }
+        StreamTableExtractor.PageAccount account = new StreamTableExtractor.PageAccount();
         try {
             out.addAll(StreamTableExtractor.extractPage(pageNum, positions, new BreuelGutterFinder(),
-                    pageFrameOf(doc, pageNum)));
+                    pageFrameOf(doc, pageNum), StreamTableExtractor.PRODUCTION_BAR,
+                    StreamTableExtractor.PRODUCTION_BAR, null, account));
         } catch (RulingOverflowException e) {
             result.truncated = true;
             System.err.println("WARNING: borderless table extraction skipped on page " + pageNum
@@ -2587,6 +2686,17 @@ final class TableExtractor {
         } catch (Exception e) {
             result.truncated = true;
             System.err.println("WARNING: borderless table extraction failed on page " + pageNum + ": " + e);
+        }
+        // The channel that did not exist before: every page-global and per-block cap trip inside
+        // extractPage now reaches Result.truncated (and so report.json's tablesTruncated) instead of
+        // degrading silently. Charged work is accumulated whether or not a cap tripped -- an aborted
+        // page still burned the CPU it burned, and forgiving it would hand a hostile document a free
+        // multiplier against MAX_STREAM_DOC_WORK.
+        docWork[0] += account.totalWork();
+        if (account.truncated) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction hit a work/size cap on page "
+                    + pageNum + " (some borderless tables on this page may be missing)");
         }
         return true;
     }
@@ -3166,6 +3276,28 @@ final class TableExtractor {
      * {@link #MAX_ARBITRATION_WORK} -- see that field for why no legitimate document can.
      */
     static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream, Result result) {
+        return arbitrate(ruled, stream, result, MAX_ARBITRATION_WORK);
+    }
+
+    /**
+     * As above with an explicit work budget in place of {@link #MAX_ARBITRATION_WORK}.
+     * Package-private for tests only -- the same convention {@link #extract(PDDocument, List, Map,
+     * boolean, long)} already uses ("so the document-level cut can be pinned deterministically on a
+     * small fixture instead of by wall-clock scale"). Production always calls the 2-arg or 3-arg
+     * ({@link Result}) forms above.
+     *
+     * <p>Needed because WHERE this method charges is as load-bearing as HOW MUCH: the guard on the
+     * adjacency matrix must refuse before allocating, and at the production budget the smallest
+     * fixture that distinguishes "refused at the guard" from "allocated, then refused in the
+     * component traversal" needs twenty million candidates. With an injectable budget the same
+     * distinction is a sixty-candidate fixture.
+     */
+    static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream, long workBudget) {
+        return arbitrate(ruled, stream, new Result(), workBudget);
+    }
+
+    private static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream, Result result,
+                                             long workBudget) {
         if (ruled == null || ruled.isEmpty()) {
             return stream == null ? new ArrayList<>() : new ArrayList<>(stream);
         }
@@ -3173,7 +3305,7 @@ final class TableExtractor {
 
         int nr = ruled.size(), ns = stream.size();
         long[] work = {0};
-        charge(work, (long) nr + ns);
+        charge(work, (long) nr + ns, workBudget);
 
         // Bucket BOTH sides by page. Candidates on different pages can never contest each other, so
         // every contest graph is page-local and both the pair scan AND the component traversal below
@@ -3208,7 +3340,15 @@ final class TableExtractor {
             // Contest graph for this page, in page-local indices. The budget is charged BEFORE the
             // adjacency matrix is allocated: charging afterwards would let a hostile candidate list
             // materialise an lp*sp byte matrix (gigabytes) and only then be refused.
-            charge(work, (long) lp * sp);
+            //
+            // `+ lp + sp` prices what `lp * sp` alone does not: the lp separate row OBJECTS of a
+            // boolean[lp][sp] (~16 bytes of header each) plus the two marker arrays. With sp == 1 the
+            // product term is only lp, so at the 40,000,000 budget an lp of 40,000,000 passed the
+            // guard and then allocated ~640MB of row headers. Not reachable through extract() (the
+            // per-page caps hold lp near 100), but this method is package-private and its own doc
+            // advertises the guard against "a hostile caller handing in an unbounded candidate list",
+            // so the guard has to actually price every allocation it gates.
+            charge(work, (long) lp * sp + lp + sp, workBudget);
             boolean[][] adj = new boolean[lp][sp];
             boolean[] rContested = new boolean[lp];
             boolean[] sContested = new boolean[sp];
@@ -3237,12 +3377,12 @@ final class TableExtractor {
                     if (!qr.isEmpty()) {
                         int a = qr.poll();
                         compR.add(rIdx.get(a));
-                        charge(work, sp);
+                        charge(work, sp, workBudget);
                         for (int b = 0; b < sp; b++) if (adj[a][b] && !seenS[b]) { seenS[b] = true; qs.add(b); }
                     } else {
                         int b = qs.poll();
                         compS.add(sIdx.get(b));
-                        charge(work, lp);
+                        charge(work, lp, workBudget);
                         for (int a = 0; a < lp; a++) if (adj[a][b] && !seenR[a]) { seenR[a] = true; qr.add(a); }
                     }
                 }
@@ -3289,9 +3429,9 @@ final class TableExtractor {
         return out;
     }
 
-    private static void charge(long[] work, long amount) {
+    private static void charge(long[] work, long amount, long budget) {
         work[0] += amount;
-        if (work[0] > MAX_ARBITRATION_WORK) throw new RulingOverflowException();
+        if (work[0] > budget) throw new RulingOverflowException();
     }
 
     /**

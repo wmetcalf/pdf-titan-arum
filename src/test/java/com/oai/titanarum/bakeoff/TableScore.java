@@ -501,4 +501,40 @@ public final class TableScore {
         List<Relation> rels = buildOfficialRelations(cells, includeNoBlanks).relations();
         return semantics == Semantics.SET ? toCounts(rels).size() : rels.size();
     }
+
+    // ------------------------------------------------- read-only accessors for other PROTOCOLS --
+    //
+    // The two methods below add NO new scoring semantics. They expose, unchanged, the two private
+    // pieces every scorer in this class already uses -- the grid relation builder and the
+    // multiset/set comparison -- so that a caller can choose a different *protocol* (which
+    // relations get compared against which) without reimplementing (and thereby risking drift
+    // from) the relation definition or the comparison itself.
+    //
+    // The protocol that motivated them is DOCUMENT-POOLED scoring: instead of pairing each
+    // ground-truth table to at most one detected table and comparing them one pair at a time, pool
+    // every ground-truth relation in a document and every detected relation in that document and
+    // compare the two multisets once. Adjacency relations are content-identified and
+    // translation-invariant, so pooling asks "did you recover this page's content structure?"
+    // without also demanding that you divide it into tables exactly the way the annotator did.
+    // Because both protocols end up calling the SAME #compare on relations built by the SAME
+    // builders, any difference between their scores is attributable purely to the protocol.
+
+    /**
+     * The RIGHT/DOWN adjacency relations of a plain text grid, exactly as
+     * {@link #scoreAdjacency(GroundTruth.Table, List)} derives them (legacy grid definition).
+     * Read-only: the returned list is freshly built and owned by the caller.
+     */
+    public static List<Relation> relationsFromRows(List<List<String>> rows) {
+        return buildRelations(rows);
+    }
+
+    /**
+     * Compares two already-built relation collections with the same multiset/set comparison every
+     * other scorer in this class uses. Exists so a caller can pool relations across tables (or
+     * across a whole document) before comparing; it neither builds nor filters relations itself.
+     */
+    public static AdjResult compareRelations(List<Relation> gtRelations, List<Relation> detRelations,
+                                              Semantics semantics) {
+        return compare(gtRelations, detRelations, semantics);
+    }
 }

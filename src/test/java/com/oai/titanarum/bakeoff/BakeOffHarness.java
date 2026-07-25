@@ -323,7 +323,10 @@ class BakeOffHarness {
 
     // ---------------------------------------------------------------------------- prose FP check
 
-    private static List<Path> sampleProsePdfs() throws IOException {
+    // Widened from private to package-private with BaselineHarness, so the consolidated baseline
+    // reports the prose false-positive rate over the EXACT same deterministic 200-PDF sample this
+    // harness uses, rather than a re-derived one that could drift. Visibility only.
+    static List<Path> sampleProsePdfs() throws IOException {
         if (!Files.isDirectory(PHISH_ROOT)) return null;
         List<Path> all;
         try (Stream<Path> s = Files.list(PHISH_ROOT)) {
@@ -356,7 +359,8 @@ class BakeOffHarness {
         }
     }
 
-    private static boolean hasStreamTableOnPage1(GutterFinder finder, Path pdf) {
+    /** Widened from private to package-private with BaselineHarness -- visibility only. */
+    static boolean hasStreamTableOnPage1(GutterFinder finder, Path pdf) {
         try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
             if (doc.getNumberOfPages() < 1) return false;
             List<TextPosition> glyphs = TableTestPdfs.harvestGlyphs(doc, 0);

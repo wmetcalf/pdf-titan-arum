@@ -52,6 +52,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
+// VISIBILITY NOTE (added with BaselineHarness): six members below -- Region, REGION_PAD, regionsOf,
+// regionGivenCells, stackAll, cellsOf, overlapsSubstantially -- were widened from `private` to
+// package-private so BaselineHarness can reuse this harness's REGION-GIVEN candidate construction and
+// its stream/tagged-lattice merge rule byte-for-byte instead of copying them (a copy would risk
+// drifting, and then the new baseline's region-given numbers would no longer be comparable to this
+// harness's). Pure visibility changes: no method body, field, threshold, or behavior was touched, and
+// this harness's own output is unchanged (verified: reran `-Dtest=MetricFixHarness -DmetricFix=true`
+// before and after, identical numbers). This mirrors the same widening BakeOffHarness already carries
+// for buildScoringSet/ScoreUnit -- see its own note.
 class MetricFixHarness {
 
     /** Same stream-vs-tagged/lattice overlap-drop threshold and OUTER-BBOX approximation
@@ -66,7 +75,7 @@ class MetricFixHarness {
      *  cell whose centre lands a hair outside a tight ink box is still unambiguously that table's
      *  cell. Centre-based membership plus a small pad is deliberately chosen over any
      *  area-overlap rule so that one oversized cell cannot drag a whole table into a region. */
-    private static final float REGION_PAD = 2f;
+    static final float REGION_PAD = 2f;
 
     // ---------------------------------------------------------------------------- keys / variants
 
@@ -141,7 +150,7 @@ class MetricFixHarness {
     /** A ground-truth table's region on ONE page, already converted to OUR coordinate space
      *  (top-left origin, y increasing downward, cropbox-relative -- the space
      *  {@code TextPosition#getXDirAdj/getYDirAdj} and {@code TableHit#bbox} both live in). */
-    private record Region(int page, float x0, float y0, float x1, float y1) {
+    record Region(int page, float x0, float y0, float x1, float y1) {
         boolean containsCentre(float cx, float cy) {
             return cx >= x0 - REGION_PAD && cx <= x1 + REGION_PAD
                     && cy >= y0 - REGION_PAD && cy <= y1 + REGION_PAD;
@@ -163,7 +172,7 @@ class MetricFixHarness {
      * near-zero one; {@link #printCoordinateSanityCheck} measures it against the alternative
      * (no-flip) reading on real data so the convention is verified, not assumed.
      */
-    private static List<Region> regionsOf(GroundTruth.Table table, Map<Integer, PDRectangle> cropByPage) {
+    static List<Region> regionsOf(GroundTruth.Table table, Map<Integer, PDRectangle> cropByPage) {
         Map<Integer, float[]> unionByPage = new LinkedHashMap<>(); // page -> {x0,y0,x1,y1} ours
         for (GroundTruth.Cell c : table.cells()) {
             if (!c.hasBox() || c.page() <= 0) continue;
@@ -197,7 +206,7 @@ class MetricFixHarness {
     /** A detected table's cells as span-carrying {@link TableScore.GridCell}s. Falls back to 1x1
      *  cells derived from the text grid if a hit carries no cell list (no production path does, but
      *  the metric must not depend on that). */
-    private static List<TableScore.GridCell> cellsOf(TableExtractor.TableHit h) {
+    static List<TableScore.GridCell> cellsOf(TableExtractor.TableHit h) {
         if (h.cells == null || h.cells.isEmpty()) {
             return TableScore.gridCellsFromRows(h.rows);
         }
@@ -263,7 +272,7 @@ class MetricFixHarness {
      * alignment. Where several hits genuinely overlap the same region (e.g. tagged and lattice both
      * finding it), stacking duplicates content and costs PRECISION -- reported, not hidden.
      */
-    private static List<TableScore.GridCell> regionGivenCells(List<TableExtractor.TableHit> hits,
+    static List<TableScore.GridCell> regionGivenCells(List<TableExtractor.TableHit> hits,
                                                                List<Region> regions,
                                                                int[] fragmentCountOut) {
         if (regions.isEmpty()) return List.of();
@@ -313,7 +322,7 @@ class MetricFixHarness {
 
     /** Stacks whole hits (no region filter) -- used by the stream region-RERUN mode, where the
      *  input glyphs were already restricted to the region, so every produced cell is in-region. */
-    private static List<TableScore.GridCell> stackAll(List<TableExtractor.TableHit> hits) {
+    static List<TableScore.GridCell> stackAll(List<TableExtractor.TableHit> hits) {
         if (hits.isEmpty()) return List.of();
         List<TableExtractor.TableHit> ordered = new ArrayList<>(hits);
         ordered.sort(Comparator.<TableExtractor.TableHit>comparingInt(h -> h.page)
@@ -762,7 +771,7 @@ class MetricFixHarness {
         return GroundTruth.normalizeCell(sb.toString());
     }
 
-    private static boolean overlapsSubstantially(TableExtractor.TableHit candidate,
+    static boolean overlapsSubstantially(TableExtractor.TableHit candidate,
                                                   List<TableExtractor.TableHit> taggedLattice) {
         if (candidate.bbox == null) return false;
         float area = Math.max(0f, candidate.bbox[2] - candidate.bbox[0])

@@ -34,10 +34,13 @@ import static org.junit.jupiter.api.Assertions.*;
  * </ol>
  *
  * <p>All three now read one constant, so they cannot drift; {@code StreamTablesDefaultCoherenceTest}
- * is the tripwire for that (and for the two declarations that are not Java at all -- the
- * {@code jobs.stream_tables} column default and {@code titanarum/engine.py}'s {@code _DEFAULT_JOB}).
- * What THIS class adds is behaviour: it drives each surface for real and checks what actually comes
- * out, in both directions, because agreeing on a constant is not the same as honouring it.
+ * is the tripwire for that (and for {@code titanarum/engine.py}'s {@code _DEFAULT_JOB}, the one
+ * declaration that is not Java at all and must still agree). The {@code jobs.stream_tables} column
+ * default is NOT one of these -- it is deliberately pinned to FALSE regardless of this constant, for
+ * rolling-deploy safety; see {@code StreamTablesDefaultCoherenceTest}'s class javadoc and
+ * {@code databaseColumnDefaultStaysFalseForRollingDeploySafety}. What THIS class adds is behaviour: it
+ * drives each surface for real and checks what actually comes out, in both directions, because
+ * agreeing on a constant is not the same as honouring it.
  *
  * <p>The worker-mode tests here drive the REAL {@code --run} control loop (pre-staged
  * {@code job.json} + {@code control.go}) rather than calling a setter, so they cover the whole

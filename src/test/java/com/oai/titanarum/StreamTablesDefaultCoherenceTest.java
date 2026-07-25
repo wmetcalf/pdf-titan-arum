@@ -20,8 +20,10 @@ import java.util.regex.Pattern;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * THE TRIPWIRE for the borderless-table default. One product decision, FIVE independent
- * declarations, in three languages, none derived from any other:
+ * THE TRIPWIRE for the borderless-table default. One product decision, FOUR independent
+ * declarations that must all agree, in three languages, none derived from any other -- plus two
+ * things that look like a fifth and sixth declaration but are deliberately NOT required to agree,
+ * covered separately below:
  *
  * <ol>
  *   <li><b>CLI</b> — picocli's {@code @Option} on {@code PdfTitanArumApp.streamTables}. Governs the
@@ -31,8 +33,6 @@ import static org.junit.jupiter.api.Assertions.*;
  *       {@code WorkerPool}'s freshly constructed app start from.</li>
  *   <li><b>blastbox job.json</b> — {@code JobDescriptor.streamTables()}'s absent-key resolution in
  *       {@code runWorker}, which is what a {@code job.json} without the key means.</li>
- *   <li><b>REST / database</b> — the {@code jobs.stream_tables} column DEFAULT in
- *       {@code db/migration}, which is what an INSERT omitting the column means.</li>
  *   <li><b>blastbox dispatcher</b> — {@code titanarum/engine.py}'s {@code _DEFAULT_JOB}, the value
  *       actually written into {@code job.json}.</li>
  * </ol>
@@ -42,10 +42,31 @@ import static org.junit.jupiter.api.Assertions.*;
  * That is not hypothetical: the REST surface shipped unable to express this flag at all, because
  * nothing tied {@code WorkerPool}'s setter block to the other surfaces.
  *
- * <p>Declarations 1–3 are all wired to {@link PdfTitanArumApp#STREAM_TABLES_DEFAULT} and so cannot
- * drift; this class proves that wiring is real (it reads the values back through the actual parse /
- * construct / deserialize paths, not by reading the constant twice) and then parses the SQL and the
- * Python — which cannot share a Java constant — and fails if either disagrees.
+ * <p>Declarations 1–2 are wired directly to {@link PdfTitanArumApp#STREAM_TABLES_DEFAULT} and so
+ * cannot drift; this class proves that wiring is real (it reads the values back through the actual
+ * parse / construct / deserialize paths, not by reading the constant twice) and then parses the
+ * Python for declaration 4 — which cannot share a Java constant — and fails if it disagrees.
+ *
+ * <p><b>NOT required to agree, #1 — the {@code jobs.stream_tables} column DEFAULT</b> in
+ * {@code db/migration}. It is tempting to list this as a fifth declaration, and an earlier version of
+ * this branch did (a V9 migration moved it from V8's {@code FALSE} to {@code TRUE} to match). That was
+ * wrong and has been reverted: {@code ApiRoutes} always supplies the column explicitly on every INSERT
+ * it issues, so the column default is never consulted by any binary that knows {@code stream_tables}
+ * exists — it only fires for an INSERT from a binary built BEFORE the column existed, mid
+ * rolling-deploy against an already-migrated database. That old binary never calls
+ * {@code setStreamTables} and always runs the ruled-only pipeline, so the column default must stay
+ * FALSE regardless of {@link PdfTitanArumApp#STREAM_TABLES_DEFAULT} — see
+ * {@link #databaseColumnDefaultStaysFalseForRollingDeploySafety()}, which pins FALSE deliberately
+ * rather than pinning agreement with the other four.
+ *
+ * <p><b>NOT required to agree, #2 — {@code TITANARUM_STREAM_TABLES_DEFAULT}</b>, the env var
+ * {@code ApiRoutes} reads to let an operator override the REST default fleet-wide without a redeploy
+ * (see {@link PdfTitanArumApp#resolveRestStreamTablesDefault}). It is not a competing declaration of
+ * the default's VALUE — unset, blank, or unrecognised it falls straight through to
+ * {@code STREAM_TABLES_DEFAULT} — so there is nothing for it to drift from; see
+ * {@link #restEnvOverrideFallsBackToShippingDefaultWhenAbsentBlankOrUnrecognised()} and
+ * {@code ServerApiRoutesFormBindingTest} for the end-to-end HTTP coverage (this class stays in the
+ * default, non-{@code -Pserver} source set, so it cannot reference {@code ApiRoutes} directly).
  *
  * <p>ALSO PINNED HERE: the picocli inversion trap. picocli sets a plain boolean flag to the OPPOSITE
  * of its {@code defaultValue} when the flag is present, so changing {@code defaultValue="false"} to
@@ -207,13 +228,28 @@ class StreamTablesDefaultCoherenceTest {
     // ------------------------------------------------------------------ 4. the database migrations
 
     /**
-     * Replays every migration in version order and asserts the FINAL column default agrees. Written
-     * as a replay rather than "grep the newest file" so that appending another migration that moves
-     * the default again is picked up automatically, and so that editing V8 in place (migrations are
-     * append-only — don't) does not quietly pass.
+     * Replays every migration in version order and asserts the FINAL column default is FALSE —
+     * DELIBERATELY, and NOT {@link #EXPECTED} ({@code STREAM_TABLES_DEFAULT}, which is {@code true}).
+     * This is the one declaration in this file that must NOT track the shipping default, for
+     * rolling-deploy safety.
+     *
+     * <p>{@code ApiRoutes} always supplies {@code stream_tables} explicitly on every INSERT it issues,
+     * so no binary that knows this column exists ever falls through to the column default. The only
+     * INSERT that can is one issued by a binary built BEFORE this column existed, mid rolling-deploy
+     * against an already-migrated database; that binary has no {@code setStreamTables} to call and
+     * always runs the ruled-only (pre-stream) pipeline. If the column default tracked
+     * {@code STREAM_TABLES_DEFAULT} (as a since-reverted V9 migration on this branch briefly did), that
+     * old binary's row would read back {@code stream_tables=true} while the binary that wrote it
+     * actually executed the ruled-only path — the stored flag would disagree with the behaviour
+     * depending on which binary claimed the row first. Pinning the column default to FALSE keeps an
+     * old binary's omitted-column INSERT meaning exactly what that binary executes.
+     *
+     * <p>Written as a replay rather than "grep the newest file" so that appending another migration
+     * that moves the default again is picked up automatically, and so that editing V8 in place
+     * (migrations are append-only — don't) does not quietly pass.
      */
     @Test
-    void databaseColumnDefaultMatches() throws Exception {
+    void databaseColumnDefaultStaysFalseForRollingDeploySafety() throws Exception {
         Path dir = repoFile("src/main/resources/db/migration/V8__add_stream_tables.sql").getParent();
         List<Path> migrations;
         try (var s = Files.list(dir)) {
@@ -258,11 +294,17 @@ class StreamTablesDefaultCoherenceTest {
                 "no migration leaves jobs.stream_tables with a column DEFAULT (last touched by "
                         + setBy + "). An INSERT that omits the column — an old application binary "
                         + "mid-rolling-deploy — would then fail against NOT NULL.");
-        assertEquals(EXPECTED, effective.get(),
-                "the jobs.stream_tables column DEFAULT (last set by " + setBy + ") disagrees with "
-                        + "STREAM_TABLES_DEFAULT. Migrations are append-only: add the next V<n> with "
-                        + "ALTER COLUMN stream_tables SET DEFAULT " + (EXPECTED ? "TRUE" : "FALSE")
-                        + " rather than editing an existing one.");
+        // Deliberately FALSE, not EXPECTED: see this method's javadoc. The column default protects a
+        // pre-V8 binary mid rolling-deploy, which always ran the ruled-only pipeline regardless of
+        // what STREAM_TABLES_DEFAULT says today, so it must stay FALSE even while EXPECTED is true.
+        assertFalse(effective.get(),
+                "the jobs.stream_tables column DEFAULT (last set by " + setBy + ") must stay FALSE. "
+                        + "It is deliberately NOT STREAM_TABLES_DEFAULT (" + EXPECTED + "): ApiRoutes "
+                        + "always supplies the column explicitly, so this default only fires for an "
+                        + "INSERT from a binary that predates the column and never calls "
+                        + "setStreamTables. FALSE keeps that old binary's stored row meaning what it "
+                        + "actually executes (the ruled-only pipeline). Do not add a migration that "
+                        + "moves this to TRUE to 'fix' this failure.");
     }
 
     private static int versionOf(Path p) {
@@ -280,6 +322,46 @@ class StreamTablesDefaultCoherenceTest {
                 "V8 must keep shipping exactly what it shipped (DEFAULT FALSE). Flyway checksums it "
                         + "on every deployed database; changing it breaks their next migration. Move "
                         + "the default in a NEW migration instead.");
+    }
+
+    // ------------------------------------------------------- 4b. the REST fleet-wide env override
+
+    /**
+     * {@code TITANARUM_STREAM_TABLES_DEFAULT} is NOT one of the four declarations above (see this
+     * class's javadoc) — it is a per-deployment override with nothing to drift from, because absent,
+     * blank, or unrecognised it falls straight through to {@code STREAM_TABLES_DEFAULT}. This pins
+     * that fallthrough directly against the pure parser; the end-to-end HTTP wiring (that
+     * {@code ApiRoutes} actually reads this env var name and feeds it to this method) is covered by
+     * {@code ServerApiRoutesFormBindingTest}, which lives under the {@code -Pserver} source set that
+     * this class deliberately does not depend on.
+     */
+    @Test
+    void restEnvOverrideFallsBackToShippingDefaultWhenAbsentBlankOrUnrecognised() {
+        assertEquals(EXPECTED, PdfTitanArumApp.resolveRestStreamTablesDefault(null),
+                "an unset TITANARUM_STREAM_TABLES_DEFAULT must mean 'no opinion', i.e. the shipping "
+                        + "default — not off");
+        assertEquals(EXPECTED, PdfTitanArumApp.resolveRestStreamTablesDefault(""),
+                "a blank TITANARUM_STREAM_TABLES_DEFAULT must fall through to the shipping default, "
+                        + "exactly like every sibling env toggle");
+        assertEquals(EXPECTED, PdfTitanArumApp.resolveRestStreamTablesDefault("   "),
+                "whitespace-only must be treated as blank");
+        assertEquals(EXPECTED, PdfTitanArumApp.resolveRestStreamTablesDefault("maybe"),
+                "an unrecognised value must fall back to the shipping default rather than silently "
+                        + "picking a side — for a default-ON flag, guessing 'off' is the worse failure");
+    }
+
+    /** Every documented truthy/falsy spelling must resolve the way the README promises. */
+    @Test
+    void restEnvOverrideAcceptsTheDocumentedTruthyAndFalseySpellings() {
+        for (String v : new String[]{"true", "1", "on", "yes", "TRUE", "Yes"}) {
+            assertTrue(PdfTitanArumApp.resolveRestStreamTablesDefault(v),
+                    "TITANARUM_STREAM_TABLES_DEFAULT=" + v + " must resolve to true");
+        }
+        for (String v : new String[]{"false", "0", "off", "no", "FALSE", "No"}) {
+            assertFalse(PdfTitanArumApp.resolveRestStreamTablesDefault(v),
+                    "TITANARUM_STREAM_TABLES_DEFAULT=" + v + " must resolve to false — this is the "
+                            + "documented fleet-wide, no-redeploy off switch");
+        }
     }
 
     // ---------------------------------------------------------------- 5. the blastbox dispatcher

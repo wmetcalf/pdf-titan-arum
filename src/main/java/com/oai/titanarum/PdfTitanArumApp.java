@@ -152,8 +152,8 @@ public class PdfTitanArumApp implements Callable<Integer> {
     /**
      * THE canonical shipping default for borderless ("stream") table extraction -- ON.
      *
-     * <p>WHY A NAMED CONSTANT. This one flag is declared independently on five surfaces, in three
-     * languages, and nothing derives any of them from any other:
+     * <p>WHY A NAMED CONSTANT. This one flag is declared independently on four surfaces that must all
+     * agree, in three languages, and nothing derives any of them from any other:
      * <ol>
      *   <li>the CLI's {@code @Option} on {@link #streamTables} (picocli, {@code --stream-tables});</li>
      *   <li>the FIELD INITIALIZER on {@link #streamTables}, which is the default every programmatic
@@ -161,16 +161,35 @@ public class PdfTitanArumApp implements Callable<Integer> {
      *       is invisible to the REST server and to any embedder;</li>
      *   <li>{@link JobDescriptor#streamTables()}'s absent-key default, i.e. what a blastbox
      *       {@code job.json} that omits {@code stream_tables} means (see {@link #runWorker});</li>
-     *   <li>the {@code jobs.stream_tables} column DEFAULT in {@code src/main/resources/db/migration}
-     *       (V8 declared FALSE, V9 sets TRUE), which is what an INSERT omitting the column means;</li>
      *   <li>{@code titanarum/engine.py}'s {@code _DEFAULT_JOB["stream_tables"]}, the value the
      *       blastbox dispatcher actually writes into {@code job.json}.</li>
      * </ol>
-     * Items 1-3 read this constant, so they cannot drift. Items 4 and 5 are a different language and
-     * cannot; {@code StreamTablesDefaultCoherenceTest} parses both and fails if either disagrees with
-     * this field. Flipping any ONE of the five in isolation is the failure this constant plus that
-     * test exist to prevent -- it had already happened once here (the REST surface silently could not
-     * express the flag at all).
+     * Items 1-3 read this constant, so they cannot drift. Item 4 is a different language and cannot;
+     * {@code StreamTablesDefaultCoherenceTest} parses it and fails if it disagrees with this field.
+     * Flipping any ONE of these in isolation is the failure this constant plus that test exist to
+     * prevent -- it had already happened once here (the REST surface silently could not express the
+     * flag at all).
+     *
+     * <p>NOT ON THIS LIST, DELIBERATELY: the {@code jobs.stream_tables} column DEFAULT in
+     * {@code src/main/resources/db/migration} (V8, {@code DEFAULT FALSE}). Every INSERT this codebase
+     * itself issues -- {@code JobRepository.insert}, always fed by {@code ApiRoutes}' own read of this
+     * constant (or of its env override, see {@link #resolveRestStreamTablesDefault}) -- supplies the
+     * column explicitly, so the column default is never consulted by any binary that knows this flag
+     * exists at all. It only fires for an INSERT issued by a binary built BEFORE V8, mid rolling-deploy
+     * against an already-migrated database; that binary has no {@code setStreamTables} to call and
+     * always runs the ruled-only pipeline, so the column default must stay FALSE regardless of what
+     * this constant is -- matching it here would let an old binary's stored row claim {@code true}
+     * while it actually executed the old, stream-less pipeline. (An earlier version of this branch had
+     * a V9 migration that moved the column default to TRUE for exactly that reason-sounding-plausible
+     * but wrong argument; it was removed before release once that hazard was caught in review -- see
+     * {@code StreamTablesDefaultCoherenceTest#databaseColumnDefaultStaysFalseForRollingDeploySafety}.)
+     *
+     * <p>ALSO NOT ON THIS LIST: {@link #resolveRestStreamTablesDefault}, the {@code
+     * TITANARUM_STREAM_TABLES_DEFAULT} env var that lets an operator flip the REST surface's default
+     * fleet-wide without shipping a new binary. It is not a competing declaration of the default's
+     * VALUE -- unset, blank, or unrecognised it falls straight through to this constant -- so there is
+     * nothing for it to drift from; it is a per-deployment override, the REST analogue of the
+     * blastbox-side {@code TITANARUM_STREAM_TABLES} env var.
      *
      * <p>See {@link #streamTables} for the measured quality and cost behind choosing ON.
      */
@@ -191,6 +210,46 @@ public class PdfTitanArumApp implements Callable<Integer> {
      */
     static boolean resolveStreamTables(Boolean fromJob) {
         return fromJob != null ? fromJob : STREAM_TABLES_DEFAULT;
+    }
+
+    /**
+     * Name of the environment variable that lets an operator flip the REST surface's
+     * {@code stream_tables} default for the whole fleet without a redeploy: {@code ApiRoutes} reads it
+     * once per submission (see {@link #resolveRestStreamTablesDefault}) to resolve a form request that
+     * omits the {@code streamTables} field. Restarting the server process (not shipping new code) is
+     * still required, because a running JVM cannot observe a changed OS environment variable.
+     *
+     * <p>This exists because the {@code jobs.stream_tables} column DEFAULT -- the other candidate for
+     * a "no redeploy" fleet-wide switch -- is inert for REST submissions: {@code JobRepository.insert}
+     * always supplies the column explicitly, so no INSERT issued by a binary that knows about this
+     * flag ever falls through to the column default (see {@link #STREAM_TABLES_DEFAULT}'s javadoc).
+     */
+    public static final String STREAM_TABLES_REST_DEFAULT_ENV = "TITANARUM_STREAM_TABLES_DEFAULT";
+
+    /**
+     * Resolves the REST surface's {@code stream_tables} default from {@code raw} -- the value of
+     * {@link #STREAM_TABLES_REST_DEFAULT_ENV}, or {@code null} if the caller's environment lookup
+     * found nothing. Mirrors the truthy/falsy vocabulary {@code engine.py}'s {@code _flag} helper uses
+     * for the blastbox-side {@code TITANARUM_STREAM_TABLES} env var, so an operator does not have to
+     * learn a second syntax for the two fleets: absent or blank means "no opinion" and falls through to
+     * {@link #STREAM_TABLES_DEFAULT}, matching {@code boolFormDefault}'s own "an unrecognised value
+     * must not silently pick a side" rule for the same reason -- for a default-ON detection stage,
+     * guessing wrong the quiet way (off) is the worse failure.
+     *
+     * <p>Pure function taking the already-looked-up string rather than calling
+     * {@code System.getenv} itself, so tests can exercise every input without mutating real process
+     * environment (which the JVM cannot do for itself once started, and Java has no public API to
+     * fake for a test).
+     */
+    public static boolean resolveRestStreamTablesDefault(String raw) {
+        if (raw == null) return STREAM_TABLES_DEFAULT;
+        String v = raw.trim();
+        if (v.isEmpty()) return STREAM_TABLES_DEFAULT;
+        if (v.equalsIgnoreCase("true") || v.equals("1")
+                || v.equalsIgnoreCase("on") || v.equalsIgnoreCase("yes")) return true;
+        if (v.equalsIgnoreCase("false") || v.equals("0")
+                || v.equalsIgnoreCase("off") || v.equalsIgnoreCase("no")) return false;
+        return STREAM_TABLES_DEFAULT;
     }
 
     // I1 (warm-plan.md): per-document QR-scan / image-extraction budgets. scanQrCodes()

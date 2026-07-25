@@ -229,6 +229,7 @@ java -jar target/pdf-titan-arum-server-1.3.0.jar server \
 | `OPENAI_BASE_URL`  | —       | OpenAI-compatible API base URL; enables AI analysis when set  |
 | `OPENAI_API_KEY`   | —       | API key (use `none` for local unauthenticated models)         |
 | `OPENAI_MODEL`     | —       | Model name (auto-detected from `/models` if not set)          |
+| `TITANARUM_STREAM_TABLES_DEFAULT` | on (unset) | Fleet-wide `streamTables` default for a REST submission that omits the field — `false`/`0`/`off`/`no` disables it for every job submitted from that point on; requires restarting the server process to take effect. Explicit per-job `streamTables=` still overrides it either way. See [Turning it off](#turning-it-off). |
 
 ### AI analysis (server)
 
@@ -300,12 +301,14 @@ default, and only an explicit falsey value disables it. The web UI therefore pai
 which for a default-on flag is indistinguishable from "field omitted", so without the hidden companion
 the box could not be unticked.
 
-The same default is declared independently in five places, in three languages (CLI `@Option`, the
-`PdfTitanArumApp.streamTables` field initializer, `JobDescriptor`'s absent-key resolution, the
-`jobs.stream_tables` column default, and `titanarum/engine.py`'s `_DEFAULT_JOB`). The three Java ones
-all read `PdfTitanArumApp.STREAM_TABLES_DEFAULT`; `StreamTablesDefaultCoherenceTest` parses the
-migration SQL and the Python source and fails if either disagrees, so the default cannot be flipped on
-one surface only.
+The same default is declared independently in four places that must agree, in three languages (CLI
+`@Option`, the `PdfTitanArumApp.streamTables` field initializer, `JobDescriptor`'s absent-key
+resolution, and `titanarum/engine.py`'s `_DEFAULT_JOB`). The three Java ones all read
+`PdfTitanArumApp.STREAM_TABLES_DEFAULT`; `StreamTablesDefaultCoherenceTest` parses the Python source
+and fails if it disagrees, so the default cannot be flipped on one surface only. (The
+`jobs.stream_tables` column default is deliberately *not* one of these four — see
+[Turning it off](#turning-it-off) — and neither is the `TITANARUM_STREAM_TABLES_DEFAULT` env override
+described there, which has nothing to drift from.)
 
 ---
 
@@ -703,10 +706,22 @@ The flag is switchable off **per job on every surface**, and none of these fall 
 | REST | form field `streamTables=false` (also `0`, `off`, `no`), or untick the box in the web UI |
 | blastbox `job.json` | `"stream_tables": false` |
 | blastbox env | `TITANARUM_STREAM_TABLES=0` (also `false`, `no`, `off`) |
-| whole fleet, no redeploy | `ALTER TABLE jobs ALTER COLUMN stream_tables SET DEFAULT FALSE;` plus `TITANARUM_STREAM_TABLES=0` for the sandboxed workers |
+| whole fleet, no redeploy | `TITANARUM_STREAM_TABLES_DEFAULT=false` (also `0`, `off`, `no`) in the Java server's environment, plus `TITANARUM_STREAM_TABLES=0` for the sandboxed workers |
 
-Note that an **empty** `TITANARUM_STREAM_TABLES=` means "no opinion", not "off" — exactly as it does
-for every sibling toggle — so it leaves the default in place. Use `0` to disable.
+Note that an **empty** `TITANARUM_STREAM_TABLES=` (or `TITANARUM_STREAM_TABLES_DEFAULT=`) means "no
+opinion", not "off" — exactly as it does for every sibling toggle — so it leaves the default in place.
+Use `0` to disable.
+
+**"No redeploy" means no new binary, not "no restart."** The Java server resolves
+`TITANARUM_STREAM_TABLES_DEFAULT` from its own process environment on every submission, so a running
+server does not pick up a changed value until its container/process is restarted with the new env var
+set — a config-and-restart operation, not a code deployment. Do **not** use
+`ALTER TABLE jobs ALTER COLUMN stream_tables SET DEFAULT FALSE;` for this: `JobRepository.insert`
+always supplies the `stream_tables` column explicitly, so the column's own default is never consulted
+by a REST submission and that `ALTER` changes nothing an operator can observe. The column default
+exists solely to protect a rolling deploy against a pre-upgrade binary that predates this column
+entirely, and is pinned to `FALSE` for that reason regardless of the shipping default above (see
+`StreamTablesDefaultCoherenceTest`).
 
 Stream hits carry a `confidence` float in `[0,1]` (omitted entirely on `tagged`/`lattice` hits), so a
 downstream consumer can filter them further.
@@ -722,11 +737,18 @@ downstream consumer can filter them further.
 - Turning the flag on roughly doubles table-extraction cost on real documents (measured p50 0.3ms →
   0.4ms, p95 13.5ms → 17.9ms per document over 277 real PDFs) — but table extraction is a small part
   of a run, so end-to-end p50 moves 260.8ms → 261.2ms.
-- The default is declared in **five** independent places (the CLI `@Option`, the
-  `PdfTitanArumApp.streamTables` field initializer, `JobDescriptor`'s absent-key resolution, the
-  `jobs.stream_tables` column default, and `titanarum/engine.py`'s `_DEFAULT_JOB`). The three Java ones
-  read `PdfTitanArumApp.STREAM_TABLES_DEFAULT`; `StreamTablesDefaultCoherenceTest` parses the SQL and
-  the Python and fails if either drifts. Flip all five or none.
+- The default is declared in **four** independent places that must all agree (the CLI `@Option`, the
+  `PdfTitanArumApp.streamTables` field initializer, `JobDescriptor`'s absent-key resolution, and
+  `titanarum/engine.py`'s `_DEFAULT_JOB`). The three Java ones read
+  `PdfTitanArumApp.STREAM_TABLES_DEFAULT`; `StreamTablesDefaultCoherenceTest` parses the Python and
+  fails if it drifts. Flip all four or none.
+- The `jobs.stream_tables` column DEFAULT is deliberately **not** one of those four: it stays `FALSE`
+  regardless of the shipping default, because it only governs an INSERT from a binary that predates
+  this column and never calls `setStreamTables` — matching the shipping default there would let that
+  old binary's stored row claim a behaviour it never ran. `TITANARUM_STREAM_TABLES_DEFAULT` (the REST
+  env override above) is likewise not a fifth declaration to keep in sync: unset or unrecognised, it
+  falls straight through to `PdfTitanArumApp.STREAM_TABLES_DEFAULT`, so there is nothing for it to
+  drift from.
 
 ### Page PDFs
 - Selected pages exported as individual single-page PDFs

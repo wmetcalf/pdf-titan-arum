@@ -114,6 +114,9 @@ class ServerApiRoutesFormBindingTest {
     @AfterEach
     void stopServer() {
         if (app != null) app.stop();
+        // Restore the real environment lookup even if a test below failed mid-swap, so the override
+        // never leaks into an unrelated test class sharing this JVM.
+        ApiRoutes.streamTablesDefaultEnvLookup = System::getenv;
     }
 
     // ------------------------------------------------------------------------------------ helpers
@@ -182,6 +185,57 @@ class ServerApiRoutesFormBindingTest {
         assertEquals(202, r.statusCode(), r.body());
         assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, repo.args.get("streamTables"),
                 "a form with no streamTables field must resolve to STREAM_TABLES_DEFAULT");
+    }
+
+    /**
+     * THE FLEET-WIDE, NO-REDEPLOY OFF SWITCH the README documents:
+     * {@code TITANARUM_STREAM_TABLES_DEFAULT=false} in the server's environment must flip what an
+     * omitted {@code streamTables} field resolves to, end to end through the real
+     * {@link ApiRoutes#wire} route — not just through the pure parser
+     * {@code StreamTablesDefaultCoherenceTest} exercises. Swaps
+     * {@link ApiRoutes#streamTablesDefaultEnvLookup} rather than mutating the real process
+     * environment, which the running JVM cannot observe a change to anyway.
+     */
+    @Test
+    void restEnvOverrideFlipsTheDefaultFleetWide() throws Exception {
+        ApiRoutes.streamTablesDefaultEnvLookup = name ->
+                PdfTitanArumApp.STREAM_TABLES_REST_DEFAULT_ENV.equals(name) ? "false" : null;
+
+        HttpResponse<String> r = postJob(List.of());
+        assertEquals(202, r.statusCode(), r.body());
+        assertEquals(Boolean.FALSE, repo.args.get("streamTables"),
+                "TITANARUM_STREAM_TABLES_DEFAULT=false must turn an omitted streamTables field off, "
+                        + "with no code change and no new binary");
+    }
+
+    /**
+     * The env override changes the DEFAULT, not the flag: a job that names {@code streamTables}
+     * explicitly must still win, exactly like every other default-vs-explicit resolution in this
+     * codebase (form field over REST default, job.json key over blastbox default, CLI flag over
+     * picocli default).
+     */
+    @Test
+    void restEnvOverrideNeverBeatsAnExplicitPerJobValue() throws Exception {
+        ApiRoutes.streamTablesDefaultEnvLookup = name ->
+                PdfTitanArumApp.STREAM_TABLES_REST_DEFAULT_ENV.equals(name) ? "false" : null;
+
+        HttpResponse<String> r = postJob(checked("streamTables"));
+        assertEquals(202, r.statusCode(), r.body());
+        assertEquals(Boolean.TRUE, repo.args.get("streamTables"),
+                "an explicit streamTables=on must survive a fleet-wide env override that disagrees "
+                        + "with it — the override changes the default, not per-job control");
+    }
+
+    /** An unset (or blank) env var must leave the shipping default exactly as it was. */
+    @Test
+    void restEnvOverrideUnsetLeavesTheShippingDefaultInPlace() throws Exception {
+        ApiRoutes.streamTablesDefaultEnvLookup = name -> null;
+
+        HttpResponse<String> r = postJob(List.of());
+        assertEquals(202, r.statusCode(), r.body());
+        assertEquals(PdfTitanArumApp.STREAM_TABLES_DEFAULT, repo.args.get("streamTables"),
+                "with the env lookup returning null (unset), an omitted field must still resolve to "
+                        + "STREAM_TABLES_DEFAULT");
     }
 
     /** Every truthy encoding must reach the field. */

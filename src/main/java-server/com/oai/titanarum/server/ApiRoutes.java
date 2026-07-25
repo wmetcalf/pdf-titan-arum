@@ -16,6 +16,16 @@ public class ApiRoutes {
 
     private static final long MAX_UPLOAD_BYTES = 500L * 1024 * 1024;
 
+    /**
+     * Environment lookup for {@link PdfTitanArumApp#STREAM_TABLES_REST_DEFAULT_ENV}, real
+     * {@code System::getenv} in production. Package-private and swappable ONLY so tests can exercise
+     * the fleet-wide env override end to end through the real route without mutating the JVM's actual
+     * environment (which Java cannot do for a running process anyway) -- mirrors the {@code nanoClock}
+     * injectable seam {@code PdfTitanArumApp#awaitGoSignal} uses for the same reason. Must be restored
+     * to {@code System::getenv} after any test that swaps it.
+     */
+    static java.util.function.UnaryOperator<String> streamTablesDefaultEnvLookup = System::getenv;
+
     public static void wire(Javalin app, JobRepository repo, ArtifactStore store, WorkerPool pool) {
 
         // POST /api/jobs — submit a PDF
@@ -45,8 +55,13 @@ public class ApiRoutes {
                     boolForm(ctx, "skipImages"),
                     boolForm(ctx, "skipPhones"),
                     boolForm(ctx, "skipTables"),
-                    // Default-ON, so absent must mean the shipping default rather than false.
-                    boolFormDefault(ctx, "streamTables", PdfTitanArumApp.STREAM_TABLES_DEFAULT),
+                    // Default-ON, so absent must mean the shipping default rather than false. The
+                    // default itself is resolved fresh per request so a fleet-wide env override
+                    // (TITANARUM_STREAM_TABLES_DEFAULT) needs only a process restart, not a redeploy.
+                    boolFormDefault(ctx, "streamTables",
+                            PdfTitanArumApp.resolveRestStreamTablesDefault(
+                                    streamTablesDefaultEnvLookup.apply(
+                                            PdfTitanArumApp.STREAM_TABLES_REST_DEFAULT_ENV))),
                     boolForm(ctx, "skipPageExport"),
                     boolForm(ctx, "skipTextUrls"),
                     boolForm(ctx, "skipQr"),

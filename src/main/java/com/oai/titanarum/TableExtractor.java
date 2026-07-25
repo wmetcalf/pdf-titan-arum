@@ -72,15 +72,80 @@ final class TableExtractor {
      * document measured here is affected, while the worst case a hostile document can buy from the
      * stream stage is bounded at 64 x 411ms = ~26s instead of growing without limit.
      *
-     * <p>WHAT THIS DELIBERATELY DOES NOT CLAIM. It leaves the stream stage MORE tightly bounded than
-     * the lattice path, whose own per-page cost (measured 157ms on a hostile page that drives
-     * {@link #MAX_TEXTFILL_WORK}) is still linear in page count with no document-level cap. That
-     * asymmetry is intentional for an OPT-IN stage on a lower-precision path: the conservative
-     * direction is to stop early and say so. A legitimate 100-page document with borderless tables
-     * past page 64 loses them, with {@code tablesTruncated} set in report.json -- missing a table
-     * loudly, which this threat model prefers to either fabricating one or hanging.
+     * <p>SUPERSEDED NOTE. This constant's doc used to record, as a deliberate non-claim, that it
+     * left the stream stage MORE tightly bounded than the lattice path, "whose own per-page cost
+     * (measured 157ms on a hostile page that drives {@link #MAX_TEXTFILL_WORK}) is still linear in
+     * page count with no document-level cap". That asymmetry is CLOSED: see {@link
+     * #MAX_LATTICE_DOC_WORK}. The two bounds are still different INSTRUMENTS -- pages here, real work
+     * there -- because the stream stage's per-page cost is nearly flat (411ms whatever the page
+     * holds, so pages are a good proxy for work) while the lattice path's varies by two orders of
+     * magnitude between a real page and a hostile one (so work is the only instrument that separates
+     * them). Both cut the document tail in page order and both set {@link Result#truncated}.
+     *
+     * <p>A legitimate 100-page document with borderless tables past page 64 loses them, with
+     * {@code tablesTruncated} set in report.json -- missing a table loudly, which this threat model
+     * prefers to either fabricating one or hanging.
      */
     static final int MAX_STREAM_PAGES_PER_DOC = 64;
+    /**
+     * Units of REAL lattice work ONE document may charge before the lattice path stops processing
+     * further pages and flags {@link Result#truncated}. Charged and checked between pages in
+     * {@link #extract(PDDocument, List, Map, boolean, long)}; the per-page budgets are untouched.
+     *
+     * <p>WHY A DOCUMENT-LEVEL BOUND AT ALL. Until this constant existed, EVERY lattice budget was
+     * per page ({@link #MAX_RULINGS_PER_PAGE}, {@link #MAX_INTERSECTIONS}, {@link
+     * #MAX_FINDCELLS_WORK}, {@link #MAX_GROUPING_WORK}, {@link #MAX_SPLIT_WORK}, {@link
+     * #MAX_TEXTFILL_WORK}, {@link #MAX_CLUMP_SPLIT_WORK}, {@link #MAX_CELLS_PER_TABLE}, {@link
+     * #MAX_TABLES_PER_PAGE}). Those hold: measured ({@code LatticeDosProbe}) the most expensive
+     * single lattice page constructible costs 278ms and charges 32M. What was UNBOUNDED is the
+     * aggregate -- measured 139.4ms/page, FLAT from 1 to 64 pages (64 pages = 8.9s), and page count
+     * is attacker-controlled at near-zero file cost because many page objects may share ONE content
+     * stream. {@code --pages all} admits up to 1,000 pages ({@code MAX_PAGES_ALL}) -- 139s of
+     * lattice -- and an explicit spec ({@code --pages 1-z}) is not capped by page count at all,
+     * while {@code --timeout} defaults to 0 (no limit) and the watchdog is not even started then.
+     * The sibling stages have each had a document-level bound since they were wired in (stream:
+     * {@link #MAX_STREAM_PAGES_PER_DOC}; tagged: {@link #MAX_STRUCTURE_WORK}; arbitration: {@link
+     * #MAX_ARBITRATION_WORK}); lattice was the only one without one.
+     *
+     * <p>WHY WORK AND NOT A PAGE COUNT, unlike {@link #MAX_STREAM_PAGES_PER_DOC}. Measured over the
+     * 277 real PDFs this project uses (77-unit ICDAR/tabula scoring corpus + 200-PDF real-world
+     * prose sample), ALL pages: a real page charges p50 2,889, p95 372,085, worst 2,151,463
+     * (schools.pdf p3). A hostile page charges 21M-32M. Work separates real from hostile by TWO
+     * ORDERS OF MAGNITUDE; page count does not separate them at all. So this budget lets a long
+     * legitimate document through while stopping a short hostile one, which a page cap cannot do.
+     *
+     * <p>SIZING, from those measurements. Worst REAL document = 9,825,547 (schools.pdf, 5pp);
+     * a synthetic 300-page document with an ordinary 25x6 ruled table on every page charges
+     * 34,464,900. At 800M this budget is <b>81x the worst real document</b> and 23x that 300-page
+     * one, and it admits ~400 pages at the density of the densest real document measured. On the
+     * hostile side, charged work runs at a measured 2.9-13.7 ns/unit (6.4 ns/unit for the reference
+     * textfill attack), so 800M caps the lattice stage at <b>~3-7 seconds</b> of work per document
+     * instead of growing linearly without limit.
+     *
+     * <p>WHAT THIS DELIBERATELY DOES NOT CLAIM. It does not bound PDFBox's content-stream
+     * TOKENIZING cost for non-path operators: {@link #collectRulings} walks the whole stream, and a
+     * page whose stream is all text charges ~nothing for that walk. Measured, that residual is
+     * 0.015ms per empty page, 0.134ms per 200-text-op page and 2.8ms per 5,000-text-op page -- real
+     * but small, proportional to stream bytes, and strictly SMALLER than the same walk the CLI's own
+     * glyph harvest already performs on every selected page before {@link #extract} is called, which
+     * no budget in this class bounds and which this one does not pretend to. Bounding that is a
+     * page-selection / {@code --timeout} concern, not a table-extraction one.
+     */
+    static final long MAX_LATTICE_DOC_WORK = 800_000_000L;
+    /**
+     * Units charged per path-construction operator dispatch in {@link RulingCollector} (see
+     * {@code pathOpsSeen}), so that geometry-side work is commensurate with the (cell, glyph) and
+     * (cell, cell) units the rest of {@link #MAX_LATTICE_DOC_WORK} is denominated in.
+     *
+     * <p>MEASURED, not chosen: a page of 400,000 {@code lineTo} operators costs 69.5ms, i.e. 174ns
+     * per operator, against 6.4ns per unit for the reference textfill attack -- a 27x mismatch at
+     * weight 1, which would have let an operator-flood document buy ~27x more wall time per unit of
+     * budget than any other shape. At weight 20 the same page charges 8.7 ns/unit and the whole
+     * measured hostile spread compresses to 2.9-13.7 ns/unit, i.e. within ~2x of the reference in
+     * both directions. Real documents barely notice: the worst real page's charge moved 2,144,338 ->
+     * 2,151,463 (+0.3%) when this weighting was introduced, because real pages draw few paths.
+     */
+    static final long LATTICE_PATH_OP_CHARGE = 20;
     static final int MAX_CELLS_PER_TABLE = 10_000;
     static final int MAX_RULINGS_PER_PAGE = 10_000;
     // Tagged-path RowSpan/ColSpan are attacker-controlled ints straight from the structure tree
@@ -283,6 +348,15 @@ final class TableExtractor {
     // arbitrated pipeline (0.8079/micro 0.8003). Full-pipeline prose false-positive rate over the
     // 200-PDF sample: 0.1250 -> 0.0600; lattice+tagged alone 0.1050 -> 0.0350.
     //
+    // THE FOUR FIGURES IN THE PARAGRAPH ABOVE ARE HISTORICAL and are left as measured, because the
+    // claim they support is a no-change claim about the state of the harness at the time. The
+    // benchmark has since been corrected (it now feeds production's own glyph harvest and reports
+    // the shipping page scope): the SAME configurations measure lattice+tagged 0.5113 and
+    // full+arbitration 0.8118/micro 0.8030 (all-pages, POOLED, de-duplicated GT), and the 0.0600
+    // prose rate above was a PAGE-1 measurement -- under the shipping page selection the same
+    // sample measures 0.0650 with the stream flag on and 0.0350 with it off. The no-change
+    // verification itself was re-run on the corrected instrument and still holds.
+    //
     // Variants measured and REJECTED, recorded so the thresholds are not re-litigated blind:
     //   * lattice "text must also span 2 distinct grid ROWS": prose FP identical, but lattice+tagged
     //     macro 0.4718 -> 0.4716 (2 matched relations lost on icdar-eu/eu-024, 2 on eu-025 -- real
@@ -434,6 +508,14 @@ final class TableExtractor {
     static final class Result {
         final List<TableHit> tables = new ArrayList<>();
         boolean truncated = false;
+        /**
+         * Units of REAL lattice work this document charged against {@link #MAX_LATTICE_DOC_WORK},
+         * summed over every page the lattice path ran on. Not serialized (this class is internal;
+         * only {@link TableHit} reaches report.json) -- it exists so the DoS tests and the
+         * measurement probes can read the actual charge through the real entry point instead of
+         * inferring it from wall-clock time.
+         */
+        long latticeWorkCharged = 0;
     }
 
     // ---------------------------------------------------------------- views
@@ -571,6 +653,21 @@ final class TableExtractor {
      * survives once the dashes are merged into one long logical ruling.
      */
     static List<Ruling> normalize(List<Ruling> raw) {
+        return normalize(raw, new long[1]);
+    }
+
+    /**
+     * As {@link #normalize(List)}, additionally ADDING this call's real work to {@code charge[0]}
+     * for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}). The term that matters
+     * is the {@code intersectsAny} keep-filter below, which is a full {@code horiz x vert} scan --
+     * the SAME quadratic shape {@link #findCells} charges, and one no cap in this class bounds
+     * (both lists are post-merge, so their sizes are bounded by page dimensions / SNAP, and PDF
+     * page dimensions go to 14,400pt). Rulings that this filter DROPS still cost that scan, so a
+     * page of deliberately non-crossing ruling fans -- which returns zero rulings and would
+     * otherwise charge almost nothing -- is charged for the scan it forced.
+     */
+    static List<Ruling> normalize(List<Ruling> raw, long[] charge) {
+        charge[0] += raw.size();
         List<Ruling> horiz = new ArrayList<>();
         List<Ruling> vert = new ArrayList<>();
         for (Ruling r : raw) {
@@ -583,6 +680,7 @@ final class TableExtractor {
         horiz.removeIf(h -> h.length() < MIN_RULING_LEN);
         vert.removeIf(v -> v.length() < MIN_RULING_LEN);
 
+        charge[0] += 2L * horiz.size() * vert.size();   // the two intersectsAny keep-filter scans
         List<Ruling> keptH = new ArrayList<>();
         for (Ruling h : horiz) if (intersectsAny(h, vert)) keptH.add(h);
         List<Ruling> keptV = new ArrayList<>();
@@ -638,6 +736,24 @@ final class TableExtractor {
      * forms a cell. Spanning cells fall out naturally where internal edges are absent.
      */
     static List<CellRect> findCells(List<Ruling> horiz, List<Ruling> vert) {
+        return findCells(horiz, vert, new long[1]);
+    }
+
+    /**
+     * As {@link #findCells(List, List)}, additionally ADDING the real work this call performs to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}).
+     * Two terms, both charged even when the call throws (so a page that trips a per-page cap is
+     * still charged for the work it forced):
+     * <ul>
+     *   <li>the intersection scan, which is exactly {@code horiz.size() x vert.size()}
+     *       {@code intersects()} calls -- charged UP FRONT, because this loop is bounded only by
+     *       {@link #MAX_INTERSECTIONS} (a cap on RETAINED points): two ruling fans that never cross
+     *       produce zero points and so run the full product with nothing to stop them;</li>
+     *   <li>the top-left/bottom-right corner scan, i.e. the {@link #MAX_FINDCELLS_WORK} counter.</li>
+     * </ul>
+     */
+    static List<CellRect> findCells(List<Ruling> horiz, List<Ruling> vert, long[] charge) {
+        charge[0] += (long) horiz.size() * vert.size();
         // All intersection points, sorted (y, x).
         java.util.TreeSet<Long> pts = new java.util.TreeSet<>();
         List<float[]> points = new ArrayList<>();
@@ -671,25 +787,29 @@ final class TableExtractor {
 
         List<CellRect> cells = new ArrayList<>();
         long work = 0;
-        for (int i = 0; i < points.size(); i++) {
-            float[] tl = points.get(i);
-            CellRect best = null;
-            for (int j = i + 1; j < points.size() && best == null; j++) {
-                if (++work > MAX_FINDCELLS_WORK) throw new RulingOverflowException();
-                float[] br = points.get(j);
-                if (br[0] <= tl[0] + EPS || br[1] <= tl[1] + EPS) continue;
-                if (!pointSet.contains(pkey(br[0], tl[1]))) continue; // top-right corner
-                if (!pointSet.contains(pkey(tl[0], br[1]))) continue; // bottom-left corner
-                if (edgeCoveredH(hByY, tl[1], tl[0], br[0])
-                        && edgeCoveredH(hByY, br[1], tl[0], br[0])
-                        && edgeCoveredV(vByX, tl[0], tl[1], br[1])
-                        && edgeCoveredV(vByX, br[0], tl[1], br[1])) {
-                    CellRect c = new CellRect();
-                    c.x0 = tl[0]; c.y0 = tl[1]; c.x1 = br[0]; c.y1 = br[1];
-                    best = c;
+        try {
+            for (int i = 0; i < points.size(); i++) {
+                float[] tl = points.get(i);
+                CellRect best = null;
+                for (int j = i + 1; j < points.size() && best == null; j++) {
+                    if (++work > MAX_FINDCELLS_WORK) throw new RulingOverflowException();
+                    float[] br = points.get(j);
+                    if (br[0] <= tl[0] + EPS || br[1] <= tl[1] + EPS) continue;
+                    if (!pointSet.contains(pkey(br[0], tl[1]))) continue; // top-right corner
+                    if (!pointSet.contains(pkey(tl[0], br[1]))) continue; // bottom-left corner
+                    if (edgeCoveredH(hByY, tl[1], tl[0], br[0])
+                            && edgeCoveredH(hByY, br[1], tl[0], br[0])
+                            && edgeCoveredV(vByX, tl[0], tl[1], br[1])
+                            && edgeCoveredV(vByX, br[0], tl[1], br[1])) {
+                        CellRect c = new CellRect();
+                        c.x0 = tl[0]; c.y0 = tl[1]; c.x1 = br[0]; c.y1 = br[1];
+                        best = c;
+                    }
                 }
+                if (best != null) cells.add(best);
             }
-            if (best != null) cells.add(best);
+        } finally {
+            charge[0] += work;
         }
         return cells;
     }
@@ -742,7 +862,18 @@ final class TableExtractor {
      * oversight, favoring near-linear performance on realistic input.
      */
     static List<List<CellRect>> groupIntoTables(List<CellRect> cells) {
+        return groupIntoTables(cells, new long[1]);
+    }
+
+    /**
+     * As {@link #groupIntoTables(List)}, additionally ADDING this call's real work to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}):
+     * the {@code n} bucket insertions plus every {@code touches()} pair evaluation (the
+     * {@link #MAX_GROUPING_WORK} counter), charged even when the call throws.
+     */
+    static List<List<CellRect>> groupIntoTables(List<CellRect> cells, long[] charge) {
         int n = cells.size();
+        charge[0] += n;
         int[] parent = new int[n];
         for (int i = 0; i < n; i++) parent[i] = i;
 
@@ -757,19 +888,23 @@ final class TableExtractor {
         }
 
         long work = 0;
-        java.util.Set<Integer> candidates = new java.util.HashSet<>();
-        for (int i = 0; i < n; i++) {
-            CellRect a = cells.get(i);
-            candidates.clear();
-            addBucket(byXEdge, snap(a.x0), candidates);
-            addBucket(byXEdge, snap(a.x1), candidates);
-            addBucket(byYEdge, snap(a.y0), candidates);
-            addBucket(byYEdge, snap(a.y1), candidates);
-            for (int j : candidates) {
-                if (j <= i) continue; // undirected pair -- evaluate once, from the smaller index
-                if (++work > MAX_GROUPING_WORK) throw new RulingOverflowException();
-                if (touches(a, cells.get(j))) union(parent, i, j);
+        try {
+            java.util.Set<Integer> candidates = new java.util.HashSet<>();
+            for (int i = 0; i < n; i++) {
+                CellRect a = cells.get(i);
+                candidates.clear();
+                addBucket(byXEdge, snap(a.x0), candidates);
+                addBucket(byXEdge, snap(a.x1), candidates);
+                addBucket(byYEdge, snap(a.y0), candidates);
+                addBucket(byYEdge, snap(a.y1), candidates);
+                for (int j : candidates) {
+                    if (j <= i) continue; // undirected pair -- evaluate once, from the smaller index
+                    if (++work > MAX_GROUPING_WORK) throw new RulingOverflowException();
+                    if (touches(a, cells.get(j))) union(parent, i, j);
+                }
             }
+        } finally {
+            charge[0] += work;
         }
         java.util.Map<Integer, List<CellRect>> comps = new java.util.LinkedHashMap<>();
         for (int i = 0; i < n; i++) comps.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(cells.get(i));
@@ -935,7 +1070,30 @@ final class TableExtractor {
      * here, separate from the existing per-table cell-count cap.
      */
     static List<List<CellRect>> splitComponent(List<CellRect> comp) {
-        return splitComponent(comp, new long[]{0}, 0);
+        return splitComponent(comp, new long[1]);
+    }
+
+    /**
+     * As {@link #splitComponent(List)}, additionally ADDING this component's grid-placement work
+     * (the {@link #MAX_SPLIT_WORK} counter) to {@code charge[0]} for the document-level lattice
+     * budget ({@link #MAX_LATTICE_DOC_WORK}), including when the split throws. The budget stays PER
+     * COMPONENT exactly as before: this wrapper owns its own counter, {@code charge} only observes.
+     *
+     * <p>Deliberately a THIN WRAPPER around the 3-arg recursive form rather than an extra argument
+     * threaded into it: the recursive method's own frame must stay exactly the size it was. That
+     * recursion is stack-bounded by {@link #MAX_SPLIT_DEPTH} against a 128KB stack (see {@code
+     * TableGeometryTest#splitComponentDepthCapPreventsUnboundedRecursionAndStackOverflow}, which
+     * models this project's firecracker/gvisor deploy targets), and that margin is tight enough to
+     * be sensitive to how much the JIT inlines into the recursive frame -- so nothing here changes
+     * the shape of that frame or of its call site.
+     */
+    static List<List<CellRect>> splitComponent(List<CellRect> comp, long[] charge) {
+        long[] work = {0};
+        try {
+            return splitComponent(comp, work, 0);
+        } finally {
+            charge[0] += work[0];
+        }
     }
 
     /** {@code depth} is FIX 4's recursion-depth guard (see {@link #MAX_SPLIT_DEPTH}), separate
@@ -1408,8 +1566,28 @@ final class TableExtractor {
      * use, so rulings and text always share one frame.
      */
     static List<Ruling> collectRulings(PDPage page) throws IOException {
+        return collectRulings(page, new long[1]);
+    }
+
+    /**
+     * As {@link #collectRulings(PDPage)}, additionally ADDING this page's geometry-side work to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}):
+     * every path point the content stream offered (cumulative across the page, so a stream that
+     * free-runs {@code lineTo} is charged for it) plus the rulings retained. Charged even when the
+     * walk throws {@link RulingOverflowException} at {@link #MAX_RULINGS_PER_PAGE}.
+     *
+     * <p>WHAT THIS DOES NOT CHARGE, stated so the budget is not over-claimed: PDFBox's own
+     * content-stream TOKENIZING cost. That is proportional to stream bytes and is paid once per page
+     * by the CLI's glyph harvest before {@link #extract} is ever called (and again here), and it is
+     * not bounded by any counter in this class -- before or after this budget existed.
+     */
+    static List<Ruling> collectRulings(PDPage page, long[] charge) throws IOException {
         RulingCollector rc = new RulingCollector(page);
-        rc.processPage(page);
+        try {
+            rc.processPage(page);
+        } finally {
+            charge[0] += rc.pathOpsSeen * LATTICE_PATH_OP_CHARGE + rc.rulings.size();
+        }
         return rc.rulings;
     }
 
@@ -1444,6 +1622,15 @@ final class TableExtractor {
         private List<float[]> current = new ArrayList<>();
         private int pointCount = 0;
         private boolean overflowed = false;
+        /**
+         * Path-construction operator dispatches seen across the WHOLE page, counted BEFORE the
+         * {@code overflowed} early-returns so a stream that free-runs {@code lineTo} past
+         * {@link #MAX_PATH_POINTS} is still charged for every operator pdfbox had to tokenize and
+         * dispatch. (Contrast {@link #pointCount}, which resets per path and bounds only the
+         * BUFFER.) This is the geometry-side work {@link #collectRulings(PDPage, long[])} charges
+         * against the document-level lattice budget, weighted by {@link #LATTICE_PATH_OP_CHARGE}.
+         */
+        long pathOpsSeen = 0;
 
         RulingCollector(PDPage page) {
             super(page);
@@ -1514,12 +1701,14 @@ final class TableExtractor {
         }
 
         @Override public void moveTo(float x, float y) {
+            pathOpsSeen++;
             if (overflowed) return;
             finalizeCurrentSubpath();
             addPoint(new float[]{x, y, 0f});
         }
 
         @Override public void lineTo(float x, float y) {
+            pathOpsSeen++;
             if (overflowed) return;
             addPoint(new float[]{x, y, 0f});
         }
@@ -1555,6 +1744,7 @@ final class TableExtractor {
          * collinear-control straight line authored via {@code c} is treated exactly like a lineTo.
          */
         @Override public void curveTo(float x1, float y1, float x2, float y2, float x3, float y3) {
+            pathOpsSeen++;
             if (overflowed) return;
             Point2D.Float p0 = getCurrentPoint();
             boolean straight = isEffectivelyStraight(p0.x, p0.y, x1, y1, x2, y2, x3, y3);
@@ -1582,6 +1772,7 @@ final class TableExtractor {
         }
 
         @Override public void appendRectangle(Point2D p0, Point2D p1, Point2D p2, Point2D p3) {
+            pathOpsSeen += 5;   // this operator buffers five points
             if (overflowed) return;
             finalizeCurrentSubpath();
             addPoint(new float[]{(float) p0.getX(), (float) p0.getY(), 0f});
@@ -1592,6 +1783,7 @@ final class TableExtractor {
         }
 
         @Override public void closePath() {
+            pathOpsSeen++;
             if (overflowed || current.isEmpty()) return;
             float[] first = current.get(0);
             addPoint(new float[]{first[0], first[1], 0f}); // closing edge is a straight line, not a curve
@@ -1977,6 +2169,16 @@ final class TableExtractor {
      * production budget. */
     static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
                                                 long glyphBudget, long workBudget) throws IOException {
+        return fillCellsByRegion(tables, page, result, glyphBudget, workBudget, new long[1]);
+    }
+
+    /** As above, additionally ADDING this call's real work (glyphs retained by the streaming
+     *  collector plus the bucketing work it charged against {@code workBudget}) to {@code charge[0]}
+     *  for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}). Charged in a
+     *  {@code finally} so a call that trips either cap is still charged for the work it forced. */
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
+                                                long glyphBudget, long workBudget, long[] charge)
+            throws IOException {
         long totalCells = 0;
         for (List<CellRect> comp : tables) totalCells += comp.size();
         // nothing to fill -- avoid registering a bogus bbox below
@@ -2000,12 +2202,20 @@ final class TableExtractor {
 
         PositionCollectingStripper stripper = new PositionCollectingStripper(
                 glyphBudget, rotation, unrotatedW, unrotatedH, bx0, by0, bx1, by1);
-        if (page.hasContents()) stripper.processPage(page);
-
         long[] work = {0};
+        try {
+            if (page.hasContents()) stripper.processPage(page);
+        } finally {
+            charge[0] += stripper.collected().size();
+        }
+
         List<TextPosition> positions = stripper.collected();
-        for (List<CellRect> comp : tables) {
-            fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, workBudget);
+        try {
+            for (List<CellRect> comp : tables) {
+                fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, workBudget);
+            }
+        } finally {
+            charge[0] += work[0];
         }
         // Returned (not just used) so extractLatticePage can hand the SAME glyphs to the
         // over-clumped-cell split pass without a second content-stream walk. Callers that only
@@ -2042,10 +2252,12 @@ final class TableExtractor {
      * path existed -- no stream stage runs, {@link #arbitrate} is never called, and the emitted
      * candidate list, its ordering and {@link Result#truncated} are all unchanged. The default is
      * off because the measured quality of the whitespace path, while competitive
-     * (document-pooled ICDAR-2013 adjacency macro F1 0.8079 end-to-end for the arbitrated
-     * pipeline, against 0.4718 for tagged+lattice alone), sits below the best heuristic extractors,
-     * the arbitration gain depends on how many borderless tables a corpus actually contains, and it
-     * raises the full-pipeline false-positive rate on real-world prose PDFs from 0.105 to 0.125.
+     * (document-pooled ICDAR-2013 adjacency macro F1 0.8118 end-to-end for the arbitrated
+     * pipeline, against 0.5113 for tagged+lattice alone -- both all-pages, de-duplicated GT, on the
+     * corrected benchmark), sits below the best heuristic extractors, the arbitration gain depends on
+     * how many borderless tables a corpus actually contains, and it raises the full-pipeline
+     * false-positive rate on real-world prose PDFs from 0.0350 to 0.0650 (200 PDFs, measured under
+     * the shipping page selection this default actually runs).
      * For a security-triage tool run automatically on hostile input, emitting a table that is not
      * there is the worse failure, so the operator asks for this stage explicitly.
      *
@@ -2058,7 +2270,10 @@ final class TableExtractor {
      *       {@code MAX_STREAM_TABLES_PER_PAGE}) -- turning on the flag at most roughly doubles a
      *       page's worst case, it does not multiply the document's;</li>
      *   <li>the between-page interruption check still bounds a multi-page hostile document, and it
-     *       is checked before BOTH stages;</li>
+     *       is checked before BOTH stages -- and since {@link #MAX_LATTICE_DOC_WORK} exists, so does
+     *       a document-level bound on each stage independently ({@link #MAX_LATTICE_DOC_WORK} for
+     *       lattice, {@link #MAX_STREAM_PAGES_PER_DOC} for stream), which no longer relies on the
+     *       operator having passed a {@code --timeout} at all;</li>
      *   <li>{@link #arbitrate} is called ONCE for the whole document against ONE
      *       {@link #MAX_ARBITRATION_WORK} budget (never per page -- arbitration buckets by page
      *       internally, so per-page cost is already page-local), so it adds a single bounded
@@ -2072,9 +2287,27 @@ final class TableExtractor {
      */
     static Result extract(PDDocument doc, List<Integer> pagesToProcess,
                           Map<Integer, List<TextPosition>> positionsByPage, boolean streamTables) {
+        return extract(doc, pagesToProcess, positionsByPage, streamTables, MAX_LATTICE_DOC_WORK);
+    }
+
+    /**
+     * As above with an explicit document-level lattice work budget in place of {@link
+     * #MAX_LATTICE_DOC_WORK}. Package-private for tests only -- the same convention {@link
+     * #fillCellsFromPositions(List, List, int, float, float, long[], long)} and {@link
+     * #fillCellsByRegion(List, PDPage, Result, long, long)} already use, so the document-level cut
+     * can be pinned deterministically on a small fixture instead of by wall-clock scale. Production
+     * always calls the 4-arg form.
+     */
+    static Result extract(PDDocument doc, List<Integer> pagesToProcess,
+                          Map<Integer, List<TextPosition>> positionsByPage, boolean streamTables,
+                          long latticeDocWorkBudget) {
         Result result = new Result();
         List<TableHit> streamHits = streamTables ? new ArrayList<>() : null;
         int streamPagesRun = 0;
+        // Cumulative REAL lattice work across every page of this document, gated between pages
+        // against latticeDocWorkBudget (production: MAX_LATTICE_DOC_WORK).
+        long[] latticeWork = {0};
+        boolean latticeBudgetReported = false;
         try {
             extractTagged(doc, new HashSet<>(pagesToProcess), result);
         } catch (StackOverflowError e) {
@@ -2130,38 +2363,58 @@ final class TableExtractor {
                 result.truncated = true;
                 break;
             }
-            try {
-                extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result);
-            } catch (RulingOverflowException e) {
+            if (latticeWork[0] >= latticeDocWorkBudget) {
+                // DOCUMENT-LEVEL LATTICE BOUND (see MAX_LATTICE_DOC_WORK). Cut the document TAIL in
+                // page order: every page already processed keeps its (complete) tables, this page and
+                // every later one contribute nothing, and truncated surfaces the loss as
+                // tablesTruncated in report.json. Deliberately checked BETWEEN pages, never inside
+                // one: the per-page budgets already bound a single page, and stopping mid-page is the
+                // one thing this class never does (it would emit a partially-filled table).
+                //
+                // This gates ONLY the lattice stage. The stream stage below has its own independent
+                // document-level budget (MAX_STREAM_PAGES_PER_DOC) and keeps running, and tagged
+                // extraction has already completed for the whole document above.
                 result.truncated = true;
-                System.err.println("WARNING: table extraction skipped on page " + pageNum + " (ruling cap)");
-            } catch (StackOverflowError e) {
-                // Symmetric with extractTagged's own catch(StackOverflowError) above: this per-page
-                // lattice path calls page.getRotation()/getCropBox() directly (and, via
-                // collectRulings/RulingCollector.processPage, again through pdfbox's own
-                // PDFStreamEngine.initPage), both of which resolve inherited page attributes via
-                // PDPageTree.getInheritableAttribute -- real pdfbox-internal recursion with a cycle
-                // guard but NO depth cap (see extractTagged's catch for the full writeup). A page
-                // whose /Parent is wired into a pathologically deep (but acyclic) chain overflows
-                // the stack here, an Error that the catch(RulingOverflowException)/catch(Exception)
-                // below can NEVER see (Error is not an Exception) -- previously escaping this whole
-                // per-page loop entirely and crashing extract() (and so the worker) outright on a
-                // single hostile page, instead of degrading just that one page. Isolate the failure
-                // to this page only (mirroring selectKeptTables'/splitComponent's own per-component
-                // StackOverflowError isolation): flag truncated and let every other page in
-                // pagesToProcess still extract normally.
-                result.truncated = true;
-                System.err.println("WARNING: table extraction overflowed the stack on page " + pageNum
-                        + " (page skipped): " + e);
-            } catch (Exception e) {
-                // PR re-review P2 (consistency): same fix as extractTagged's own catch(Exception)
-                // above -- this used to leave result.truncated FALSE, unlike every sibling
-                // hostile-input cap on this per-page loop (RulingOverflowException/StackOverflowError
-                // just above), so a page whose lattice extraction failed (e.g. an IOException on a
-                // malformed content stream) was indistinguishable from a clean page with genuinely no
-                // tables. Flag it; the loop still continues to the next page as before.
-                result.truncated = true;
-                System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
+                if (!latticeBudgetReported) {
+                    latticeBudgetReported = true;
+                    System.err.println("WARNING: drawn-ruling (lattice) table extraction stopped at page "
+                            + pageNum + " of " + pagesToProcess.size() + " (document work cap "
+                            + latticeDocWorkBudget + " reached; charged " + latticeWork[0] + ")");
+                }
+            } else {
+                try {
+                    extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result, latticeWork);
+                } catch (RulingOverflowException e) {
+                    result.truncated = true;
+                    System.err.println("WARNING: table extraction skipped on page " + pageNum + " (ruling cap)");
+                } catch (StackOverflowError e) {
+                    // Symmetric with extractTagged's own catch(StackOverflowError) above: this per-page
+                    // lattice path calls page.getRotation()/getCropBox() directly (and, via
+                    // collectRulings/RulingCollector.processPage, again through pdfbox's own
+                    // PDFStreamEngine.initPage), both of which resolve inherited page attributes via
+                    // PDPageTree.getInheritableAttribute -- real pdfbox-internal recursion with a cycle
+                    // guard but NO depth cap (see extractTagged's catch for the full writeup). A page
+                    // whose /Parent is wired into a pathologically deep (but acyclic) chain overflows
+                    // the stack here, an Error that the catch(RulingOverflowException)/catch(Exception)
+                    // below can NEVER see (Error is not an Exception) -- previously escaping this whole
+                    // per-page loop entirely and crashing extract() (and so the worker) outright on a
+                    // single hostile page, instead of degrading just that one page. Isolate the failure
+                    // to this page only (mirroring selectKeptTables'/splitComponent's own per-component
+                    // StackOverflowError isolation): flag truncated and let every other page in
+                    // pagesToProcess still extract normally.
+                    result.truncated = true;
+                    System.err.println("WARNING: table extraction overflowed the stack on page " + pageNum
+                            + " (page skipped): " + e);
+                } catch (Exception e) {
+                    // PR re-review P2 (consistency): same fix as extractTagged's own catch(Exception)
+                    // above -- this used to leave result.truncated FALSE, unlike every sibling
+                    // hostile-input cap on this per-page loop (RulingOverflowException/StackOverflowError
+                    // just above), so a page whose lattice extraction failed (e.g. an IOException on a
+                    // malformed content stream) was indistinguishable from a clean page with genuinely no
+                    // tables. Flag it; the loop still continues to the next page as before.
+                    result.truncated = true;
+                    System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
+                }
             }
             if (streamHits != null) {
                 if (streamPagesRun >= MAX_STREAM_PAGES_PER_DOC) {
@@ -2171,6 +2424,7 @@ final class TableExtractor {
                 }
             }
         }
+        result.latticeWorkCharged = latticeWork[0];
         result.tables.sort(java.util.Comparator
                 .<TableHit>comparingInt(t -> t.page)
                 .thenComparingDouble(t -> t.bbox == null ? 0 : t.bbox[1]));
@@ -2305,8 +2559,15 @@ final class TableExtractor {
         return out;
     }
 
-    private static void extractLatticePage(PDDocument doc, int pageNum,
-                                           List<TextPosition> positions, Result result) throws IOException {
+    /**
+     * ADDS every unit of real work this page charged to {@code charge[0]}, which {@link #extract}
+     * carries across the document and gates against {@link #MAX_LATTICE_DOC_WORK}. Charging is by
+     * {@code finally} at every stage, so a page that ABORTS on one of its own per-page caps is still
+     * charged for the work it forced before aborting -- the alternative (charging only pages that
+     * completed) would let a document of aborting pages ride for free, which is exactly the attack.
+     */
+    private static void extractLatticePage(PDDocument doc, int pageNum, List<TextPosition> positions,
+                                           Result result, long[] charge) throws IOException {
         if (pageNum < 1 || pageNum > doc.getNumberOfPages()) return;
         PDPage page = doc.getPage(pageNum - 1);
         int rotation = page.getRotation();
@@ -2314,12 +2575,12 @@ final class TableExtractor {
         float unrotatedW = cropBox.getWidth();
         float unrotatedH = cropBox.getHeight();
 
-        List<Ruling> rulings = normalize(collectRulings(page));
+        List<Ruling> rulings = normalize(collectRulings(page, charge), charge);
         if (rulings.isEmpty()) return;
         List<Ruling> horiz = new ArrayList<>();
         List<Ruling> vert = new ArrayList<>();
         for (Ruling r : rulings) (r.horizontal() ? horiz : vert).add(r);
-        List<CellRect> cells = findCells(horiz, vert);
+        List<CellRect> cells = findCells(horiz, vert, charge);
         if (cells.isEmpty()) return;
 
         // Decide which components actually become tables (geometry only - buildTable(...) here
@@ -2334,7 +2595,8 @@ final class TableExtractor {
         // MAX_CELLS_PER_TABLE / MAX_TABLES_PER_PAGE gates below, so each resulting sub-table is
         // gated on its own true size/count) detects that case and emits the maximal coherent
         // sub-grids instead of one bogus merged grid.
-        List<List<CellRect>> kept = selectKeptTables(groupIntoTables(cells), pageNum, result);
+        List<List<CellRect>> kept =
+                selectKeptTables(groupIntoTables(cells, charge), pageNum, result, charge);
 
         // The glyph list the cell text was actually filled from -- reused (read-only) by the
         // over-clumped-cell split pass in renderKeptTables so it can re-derive WORDS inside an
@@ -2344,15 +2606,20 @@ final class TableExtractor {
         List<TextPosition> filledFrom = null;
         if (positions != null && !positions.isEmpty()) {
             long[] work = {0};
-            for (List<CellRect> comp : kept) {
-                fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work);
+            try {
+                for (List<CellRect> comp : kept) {
+                    fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work);
+                }
+            } finally {
+                charge[0] += work[0];
             }
             filledFrom = positions;
         } else if (!kept.isEmpty()) {
-            filledFrom = fillCellsByRegion(kept, page, result);
+            filledFrom = fillCellsByRegion(kept, page, result, MAX_REGION_GLYPHS,
+                    MAX_TEXTFILL_WORK, charge);
         }
 
-        renderKeptTables(pageNum, kept, result, filledFrom, rotation, unrotatedW, unrotatedH);
+        renderKeptTables(pageNum, kept, result, filledFrom, rotation, unrotatedW, unrotatedH, charge);
     }
 
     /**
@@ -2396,6 +2663,19 @@ final class TableExtractor {
     static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result,
                                  List<TextPosition> positions, int rotation,
                                  float unrotatedW, float unrotatedH) {
+        renderKeptTables(pageNum, kept, result, positions, rotation, unrotatedW, unrotatedH, new long[1]);
+    }
+
+    /**
+     * As {@link #renderKeptTables(int, List, Result, List, int, float, float)}, additionally ADDING
+     * the over-clumped-cell split pass's real work (the {@link #MAX_CLUMP_SPLIT_WORK} counter,
+     * already shared across every table on the page) to {@code charge[0]} for the document-level
+     * lattice budget ({@link #MAX_LATTICE_DOC_WORK}). Observation only: the per-page clump budget is
+     * unchanged.
+     */
+    static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result,
+                                 List<TextPosition> positions, int rotation,
+                                 float unrotatedW, float unrotatedH, long[] charge) {
         long[] clumpWork = {0};
         for (List<CellRect> comp : kept) {
             try {
@@ -2431,6 +2711,7 @@ final class TableExtractor {
                 System.err.println("WARNING: table render skipped on page " + pageNum + " (grid-product cap)");
             }
         }
+        charge[0] += clumpWork[0];
     }
 
     /**
@@ -2854,6 +3135,18 @@ final class TableExtractor {
      * the tagged path.
      */
     static List<List<CellRect>> selectKeptTables(List<List<CellRect>> components, int pageNum, Result result) {
+        return selectKeptTables(components, pageNum, result, new long[1]);
+    }
+
+    /**
+     * As {@link #selectKeptTables(List, int, Result)}, additionally ADDING this call's real work to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}): the
+     * per-component {@link #splitComponent} grid-placement work (the {@link #MAX_SPLIT_WORK}
+     * counter), charged per component even when that component's split throws. The budget itself
+     * stays PER COMPONENT exactly as before -- {@code charge} only observes, it never gates.
+     */
+    static List<List<CellRect>> selectKeptTables(List<List<CellRect>> components, int pageNum,
+                                                 Result result, long[] charge) {
         List<List<CellRect>> kept = new ArrayList<>();
         int tablesOnPage = 0;
         pageLoop:
@@ -2864,7 +3157,7 @@ final class TableExtractor {
             }
             List<List<CellRect>> subComponents;
             try {
-                subComponents = splitComponent(comp);
+                subComponents = splitComponent(comp, charge);
             } catch (RulingOverflowException e) {
                 result.truncated = true;
                 System.err.println("WARNING: table split skipped on page " + pageNum + " (split-work cap)");

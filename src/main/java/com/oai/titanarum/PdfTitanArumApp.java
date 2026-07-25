@@ -241,11 +241,12 @@ private boolean skipQrScan;
      * rest on something the document itself asserts -- a {@code /Table} structure element, or lines
      * actually drawn on the page. The stream path infers a table from whitespace alone. Measured
      * end-to-end on ICDAR 2013 (document-pooled adjacency-relation macro F1, de-duplicated ground
-     * truth) the arbitrated three-path pipeline scores 0.8079 against 0.4718 for tagged+lattice
-     * alone -- a large gain, but still below the best heuristic extractors (TEXUS 0.8259, Nurminen
-     * 0.8374, FineReader 0.8772), the size of the gain depends on how many of a corpus's tables are
-     * borderless at all, and on a 200-PDF real-world prose sample it raises the rate of documents
-     * where the FULL pipeline emits at least one table from 0.105 to 0.125. For a tool that runs
+     * truth, all pages) the arbitrated three-path pipeline scores 0.8118 against 0.5113 for
+     * tagged+lattice alone -- a large gain, but still below the best heuristic extractors
+     * (TEXUS 0.8259, Nurminen 0.8374, FineReader 0.8772), the size of the gain depends on how many of
+     * a corpus's tables are borderless at all, and on a 200-PDF real-world prose sample it raises the
+     * rate of documents where the FULL pipeline emits at least one table from 0.0350 to 0.0650
+     * (measured under the shipping {@code --pages default} selection). For a tool that runs
      * automatically over untrusted, hostile PDFs in a triage sandbox, a table that is not really
      * there is the more expensive error, so this stays something an operator asks for.
      *

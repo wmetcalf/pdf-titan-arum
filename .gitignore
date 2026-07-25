@@ -38,3 +38,7 @@ AGENTS.md
 .venv/
 .superpowers/
 corpus/
+
+# Python bytecode
+__pycache__/
+*.py[cod]

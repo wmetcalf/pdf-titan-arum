@@ -151,3 +151,21 @@ def test_skip_tables_env_override(monkeypatch):
 
 def test_skip_tables_default_off():
     assert eng._DEFAULT_JOB["skip_tables"] is False
+
+
+def test_stream_tables_env_override(monkeypatch):
+    monkeypatch.setenv("TITANARUM_STREAM_TABLES", "1")
+    over = eng._env_param_overrides()
+    assert over["stream_tables"] is True
+
+
+def test_stream_tables_default_off():
+    # Borderless (whitespace-only) table extraction is OPT-IN: measured quality is below the best
+    # heuristic extractors and it raises the full-pipeline prose false-positive rate, so the
+    # conservative default for a triage engine is off. See README ("Borderless tables").
+    assert eng._DEFAULT_JOB["stream_tables"] is False
+
+
+def test_stream_tables_unset_is_not_injected(monkeypatch):
+    monkeypatch.delenv("TITANARUM_STREAM_TABLES", raising=False)
+    assert "stream_tables" not in eng._env_param_overrides()

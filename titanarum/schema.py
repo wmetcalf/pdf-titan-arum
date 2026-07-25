@@ -85,6 +85,9 @@ _SCHEMA: dict[str, Any] = {
         "renderedImages": _arr({"type": "object"}),
         "resourceImages": _arr({"type": "object"}),
         "pageTexts": _arr({"type": "object"}),
+        # Free-form objects, so no schema change was needed to surface the stream path's
+        # `confidence` (a float in [0,1], present ONLY on extractionMethod=="stream" hits and
+        # omitted entirely otherwise). Stated here because it was checked, not assumed.
         "tables": _arr({"type": "object"}),
         "tablesTruncated": _BOOL,
         "pageStats": _arr({"type": "object"}),

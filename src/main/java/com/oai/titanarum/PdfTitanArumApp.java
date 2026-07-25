@@ -234,6 +234,28 @@ private boolean skipQrScan;
     @Option(names = {"--skip-tables"}, defaultValue = "false", description = "Skip table extraction")
     private boolean skipTables;
 
+    /**
+     * Borderless ("stream") table extraction: OPT-IN, and deliberately so.
+     *
+     * <p>Tagged (structure-tree) and lattice (drawn-ruling) extraction are always on because both
+     * rest on something the document itself asserts -- a {@code /Table} structure element, or lines
+     * actually drawn on the page. The stream path infers a table from whitespace alone. Measured
+     * end-to-end on ICDAR 2013 (document-pooled adjacency-relation macro F1, de-duplicated ground
+     * truth) the arbitrated three-path pipeline scores 0.8079 against 0.4718 for tagged+lattice
+     * alone -- a large gain, but still below the best heuristic extractors (TEXUS 0.8259, Nurminen
+     * 0.8374, FineReader 0.8772), the size of the gain depends on how many of a corpus's tables are
+     * borderless at all, and on a 200-PDF real-world prose sample it raises the rate of documents
+     * where the FULL pipeline emits at least one table from 0.105 to 0.125. For a tool that runs
+     * automatically over untrusted, hostile PDFs in a triage sandbox, a table that is not really
+     * there is the more expensive error, so this stays something an operator asks for.
+     *
+     * <p>Orthogonal to {@code --skip-tables}, which disables ALL table extraction and wins.
+     */
+    @Option(names = {"--stream-tables"}, defaultValue = "false",
+            description = "Also extract borderless (whitespace-only) tables. Off by default: "
+                    + "lower precision than ruled/tagged extraction, so it is opt-in.")
+    private boolean streamTables;
+
     @Option(names = {"--skip-page-export"}, defaultValue = "false", description = "Skip per-page PDF export")
     private boolean skipPageExport;
 
@@ -268,6 +290,7 @@ private boolean skipQrScan;
     public void setSkipImages(boolean v)      { this.skipImages = v; }
     public void setSkipPhones(boolean v)      { this.skipPhones = v; }
     public void setSkipTables(boolean v)      { this.skipTables = v; }
+    public void setStreamTables(boolean v)    { this.streamTables = v; }
     public void setSkipPageExport(boolean v)  { this.skipPageExport = v; }
     public void setSkipTextUrls(boolean v)    { this.skipTextUrls = v; }
     public void setNoSkipBlanks(boolean v) { this.noSkipBlanks = v; }
@@ -797,7 +820,8 @@ private boolean skipQrScan;
                     posByPage.put(ptd.page(),
                             dedupeConsecutiveTextPositionRefs(ptd.stripper().positionsForRange(0, Integer.MAX_VALUE)));
                 }
-                TableExtractor.Result tablesResult = TableExtractor.extract(document, pagesToProcess, posByPage);
+                TableExtractor.Result tablesResult =
+                        TableExtractor.extract(document, pagesToProcess, posByPage, streamTables);
                 report.tables.addAll(tablesResult.tables);
                 if (tablesResult.truncated) report.tablesTruncated = Boolean.TRUE;
                 checkInterrupted();
@@ -5288,6 +5312,9 @@ for (int pageNum : pagesToProcess) {
             @JsonProperty("skip_images") boolean skipImages,
             @JsonProperty("skip_phones") boolean skipPhones,
             @JsonProperty("skip_tables") boolean skipTables,
+            /** Opt-in borderless ("stream") table extraction; see {@code --stream-tables}. Absent
+             *  in job.json means false, i.e. off, which is the shipping default. */
+            @JsonProperty("stream_tables") boolean streamTables,
             @JsonProperty("skip_page_export") boolean skipPageExport,
             @JsonProperty("skip_text_urls") boolean skipTextUrls,
             @JsonProperty("no_skip_blanks") boolean noSkipBlanks,
@@ -5362,6 +5389,7 @@ for (int pageNum : pagesToProcess) {
         setSkipImages(job.skipImages());
         setSkipPhones(job.skipPhones());
         setSkipTables(job.skipTables());
+        setStreamTables(job.streamTables());
         setSkipPageExport(job.skipPageExport());
         setSkipTextUrls(job.skipTextUrls());
         setNoSkipBlanks(job.noSkipBlanks());

@@ -74,6 +74,15 @@ _DEFAULT_JOB: dict[str, Any] = {
     "skip_images": False,
     "skip_phones": False,
     "skip_tables": False,
+    # Borderless ("stream") table extraction: OPT-IN. Tagged/lattice extraction rests on something
+    # the PDF itself asserts (a /Table structure element, or lines actually drawn); the stream path
+    # infers a table from whitespace alone. It is a large recall win on borderless tables
+    # (ICDAR-2013 pooled adjacency macro F1 0.8079 for the arbitrated pipeline vs 0.4718 for
+    # tagged+lattice alone) but sits below the best heuristic extractors, and on a 200-PDF
+    # real-world prose sample it raises the share of documents where the full pipeline emits at
+    # least one table from 0.105 to 0.125. For automatic triage of hostile PDFs a fabricated table
+    # is the more expensive error, so a caller enables this explicitly (TITANARUM_STREAM_TABLES=1).
+    "stream_tables": False,
     "skip_page_export": False,
     "skip_text_urls": False,
     "no_skip_blanks": False,
@@ -125,6 +134,7 @@ def _env_param_overrides() -> dict[str, Any]:
         ("TITANARUM_SKIP_IMAGES", "skip_images"),
         ("TITANARUM_SKIP_PHONES", "skip_phones"),
         ("TITANARUM_SKIP_TABLES", "skip_tables"),
+        ("TITANARUM_STREAM_TABLES", "stream_tables"),
         ("TITANARUM_SKIP_PAGE_EXPORT", "skip_page_export"),
         ("TITANARUM_SKIP_TEXT_URLS", "skip_text_urls"),
         ("TITANARUM_NO_SKIP_BLANKS", "no_skip_blanks"),

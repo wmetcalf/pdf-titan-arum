@@ -93,6 +93,7 @@ java -jar target/pdf-titan-arum-1.3.0.jar \
   [--skip-images]                 # skip drawn and resource image extraction
   [--skip-phones]                 # skip phone number extraction
   [--skip-tables]                 # skip table extraction (tables: [] in report.json)
+  [--stream-tables]               # ALSO extract borderless (whitespace-only) tables — opt-in, see below
   [--skip-page-export]            # skip per-page PDF export
   [--skip-text-urls]              # skip PDFTextStripper; only annotation URLs extracted (~370ms faster)
   [--no-skip-blanks]              # disable blank-page replacement; process original selection including blanks
@@ -408,6 +409,7 @@ keys are dropped before the allowlist). They map onto the same knobs as the CLI 
 | `TITANARUM_DPI` | render DPI (clamped to 1–600) | 150 |
 | `TITANARUM_PAGES` | page spec (`1-4,z`, `all`) | first 4 + last |
 | `TITANARUM_SKIP_QR` · `_SCREENSHOTS` · `_IMAGES` · `_PHONES` · `_TABLES` · `_PAGE_EXPORT` · `_TEXT_URLS` | disable a stage | off |
+| `TITANARUM_STREAM_TABLES` | **enable** borderless (whitespace-only) table extraction — see [Tables](#tables) for the measured quality and its limits | off |
 | `TITANARUM_OCR_SCREENSHOTS` · `_OCR_URL_CROPS` · `_OCR_LANG` | OCR toggles + language | off / `eng` |
 | `TITANARUM_NO_SKIP_BLANKS` · `_ADD_LINK_ANNOTATIONS` | blank-page + link-annotation behavior | off |
 | `TITANARUM_PASSWORD` | password for encrypted PDFs (cleared after the worker reads it) | — |
@@ -583,6 +585,61 @@ Four additional action types in a unified `actions[]` model:
 - libphonenumber extraction from visible page text and JavaScript content
 - E.164 normalisation, country code, geocode
 
+### Tables
+
+Three independent extraction paths feed `tables[]`, each tagging its hits with `extractionMethod`:
+
+| Path | `extractionMethod` | Evidence it rests on | Default |
+|---|---|---|---|
+| Tagged | `tagged` | the PDF's own structure tree (`/Table`, `/TR`, `/TD`) | **on** |
+| Lattice | `lattice` | rulings actually drawn on the page | **on** |
+| Stream | `stream` | whitespace alone — no rulings, no tags | **off** (`--stream-tables`) |
+
+When more than one path produces a candidate for the same region, a per-region arbitration picks one
+using extraction-time signals only (drawn-grid occupancy, row/column counts, and the stream path's own
+gridness confidence). A `tagged` candidate is never arbitrated away.
+
+#### Borderless tables are opt-in — and why
+
+`--stream-tables` (env `TITANARUM_STREAM_TABLES=1`, job field `stream_tables`) enables the whitespace
+path. It is **off by default**, deliberately. Measured on the ICDAR 2013 competition set
+(adjacency-relation F1, end-to-end, document-pooled, de-duplicated ground truth, macro over 77 units):
+
+| Configuration | Macro F1 |
+|---|---|
+| default (`tagged` + `lattice`) | 0.4718 |
+| `--stream-tables` (all pages scored) | **0.8111** |
+| `--stream-tables`, shipping `--pages default` (first 4 + last) | 0.7920 |
+| published comparators | TABFIND 0.6962 · Acrobat 0.7685 · TEXUS 0.8259 · Nurminen 0.8374 · FineReader 0.8772 |
+
+So it is a very large recall win — the corpus is full of borderless tables the ruled paths cannot see
+at all (`lattice`+`tagged` recall on that subset is 0.0000) — but it still lands below the best
+heuristic extractors, and the size of the gain depends entirely on how many of *your* documents have
+borderless tables. Against that, on a 200-PDF sample of real-world (phishing-corpus) PDFs, the share
+of documents where the pipeline emits **at least one table at all** rises:
+
+| | flag off | flag on |
+|---|---|---|
+| page 1 only | 0.1050 | 0.1250 |
+| shipping page selection (first 4 + last) | 0.1050 | 0.1300 |
+
+For a tool that runs unattended over untrusted, hostile PDFs, a table that is not really there costs
+more than a table that is missing — so the conservative default is off and an operator opts in.
+
+Stream hits carry a `confidence` float in `[0,1]` (omitted entirely on `tagged`/`lattice` hits), so a
+downstream consumer can filter them further.
+
+**Caveats, stated plainly.**
+- With `--skip-text-urls` the stream path produces nothing at all: it is glyph-only and has no
+  region-strip fallback (the lattice path does, and still works).
+- `--skip-tables` disables every path and wins over `--stream-tables`.
+- The stream stage runs on at most the first 64 pages of a document that it does real work on; past
+  that it stops and sets `tablesTruncated`. That bounds a hostile document's worst case at roughly
+  26s of whitespace analysis (measured 411ms for the most expensive page constructible) instead of
+  growing without limit. No real document in either measured sample exceeds 15 pages.
+- Turning the flag on roughly doubles table-extraction cost on real documents (measured p50 0.3ms →
+  0.4ms, p95 13.5ms → 17.9ms per document over 277 real PDFs).
+
 ### Page PDFs
 - Selected pages exported as individual single-page PDFs
 - SHA-256 per exported page
@@ -661,7 +718,7 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 | `resourceImages`  | array  | `ImageArtifact[]` (XObject resource images)          |
 | `pagePdfs`        | array  | `PagePdfArtifact[]`                                  |
 | `pageTexts`       | array  | Per-page extracted text (first N processed pages)    |
-| `tables`          | array  | `TableHit[]` — extracted tables (tagged-structure and ruled/lattice detection); empty if none or `--skip-tables` |
+| `tables`          | array  | `TableHit[]` — extracted tables (tagged-structure and ruled/lattice detection, plus borderless/whitespace detection with `--stream-tables`); empty if none or `--skip-tables`. `stream` hits carry a `confidence` float; see [Tables](#tables) |
 | `tablesTruncated` | bool   | `true` if table extraction hit an internal safety cap (omitted otherwise) |
 | `ocgLayers`       | array  | `OcgLayer[]` — optional content groups / hidden layers |
 | `formFields`      | array  | `FormFieldHit[]` — suspicious AcroForm fields (hidden, base64 payloads, Name value encoding) |

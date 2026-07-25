@@ -1725,6 +1725,119 @@ final class TableTestPdfs {
         }
     }
 
+    /**
+     * BORDERLESS (stream-path) fixture: one page, NO rulings at all, a 3-column numeric table
+     * (header + 4 data rows, 20pt pitch) that the whitespace path resolves cleanly and the
+     * lattice/tagged paths cannot see at all. Deliberately the same geometry
+     * {@code StreamSegmentationTest} already proves the stream path handles, so a wiring test can
+     * assert "the borderless table reaches report.json" without also re-litigating detection.
+     */
+    static void borderless3Col(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(new PDRectangle(300, 400));
+            doc.addPage(page);
+            String[][] data = {
+                {"Region", "Votes", "Pct"},
+                {"North", "1200", "41.2"},
+                {"South", "900", "30.9"},
+                {"East", "450", "15.4"},
+                {"West", "360", "12.5"}
+            };
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setFont(HELV, 11);
+                float[] colX = {40, 150, 230};
+                for (int r = 0; r < data.length; r++) {
+                    float y = 316 - r * 20;
+                    for (int c = 0; c < 3; c++) {
+                        cs.beginText();
+                        cs.setFont(HELV, 11);
+                        cs.newLineAtOffset(colX[c], y);
+                        cs.showText(data[r][c]);
+                        cs.endText();
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /** {@link #borderless3Col}, repeated on {@code pageCount} pages. Used to drive the stream
+     *  stage's document-level page budget without needing a huge file. */
+    static void borderless3ColManyPages(Path file, int pageCount) throws IOException {
+        String[][] data = {
+            {"Region", "Votes", "Pct"},
+            {"North", "1200", "41.2"},
+            {"South", "900", "30.9"},
+            {"East", "450", "15.4"},
+            {"West", "360", "12.5"}
+        };
+        try (PDDocument doc = new PDDocument()) {
+            for (int pg = 0; pg < pageCount; pg++) {
+                PDPage page = new PDPage(new PDRectangle(300, 400));
+                doc.addPage(page);
+                try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                    float[] colX = {40, 150, 230};
+                    for (int r = 0; r < data.length; r++) {
+                        float y = 316 - r * 20;
+                        for (int c = 0; c < 3; c++) {
+                            cs.beginText();
+                            cs.setFont(HELV, 11);
+                            cs.newLineAtOffset(colX[c], y);
+                            cs.showText(data[r][c]);
+                            cs.endText();
+                        }
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
+     * ARBITRATION fixture: one page carrying BOTH a fully ruled 3x3 grid (top) and, far below it
+     * with no rulings anywhere near, the borderless 3-column table of {@link #borderless3Col}. The
+     * two regions do not overlap, so arbitration must keep BOTH -- which is what makes this the
+     * right fixture for asserting that the wired pipeline's output equals
+     * {@code arbitrate(ruled, stream)} computed from the two paths run separately: any drop, any
+     * duplicate, or any per-path candidate that never reached the merge shows up as a mismatch.
+     */
+    static void ruledPlusBorderlessSamePage(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            String[][] data = {
+                {"Region", "Votes", "Pct"},
+                {"North", "1200", "41.2"},
+                {"South", "900", "30.9"},
+                {"East", "450", "15.4"},
+                {"West", "360", "12.5"}
+            };
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                cs.setLineWidth(0.75f);
+                for (float y : new float[]{700, 670, 640, 610}) line(cs, 50, y, 350, y);
+                for (float x : new float[]{50, 150, 250, 350}) line(cs, x, 700, x, 610);
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        text(cs, 55 + c * 100, 700 - 20 - r * 30, "R" + (r + 1) + "C" + (c + 1));
+                    }
+                }
+                // Borderless table, 300pt lower: no ruling within 300pt of it.
+                float[] colX = {60, 200, 300};
+                for (int r = 0; r < data.length; r++) {
+                    float y = 300 - r * 20;
+                    for (int c = 0; c < 3; c++) {
+                        cs.beginText();
+                        cs.setFont(HELV, 11);
+                        cs.newLineAtOffset(colX[c], y);
+                        cs.showText(data[r][c]);
+                        cs.endText();
+                    }
+                }
+            }
+            doc.save(file.toFile());
+        }
+    }
+
     /** Harvest all TextPositions on a 0-based page index (top-left-origin coords). */
     static java.util.List<org.apache.pdfbox.text.TextPosition> harvestGlyphs(
             org.apache.pdfbox.pdmodel.PDDocument doc, int pageIndex) throws java.io.IOException {

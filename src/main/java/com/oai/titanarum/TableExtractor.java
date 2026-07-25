@@ -49,6 +49,38 @@ final class TableExtractor {
 
     // Hostile-input bounds — over-cap drops the page/table and sets Result.truncated.
     static final int MAX_TABLES_PER_PAGE = 50;
+    /**
+     * Pages of ONE document the borderless ("stream") stage will run on before it stops and flags
+     * {@link Result#truncated}. Only relevant when that stage is enabled (see
+     * {@link #extract(PDDocument, List, Map, boolean)}); with it off nothing here runs.
+     *
+     * <p>WHY A DOCUMENT-LEVEL BOUND AT ALL. Every stream budget that existed before this stage was
+     * wired into production was PER PAGE. Measured (see {@code WiredDosProbe}), those per-page
+     * budgets do hold: the most expensive page that could be constructed -- a brick-offset word
+     * layout in which no two rows share a column boundary, so the gutter search can never terminate
+     * cheaply -- costs 411ms, and that figure is FLAT from 12,000 to 108,000 glyphs (at 108k the
+     * word/line caps abort the page early and it drops to 63ms). What was unbounded is the AGGREGATE:
+     * cost is linear in page count, 40 such pages measured at 15.5s, and {@code --timeout} defaults
+     * to 0 (no limit) on the CLI. So a hostile document could buy arbitrary stream work by simply
+     * being long.
+     *
+     * <p>SIZING, from measurements on real documents rather than taste. Across the 277 real PDFs this
+     * project measures on (the 77-unit ICDAR/tabula scoring corpus plus the 200-PDF real-world prose
+     * sample) the LONGEST document is 15 pages, and the deepest page index that ever produced a
+     * stream table is 14. The shipping page selection ({@code --pages default}) processes 5 pages.
+     * At 64 this budget is more than 4x the longest real document in either sample, so no real
+     * document measured here is affected, while the worst case a hostile document can buy from the
+     * stream stage is bounded at 64 x 411ms = ~26s instead of growing without limit.
+     *
+     * <p>WHAT THIS DELIBERATELY DOES NOT CLAIM. It leaves the stream stage MORE tightly bounded than
+     * the lattice path, whose own per-page cost (measured 157ms on a hostile page that drives
+     * {@link #MAX_TEXTFILL_WORK}) is still linear in page count with no document-level cap. That
+     * asymmetry is intentional for an OPT-IN stage on a lower-precision path: the conservative
+     * direction is to stop early and say so. A legitimate 100-page document with borderless tables
+     * past page 64 loses them, with {@code tablesTruncated} set in report.json -- missing a table
+     * loudly, which this threat model prefers to either fabricating one or hanging.
+     */
+    static final int MAX_STREAM_PAGES_PER_DOC = 64;
     static final int MAX_CELLS_PER_TABLE = 10_000;
     static final int MAX_RULINGS_PER_PAGE = 10_000;
     // Tagged-path RowSpan/ColSpan are attacker-controlled ints straight from the structure tree
@@ -1556,7 +1588,51 @@ final class TableExtractor {
      */
     static Result extract(PDDocument doc, List<Integer> pagesToProcess,
                           Map<Integer, List<TextPosition>> positionsByPage) {
+        return extract(doc, pagesToProcess, positionsByPage, false);
+    }
+
+    /**
+     * As {@link #extract(PDDocument, List, Map)}, plus the borderless ("stream") whitespace path
+     * when {@code streamTables} is true.
+     *
+     * <p>OPT-IN BY DESIGN, and the 3-arg overload above pins that: with {@code streamTables} false
+     * this method is bit-identical to the tagged+lattice pipeline that shipped before the stream
+     * path existed -- no stream stage runs, {@link #arbitrate} is never called, and the emitted
+     * candidate list, its ordering and {@link Result#truncated} are all unchanged. The default is
+     * off because the measured quality of the whitespace path, while competitive
+     * (document-pooled ICDAR-2013 adjacency macro F1 0.8079 end-to-end for the arbitrated
+     * pipeline, against 0.4718 for tagged+lattice alone), sits below the best heuristic extractors,
+     * the arbitration gain depends on how many borderless tables a corpus actually contains, and it
+     * raises the full-pipeline false-positive rate on real-world prose PDFs from 0.105 to 0.125.
+     * For a security-triage tool run automatically on hostile input, emitting a table that is not
+     * there is the worse failure, so the operator asks for this stage explicitly.
+     *
+     * <p>COMPOSITION OF BUDGETS (not multiplication). The stream stage runs inside the SAME per-page
+     * loop as lattice, so:
+     * <ul>
+     *   <li>every per-page budget is ADDITIVE per page -- lattice's ruling/cell/text-fill budgets
+     *       plus the stream path's own per-page caps ({@link StreamTableExtractor#MAX_STREAM_GLYPHS},
+     *       {@code MAX_STREAM_WORDS}, {@code MAX_STREAM_LINES}, {@code MAX_STREAM_PAGE_BLOCK_WORK},
+     *       {@code MAX_STREAM_TABLES_PER_PAGE}) -- turning on the flag at most roughly doubles a
+     *       page's worst case, it does not multiply the document's;</li>
+     *   <li>the between-page interruption check still bounds a multi-page hostile document, and it
+     *       is checked before BOTH stages;</li>
+     *   <li>{@link #arbitrate} is called ONCE for the whole document against ONE
+     *       {@link #MAX_ARBITRATION_WORK} budget (never per page -- arbitration buckets by page
+     *       internally, so per-page cost is already page-local), so it adds a single bounded
+     *       document-level term rather than a per-page one;</li>
+     *   <li>{@link #MAX_TABLES_PER_PAGE} is COMPOSED by {@link #capTablesPerPage}: the ceiling on
+     *       tables emitted for one page does not rise because a path was added.</li>
+     * </ul>
+     *
+     * <p>Never throws, for the same reason and by the same means as the 3-arg form: the stream stage
+     * is wrapped per page, and arbitration's own budget trip degrades to the drawn-ruling answer.
+     */
+    static Result extract(PDDocument doc, List<Integer> pagesToProcess,
+                          Map<Integer, List<TextPosition>> positionsByPage, boolean streamTables) {
         Result result = new Result();
+        List<TableHit> streamHits = streamTables ? new ArrayList<>() : null;
+        int streamPagesRun = 0;
         try {
             extractTagged(doc, new HashSet<>(pagesToProcess), result);
         } catch (StackOverflowError e) {
@@ -1645,11 +1721,146 @@ final class TableExtractor {
                 result.truncated = true;
                 System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
             }
+            if (streamHits != null) {
+                if (streamPagesRun >= MAX_STREAM_PAGES_PER_DOC) {
+                    result.truncated = true;
+                } else if (extractStreamPage(pageNum, positionsByPage.get(pageNum), streamHits, result)) {
+                    streamPagesRun++;
+                }
+            }
         }
         result.tables.sort(java.util.Comparator
                 .<TableHit>comparingInt(t -> t.page)
                 .thenComparingDouble(t -> t.bbox == null ? 0 : t.bbox[1]));
+
+        if (streamHits != null && !streamHits.isEmpty()) {
+            List<TableHit> merged;
+            try {
+                merged = arbitrate(new ArrayList<>(result.tables), streamHits);
+            } catch (RulingOverflowException e) {
+                // Arbitration's work budget tripped. This is unreachable on any legitimate document
+                // (see MAX_ARBITRATION_WORK: it needs ~8900 pages ALL saturating both per-page
+                // candidate caps), and was never observed on the 77-unit scoring corpus or the
+                // 200-PDF prose sample. Degrade the conservative way for a triage tool: keep the
+                // drawn-ruling/tagged answer and emit NO stream candidate at all. NOTE that this is
+                // deliberately NOT the bake-off harness's fallback (which reverts to the old
+                // positional merge, i.e. still emits non-overlapping stream hits) -- on hostile
+                // input, missing a table beats fabricating one. Because the branch cannot be reached
+                // on the corpus, it cannot account for any difference between the harness's measured
+                // number and this pipeline's.
+                result.truncated = true;
+                System.err.println("WARNING: table path arbitration truncated (work cap); "
+                        + "borderless candidates dropped for this document");
+                merged = new ArrayList<>(result.tables);
+            }
+            merged = capTablesPerPage(merged, result);
+            merged.sort(java.util.Comparator
+                    .<TableHit>comparingInt(t -> t.page)
+                    .thenComparingDouble(t -> t.bbox == null ? 0 : t.bbox[1]));
+            result.tables.clear();
+            result.tables.addAll(merged);
+        }
         return result;
+    }
+
+    /**
+     * Run the borderless ("stream") whitespace path for one page, appending its candidates to
+     * {@code out}. Isolated per page exactly like {@link #extractLatticePage}'s call site: one
+     * hostile page degrades to "no stream candidate for that page", never to a lost document.
+     *
+     * <p>{@code positions} may be null or empty ({@code --skip-text-urls} hands {@link #extract} an
+     * empty map). The stream path is glyph-only -- there is no region-strip fallback for it, because
+     * it has no drawn geometry to define a region with -- so it simply produces nothing, which is
+     * the correct answer rather than a fabricated one.
+     *
+     * <p>The glyph cap is checked HERE as well as inside {@link StreamTableExtractor#buildWords}:
+     * {@code extractPage} swallows its own {@link RulingOverflowException} and returns an empty
+     * list, so without this pre-check a glyph-bomb page would silently omit its tables with
+     * {@link Result#truncated} left false -- the one thing every other hostile-input cap in this
+     * class is careful to surface. The cap tested is the same constant, so no page's OUTPUT changes;
+     * only its reporting does.
+     *
+     * @return true when the whitespace detector actually ran for this page, i.e. when the page
+     *         consumed a unit of the document-level {@link #MAX_STREAM_PAGES_PER_DOC} budget. A page
+     *         with no glyphs, or one refused by the glyph cap, does no detection work and is
+     *         therefore not charged -- a document of blank pages must not spend a real document's
+     *         budget.
+     */
+    private static boolean extractStreamPage(int pageNum, List<TextPosition> positions,
+                                             List<TableHit> out, Result result) {
+        if (positions == null || positions.isEmpty()) return false;
+        if (positions.size() > StreamTableExtractor.MAX_STREAM_GLYPHS) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction skipped on page " + pageNum
+                    + " (glyph cap)");
+            return false;
+        }
+        try {
+            out.addAll(StreamTableExtractor.extractPage(pageNum, positions, new BreuelGutterFinder()));
+        } catch (RulingOverflowException e) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction skipped on page " + pageNum
+                    + " (work cap)");
+        } catch (StackOverflowError e) {
+            // Symmetric with the lattice path's own catch: an Error is not an Exception and would
+            // otherwise escape this whole loop and kill the worker on a single hostile page.
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction overflowed the stack on page "
+                    + pageNum + " (page skipped): " + e);
+        } catch (Exception e) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction failed on page " + pageNum + ": " + e);
+        }
+        return true;
+    }
+
+    /**
+     * COMPOSE {@link #MAX_TABLES_PER_PAGE} across extraction paths. Each path enforces the cap for
+     * itself (tagged and lattice at 50 in {@link #selectKeptTables} / {@code renderTaggedTables},
+     * stream at {@link StreamTableExtractor#MAX_STREAM_TABLES_PER_PAGE} = 20), so a naive union
+     * could emit more tables for one page than the documented ceiling merely because a path was
+     * added. This levies the ceiling on the MERGED list instead.
+     *
+     * <p>Overflow is always taken off the STREAM side. A drawn-ruling or tagged candidate is never
+     * dropped here, so with the stream stage off this method is a no-op pass-through and the shipping
+     * default's output is untouched; and with it on, the structure tree's own statement about the
+     * document (tagged) and the author's drawn geometry (lattice) still outrank a whitespace guess,
+     * consistent with {@link #arbitrate}'s own rule 1.
+     *
+     * <p>Returns {@code candidates} itself when nothing needs dropping (the overwhelmingly common
+     * case: the densest page measured across the scoring corpus carried 9 ruling + 4 stream
+     * candidates, and across 200 real-world prose PDFs 15 + 1). Sets {@link Result#truncated} when
+     * anything was dropped, like every other cap in this class.
+     */
+    static List<TableHit> capTablesPerPage(List<TableHit> candidates, Result result) {
+        Map<Integer, Integer> perPage = new HashMap<>();
+        boolean over = false;
+        for (TableHit t : candidates) {
+            int n = perPage.merge(t.page, 1, Integer::sum);
+            if (n > MAX_TABLES_PER_PAGE) { over = true; break; }
+        }
+        if (!over) return candidates;
+
+        List<TableHit> out = new ArrayList<>(candidates.size());
+        Map<Integer, Integer> kept = new HashMap<>();
+        // Pass 1: every non-stream candidate, in input order, unconditionally -- they are counted
+        // against the page's budget but never refused by it.
+        for (TableHit t : candidates) {
+            if ("stream".equals(t.extractionMethod)) continue;
+            out.add(t);
+            kept.merge(t.page, 1, Integer::sum);
+        }
+        // Pass 2: stream candidates, in input order, only while their page has room.
+        for (TableHit t : candidates) {
+            if (!"stream".equals(t.extractionMethod)) continue;
+            if (kept.getOrDefault(t.page, 0) >= MAX_TABLES_PER_PAGE) {
+                result.truncated = true;
+                continue;
+            }
+            out.add(t);
+            kept.merge(t.page, 1, Integer::sum);
+        }
+        return out;
     }
 
     private static void extractLatticePage(PDDocument doc, int pageNum,

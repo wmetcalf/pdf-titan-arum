@@ -52,6 +52,78 @@ class TableReportIntegrationTest {
         assertEquals(0, report.get("tables").size());
     }
 
+    // -------------------------------------------------------------- --stream-tables (opt-in)
+
+    @Test
+    void borderlessTableIsAbsentByDefault() throws Exception {
+        // The conservative default for a security-triage tool: borderless extraction is OFF, so a
+        // page with no rulings and no tags emits no table at all unless asked for.
+        Path pdf = tmp.resolve("borderless.pdf");
+        TableTestPdfs.borderless3Col(pdf);
+        JsonNode report = runApp(pdf, tmp.resolve("outS1"));
+        assertNotNull(report.get("tables"));
+        assertEquals(0, report.get("tables").size(),
+                "borderless extraction must be opt-in, not the default");
+    }
+
+    @Test
+    void streamTablesFlagSurfacesBorderlessTableWithConfidence() throws Exception {
+        Path pdf = tmp.resolve("borderless.pdf");
+        TableTestPdfs.borderless3Col(pdf);
+        JsonNode report = runApp(pdf, tmp.resolve("outS2"), "--stream-tables");
+        JsonNode tables = report.get("tables");
+        assertEquals(1, tables.size());
+        JsonNode t = tables.get(0);
+        assertEquals("stream", t.get("extractionMethod").asText());
+        assertEquals(3, t.get("colCount").asInt());
+        assertEquals(5, t.get("rowCount").asInt());
+        assertEquals("Region", t.get("rows").get(0).get(0).asText());
+        assertTrue(t.has("confidence"),
+                "downstream consumers must be able to filter stream tables by confidence");
+        double conf = t.get("confidence").asDouble();
+        assertTrue(conf > 0.0 && conf <= 1.0, "confidence must be a real probability, got " + conf);
+    }
+
+    @Test
+    void skipTablesBeatsStreamTables() throws Exception {
+        // --skip-tables disables ALL table extraction; the two flags are orthogonal and the skip
+        // wins, so an operator cannot re-enable a stage they just turned off.
+        Path pdf = tmp.resolve("borderless.pdf");
+        TableTestPdfs.borderless3Col(pdf);
+        JsonNode report = runApp(pdf, tmp.resolve("outS3"), "--stream-tables", "--skip-tables");
+        assertNotNull(report.get("tables"));
+        assertEquals(0, report.get("tables").size());
+    }
+
+    @Test
+    void streamTablesDoesNotDisturbRuledExtraction() throws Exception {
+        Path pdf = tmp.resolve("grid.pdf");
+        TableTestPdfs.ruled3x3(pdf);
+        JsonNode report = runApp(pdf, tmp.resolve("outS4"), "--stream-tables");
+        assertEquals(1, report.get("tables").size());
+        JsonNode t = report.get("tables").get(0);
+        assertEquals("lattice", t.get("extractionMethod").asText());
+        assertFalse(t.has("confidence"), "lattice tables must not grow a confidence field");
+    }
+
+    @Test
+    void streamTablesFlowsThroughTheJobDescriptor() throws Exception {
+        // The blastbox engine writes job.json; stream_tables must ride the same path skip_tables does.
+        String json = "{\"input_path\":\"/x\",\"output_dir\":\"/y\",\"stream_tables\":true}";
+        PdfTitanArumApp.JobDescriptor job =
+                new ObjectMapper().readValue(json, PdfTitanArumApp.JobDescriptor.class);
+        assertTrue(job.streamTables(), "job.json's stream_tables must bind to the descriptor");
+        PdfTitanArumApp app = new PdfTitanArumApp();
+        assertDoesNotThrow(() -> app.setStreamTables(job.streamTables()));
+    }
+
+    @Test
+    void jobDescriptorDefaultsStreamTablesOff() throws Exception {
+        PdfTitanArumApp.JobDescriptor job = new ObjectMapper()
+                .readValue("{\"input_path\":\"/x\"}", PdfTitanArumApp.JobDescriptor.class);
+        assertFalse(job.streamTables(), "absent stream_tables must mean OFF, never on");
+    }
+
     @Test
     void tablesStillExtractedWithSkipTextUrls() throws Exception {
         // region-strip fallback path through the real app

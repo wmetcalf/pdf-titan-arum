@@ -2269,14 +2269,6 @@ final class TableExtractor {
      * path existed -- no stream stage runs, {@link #arbitrate} is never called, and the emitted
      * candidate list, its ordering and {@link Result#truncated} are all unchanged. The default is
      * off because the measured quality of the whitespace path, while competitive
-<<<<<<< ours
-     * (document-pooled ICDAR-2013 adjacency macro F1 0.8118 end-to-end for the arbitrated
-     * pipeline, against 0.5113 for tagged+lattice alone -- both all-pages, de-duplicated GT, on the
-     * corrected benchmark), sits below the best heuristic extractors, the arbitration gain depends on
-     * how many borderless tables a corpus actually contains, and it raises the full-pipeline
-     * false-positive rate on real-world prose PDFs from 0.0350 to 0.0650 (200 PDFs, measured under
-     * the shipping page selection this default actually runs).
-=======
      * (document-pooled ICDAR-2013 adjacency macro F1 0.8118 end-to-end for the arbitrated pipeline
      * over all pages -- 0.7927 under the shipping page default -- against 0.5113 and 0.4938 for
      * tagged+lattice alone), sits below the best heuristic extractors, the arbitration gain depends
@@ -2284,7 +2276,6 @@ final class TableExtractor {
      * full pipeline emits a table on a real-world prose PDF from 0.0350 to 0.0650 on the project's
      * 200-PDF sample (0.0475 to 0.0826 over the whole 1,599-PDF population), both measured over the
      * pages the CLI default actually processes.
->>>>>>> theirs
      * For a security-triage tool run automatically on hostile input, emitting a table that is not
      * there is the worse failure, so the operator asks for this stage explicitly.
      *

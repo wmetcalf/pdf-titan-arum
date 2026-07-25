@@ -169,6 +169,57 @@ final class StreamTableExtractor {
     // O(obstacles) scan and the budget directly caps pop count at budget/obstacles regardless.
     static final long MAX_GUTTER_SCAN_WORK  = 500_000_000;
 
+    // Task 9l. Corpus decomposition (task-9k's own diagnosis, re-examined) found column
+    // UNDER-SPLITTING is 50% of all within-table false positives, and dumping the real geometry
+    // of the corpus's own technology/tabula/spanning_cells.pdf fixture found the actual
+    // mechanism: the true inter-column gaps there are ~11x medianSpace -- enormously wide,
+    // nothing to do with minGutterW -- but a spanning sub-header word crosses the gutter's
+    // x-range on a FEW rows, fragmenting the merged gutter's row-coverage bitset (see the
+    // "merged" / "mergedRows" loop above) below the row-coverage acceptance bar, so the whole
+    // gutter is rejected and the two columns merge. This directly contradicts the feature's own
+    // design intent (derive gutters from the MAJORITY of rows, treating a spanning cell as a
+    // colspan -- real structure -- not as proof the gutter is fake) and the whole reason a
+    // per-row-empty Breuel search was chosen over a whole-page whitespace projection (a gutter
+    // need only be empty over the rows it actually separates).
+    //
+    // Fix: a row is EXCLUDED from a merged gutter's coverage denominator (neither numerator nor
+    // denominator) if some word on that row STRADDLES the gutter's own finalized x-range (starts
+    // before its right edge and ends after its left edge) -- see the coverage computation in the
+    // final merge loop below. Such a row is not evidence against the boundary: every row NOT
+    // straddled is either accepted-clean (supports the gutter) or genuinely obstacle-crossing
+    // elsewhere (a real miss, still counted against it) -- straddling rows are simply neutral,
+    // matching the spec's own "colspan, not proof of one column" framing.
+    //
+    // Two guards keep this from ever inventing a gutter inside a genuinely single, undivided
+    // column (e.g. twoColumnProse, or a real single wide column with a few short/ragged lines
+    // creating incidental whitespace): both must hold before the exclusion applies at all;
+    // failing either falls back to scoring against the ORIGINAL full row count, i.e. exactly the
+    // pre-fix rule (which correctly rejects a real single column).
+    //
+    // GUTTER_MIN_NONSTRADDLING_ROWS_FOR_EXCLUSION: mirrors scoreGrid's own "rows < 3" minimum
+    // significance floor elsewhere in this file -- fewer than 3 non-straddling rows is too small
+    // a sample to trust a coverage fraction computed over it, regardless of how high that
+    // fraction is.
+    static final int GUTTER_MIN_NONSTRADDLING_ROWS_FOR_EXCLUSION = 3;
+    // GUTTER_MAX_STRADDLE_FRACTION_FOR_EXCLUSION: straddling rows must remain a MINORITY of the
+    // block's rows for the exclusion to apply. A real spanning sub-header interrupts a small
+    // handful of rows (spanning is the exception, not the rule); a genuine single, undivided
+    // column instead straddles on most/all of its rows. 0.50 is the natural minority/majority
+    // split -- measured directly against the reproduction fixture (task-9l's
+    // gutterSurvivesSpanningHeaderRows: 9/20 = 45% straddling rows, a minority, must be
+    // excluded and recover the gutter; StreamGutterTest's own diagnostic sweep confirmed the
+    // pre-fix rule flips from accept to reject exactly at the 60%-of-total-rows boundary as the
+    // straddling fraction crosses ~40-45%, i.e. well before it becomes a majority) and against
+    // twoColumnProse/the gridness+prose suite, which must still see zero straddling rows (a
+    // clean two-block prose page has no word crossing its own central gutter at all) and so are
+    // completely unaffected by this constant either way.
+    static final float GUTTER_MAX_STRADDLE_FRACTION_FOR_EXCLUSION = 0.50f;
+    // The original row-coverage acceptance bar (fraction of the EFFECTIVE row count -- i.e. of
+    // the full row count when the guards above disqualify exclusion, or of the non-straddling
+    // row count when they don't). Unchanged in VALUE from the pre-task-9l inline 0.60f -- see the
+    // task-9l report for the sensitivity check against alternative values.
+    static final float GUTTER_MIN_COVER_FRACTION = 0.60f;
+
     // Task 9k. Corpus-wide adjacency-F1 diagnosis (77-PDF ICDAR/tabula scoring set) decomposed
     // every false positive/negative for the production "breuel" finder: 88.8% of all FNs and
     // 56.7% of all FPs occur INSIDE tables already correctly located, i.e. the grid built
@@ -262,7 +313,6 @@ final class StreamTableExtractor {
         }
         final float bandH = yBot - yTop;
         final float minGutterW = Math.max(medianSpace, 1f);
-        final float minCover = 0.60f * lines.size();
 
         // best-first branch & bound
         PriorityQueue<Rect> pq = new PriorityQueue<>(
@@ -343,7 +393,45 @@ final class StreamTableExtractor {
         for (int i = 0; i < merged.size(); i++) {
             float[] m = merged.get(i);
             int cover = mergedRows.get(i).cardinality();
-            if (cover < minCover) continue;
+            // Task 9l: a row NOT covered by any accepted (obstacle-free) fragment might still be
+            // a legitimate spanning cell rather than real evidence against this boundary -- count
+            // how many of the block's rows have a word that STRADDLES this merged gutter's own
+            // finalized x-range [m[0], m[1]] (starts before its right edge, ends after its left
+            // edge). Note this is NOT guaranteed disjoint from "covered": mergedRows marks a row
+            // covered on ANY Y-overlap with an accepted rect (see the loop above), which can be a
+            // partial overlap against a row whose OWN content pokes into the gutter elsewhere in
+            // its height (verified directly against real corpus geometry, e.g.
+            // technology/tabula/spanning_cells.pdf, where one merged gutter measured cover=20,
+            // straddling=3 against only 21 total rows -- 2 rows counted as both). That is harmless
+            // here: coverFraction can then modestly exceed 1.0, which only makes the >=
+            // GUTTER_MIN_COVER_FRACTION check below even easier to satisfy for a row that is ALSO
+            // straddling on some other word -- it does not change what the check is testing
+            // (whether the genuinely-clean rows are a strong majority). Charged against the same
+            // MAX_GUTTER_SCAN_WORK budget as the search above -- this is a second, smaller, but
+            // still real O(rows x words-per-row) pass, so it must be bounded the same way.
+            int totalRows = lines.size();
+            int straddling = 0;
+            for (Line l : lines) {
+                for (Word w : l.words) {
+                    work++;
+                    if (work > MAX_GUTTER_SCAN_WORK) throw new TableExtractor.RulingOverflowException();
+                    if (w.x0 < m[1] && w.x1 > m[0]) { straddling++; break; }
+                }
+            }
+            int nonStraddling = totalRows - straddling;
+            // Exclude straddling rows from the denominator ONLY when both guards hold (see the
+            // GUTTER_MIN_NONSTRADDLING_ROWS_FOR_EXCLUSION / GUTTER_MAX_STRADDLE_FRACTION_FOR_
+            // EXCLUSION docs above); otherwise fall back to the original full-row-count fraction,
+            // which is exactly the pre-task-9l rule and correctly rejects a genuine single column.
+            double coverFraction;
+            if (straddling > 0
+                    && nonStraddling >= GUTTER_MIN_NONSTRADDLING_ROWS_FOR_EXCLUSION
+                    && straddling < GUTTER_MAX_STRADDLE_FRACTION_FOR_EXCLUSION * totalRows) {
+                coverFraction = nonStraddling > 0 ? (double) cover / nonStraddling : 0;
+            } else {
+                coverFraction = totalRows > 0 ? (double) cover / totalRows : 0;
+            }
+            if (coverFraction < GUTTER_MIN_COVER_FRACTION) continue;
             if (m[0] <= bandX0 + 0.5f || m[1] >= bandX1 - 0.5f) continue; // edge margin, not interior
             Gutter g = new Gutter(); g.x0 = m[0]; g.x1 = m[1]; g.rowsCovered = cover;
             gutters.add(g);

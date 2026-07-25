@@ -270,6 +270,59 @@ class StreamGutterTest {
         assertTrue(g.get(1).cx() > 85 && g.get(1).cx() < 88.5f, "gutter1 (narrow) between col1 and col2");
     }
 
+    /**
+     * Task 9l. Reproduces the real spanning_cells.pdf erosion mechanism found by the corpus
+     * decomposition: a wide, utterly unambiguous inter-column gutter is rejected because a
+     * spanning sub-header word crosses its x-range on a MINORITY of rows, fragmenting the
+     * gutter's vertical coverage below the 60%-of-all-rows acceptance bar -- even though the
+     * gutter is empty on every row the spanning word does NOT touch.
+     *
+     * <p>The branch-and-bound's OWN per-candidate quality gate ({@code r.h() &lt; 0.60*bandH},
+     * findGutters) has to be kept clearly satisfied so this test isolates the ROW-COVERAGE gate
+     * this task targets (the {@code cover &lt; minCover} check in the merge/filter step) rather
+     * than accidentally tripping over that unrelated, earlier gate: with uniform row spacing the
+     * two gates are numerically the same (a candidate's height fraction of the band equals its
+     * row-count fraction), so a naive "N spanning rows packed at one end, uniformly spaced"
+     * construction fails at the EARLIER per-candidate height gate before the coverage-merge step
+     * this fix touches is ever reached (verified directly: instrumenting both gates showed the
+     * uniform-spacing version rejects via GATE1, not the row-coverage merge). The fix here is
+     * non-uniform spacing that decouples the two: the 9 spanning rows are packed 1pt apart (their
+     * combined Y-extent is negligible), while the 11 clean rows are spaced 100pt apart (their Y
+     * extent dominates the band) -- so the accepted "clean" candidate rect's HEIGHT is ~91% of
+     * the band (comfortably clears the unrelated height gate) even though its ROW COUNT is only
+     * 11 of 20 total rows = 55%, just under the coverage bar this fix targets. Confirmed directly
+     * (temporary debug instrumentation, since removed) that pre-fix this rejects at the
+     * cover-vs-minCover check specifically (cover=11, minCover=12), not the height gate.
+     */
+    @Test
+    void gutterSurvivesSpanningHeaderRows() {
+        int span = 9, clean = 11;
+        List<StreamTableExtractor.Word> ws = new ArrayList<>();
+        float y = 0;
+        for (int r = 0; r < span; r++) {
+            ws.add(w(20, 140, y, "SpanningSubHeader")); // crosses both interior gutters
+            y += 10f; // packed tight (== word height, so buildLines never merges adjacent
+                      // spanning rows into one line) but still negligible combined Y-extent
+                      // next to the clean rows' 100pt spacing below
+        }
+        for (int r = 0; r < clean; r++) {
+            ws.add(w(10, 45, y, "Row" + r));
+            ws.add(w(70, 90, y, String.valueOf(r * 3)));
+            ws.add(w(130, 150, y, String.valueOf(r * 7)));
+            y += 100f; // spread wide: dominates the band's Y-extent
+        }
+        List<StreamTableExtractor.Line> lines = StreamTableExtractor.buildLines(ws, 10f);
+        int total = span + clean;
+        assertEquals(total, lines.size());
+        List<StreamTableExtractor.Gutter> g = StreamTableExtractor.findGutters(lines, 10, 150, 6f);
+        assertEquals(2, g.size(),
+            "expect 2 interior gutters -> 3 columns; a spanning sub-header word crossing the "
+                + "gutter on a MINORITY (9/20) of rows must not erode an otherwise-unanimous "
+                + "gutter boundary; got " + g.size());
+        assertTrue(g.get(0).cx() > 45 && g.get(0).cx() < 70, "gutter0 between col0 and col1");
+        assertTrue(g.get(1).cx() > 90 && g.get(1).cx() < 130, "gutter1 between col1 and col2");
+    }
+
     @Test
     void denseNumericTableYieldsAllColumns() {
         int rows = 40, cols = 11;

@@ -44,6 +44,7 @@ public class ApiRoutes {
                     boolForm(ctx, "skipImages"),
                     boolForm(ctx, "skipPhones"),
                     boolForm(ctx, "skipTables"),
+                    boolForm(ctx, "streamTables"),
                     boolForm(ctx, "skipPageExport"),
                     boolForm(ctx, "skipTextUrls"),
                     boolForm(ctx, "skipQr"),

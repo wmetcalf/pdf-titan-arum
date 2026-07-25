@@ -9,6 +9,9 @@
         <maven.compiler.target>25</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <server.test.exclude>**/LocalArtifactStoreTest.java</server.test.exclude>
+        <!-- Server-profile tests follow the Server*Test naming convention so one glob covers all
+             of them; both this and ${server.test.exclude} flip to a no-op under -Pserver. -->
+        <server.test.exclude2>**/Server*Test.java</server.test.exclude2>
         <jackson.version>2.19.0</jackson.version>
         <picocli.version>4.7.7</picocli.version>
         <pdfbox.version>3.0.8</pdfbox.version>
@@ -104,6 +107,7 @@
             <id>server</id>
             <properties>
                 <server.test.exclude>__nothing_to_exclude__</server.test.exclude>
+                <server.test.exclude2>__nothing_to_exclude__</server.test.exclude2>
             </properties>
             <build>
                 <finalName>pdf-titan-arum-server-${project.version}</finalName>
@@ -212,6 +216,7 @@
                     </compilerArgs>
                     <testExcludes>
                         <testExclude>${server.test.exclude}</testExclude>
+                        <testExclude>${server.test.exclude2}</testExclude>
                     </testExcludes>
                 </configuration>
             </plugin>
@@ -278,6 +283,7 @@
             <configuration>
                 <excludes>
                     <exclude>${server.test.exclude}</exclude>
+                    <exclude>${server.test.exclude2}</exclude>
                 </excludes>
                 <!-- turbojpeg JNI binding for the rosetta JPEG-decode parity tests (present on
                      Ubuntu via libturbojpeg-java at /usr/share/java/turbojpeg.jar; the tests

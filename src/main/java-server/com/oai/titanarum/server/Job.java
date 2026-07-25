@@ -20,6 +20,9 @@ public record Job(
     boolean skipImages,
     boolean skipPhones,
     boolean skipTables,
+    /** Opt-in borderless ("stream") table extraction; the server face of {@code --stream-tables}.
+     *  Orthogonal to {@link #skipTables()}, which disables ALL table extraction and wins. */
+    boolean streamTables,
     boolean skipPageExport,
     boolean skipTextUrls,
     boolean skipQr,

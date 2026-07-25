@@ -94,17 +94,7 @@ public class WorkerPool {
             repo.clearPassword(job.id());
 
             PdfTitanArumApp triageApp = new PdfTitanArumApp();
-            triageApp.setSkipScreenshots(job.skipScreenshots());
-            triageApp.setSkipImages(job.skipImages());
-            triageApp.setSkipPhones(job.skipPhones());
-            triageApp.setSkipTables(job.skipTables());
-            triageApp.setSkipPageExport(job.skipPageExport());
-            triageApp.setSkipTextUrls(job.skipTextUrls());
-            triageApp.setNoSkipBlanks(job.noSkipBlanks());
-            triageApp.setTimeout(job.timeoutSeconds() != null ? job.timeoutSeconds() : timeoutSeconds);
-            triageApp.setOcrScreenshots(job.ocrScreenshots());
-            triageApp.setOcrUrlCrops(job.ocrUrlCrops());
-            triageApp.setOcrLang(job.ocrLang() != null ? job.ocrLang() : ocrLang);
+            configureApp(triageApp, job, ocrLang, timeoutSeconds);
             float jobDpi = job.dpi() != null ? job.dpi() : 150f;
             String jobPages = job.pagesSpec() != null ? job.pagesSpec() : "default";
             PdfTitanArumApp.AnalysisReport report = triageApp.callWith(
@@ -146,6 +136,37 @@ public class WorkerPool {
                 System.err.println("Could not mark job failed: " + se.getMessage());
             }
         }
+    }
+
+    /**
+     * Copies every field-only option a {@link Job} carries onto a fresh {@link PdfTitanArumApp}.
+     *
+     * <p>This is the ONLY place the HTTP server's per-job options reach the triage app: unlike the
+     * blastbox file-IPC worker, this path never constructs a {@code JobDescriptor}, so the
+     * {@code @JsonProperty} bindings in {@code PdfTitanArumApp} are not involved and a flag that is
+     * missing here is silently dropped rather than defaulted loudly. Keep this block in step with
+     * {@code PdfTitanArumApp.runWorker}'s equivalent block; anything present there and absent here
+     * is a flag the server cannot express.
+     *
+     * <p>Extracted from {@link #processJob} (behaviour-preserving) so the wiring is testable without
+     * a database, an artifact store or a running worker loop.
+     *
+     * @param defaultOcrLang        pool-wide OCR language, used when the job does not override it
+     * @param defaultTimeoutSeconds pool-wide per-job timeout, used when the job does not override it
+     */
+    static void configureApp(PdfTitanArumApp app, Job job, String defaultOcrLang, int defaultTimeoutSeconds) {
+        app.setSkipScreenshots(job.skipScreenshots());
+        app.setSkipImages(job.skipImages());
+        app.setSkipPhones(job.skipPhones());
+        app.setSkipTables(job.skipTables());
+        app.setStreamTables(job.streamTables());
+        app.setSkipPageExport(job.skipPageExport());
+        app.setSkipTextUrls(job.skipTextUrls());
+        app.setNoSkipBlanks(job.noSkipBlanks());
+        app.setTimeout(job.timeoutSeconds() != null ? job.timeoutSeconds() : defaultTimeoutSeconds);
+        app.setOcrScreenshots(job.ocrScreenshots());
+        app.setOcrUrlCrops(job.ocrUrlCrops());
+        app.setOcrLang(job.ocrLang() != null ? job.ocrLang() : defaultOcrLang);
     }
 
     private static String sha256Hex(byte[] bytes) {

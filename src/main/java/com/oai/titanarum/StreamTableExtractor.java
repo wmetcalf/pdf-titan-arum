@@ -712,6 +712,37 @@ final class StreamTableExtractor {
     // nothing at all (full ALL-77 identical to baseline), while 0.35 starts admitting wide junk and
     // is worse on every corpus aggregate. 0.40 sits just below the lowest correct wide-table reject
     // measured on the corpus (0.405) and above the wide-junk population.
+    //
+    // ------------------------------------------------------------------ RE-CALIBRATION (Lever5RecalHarness)
+    //
+    // The sweep table above is STALE IN TWO WAYS and is kept only for its reasoning. It was measured
+    // (a) on the benchmark's old glyph feed, corrected in ec93b10, and (b) through the POSITIONAL
+    // merge, which stopped being the shipping pipeline when per-region arbitration landed -- its
+    // "full ALL-77" column scores a merge production no longer performs. The gate was therefore
+    // re-searched THROUGH ARBITRATION over a 100-point grid (narrow bar x wide-tier column threshold
+    // x wide bar), under the primary protocol, at both page scopes, with leave-one-document-out:
+    //
+    //   gate                       all-pages MACRO   shipping MACRO   prose FP (1599)   (200-sample)
+    //   cols>=7 @ 0.40, narrow .55   0.8118  <-argmax   0.7927 <-argmax   132 = 0.0826   13 = 0.0650
+    //   cols>=7 @ 0.40, narrow .60   0.8118             0.7927            126 = 0.0788   13 = 0.0650
+    //   cols>=7 @ 0.40, narrow .65   0.8020             0.7828            117 = 0.0732   12 = 0.0600
+    //   cols>=5 @ 0.40, narrow .55   0.8115             0.7924            132 = 0.0826   13 = 0.0650
+    //   FLAT 0.55 (no wide tier)     0.8056             0.7843            132 = 0.0826   13 = 0.0650
+    //   FLAT 0.60 (no wide tier)     0.8005             0.7792            126 = 0.0788   13 = 0.0650
+    //
+    // These three values are the STRICT in-sample argmax at BOTH page scopes and are tied for best in
+    // 75 of the 77 leave-one-out folds (leave-one-out 0.8044 all-pages / 0.7831 shipping). The wide
+    // tier still earns its keep: removing it (FLAT 0.55) costs 0.0062 MACRO for no false-positive
+    // benefit at all. NOTHING MOVED, so nothing here changed.
+    //
+    // ONE MEASURED PARETO CANDIDATE, deliberately NOT taken: narrow bar 0.60 with the same wide tier
+    // is POINTWISE IDENTICAL to 0.55 on all 77 corpus documents at both scopes (no corpus candidate
+    // scores in [0.55, 0.60), so the corpus cannot separate them) while rejecting 6 more prose false
+    // positives out of 1,599 -- 0.0826 -> 0.0788. It is a precision-only tightening in the direction
+    // this project's threat model prefers, but the corpus provides ZERO evidence for it either way,
+    // the tracked 200-PDF watch item does not move (13/200 both ways), and leave-one-out does not
+    // improve. It therefore needs its own decision and its own tests, not a silent ride on a
+    // recalibration that found nothing to change.
     static final int WIDE_GRID_MIN_COLS = 7;
     static final double STREAM_CONFIDENCE_MIN_WIDE = 0.40;
 

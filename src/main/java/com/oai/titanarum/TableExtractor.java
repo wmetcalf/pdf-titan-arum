@@ -344,9 +344,26 @@ final class TableExtractor {
     // The two bounds below close 14 of those 21 documents. Both are precision-only rules on the
     // "prefer MISSING a table over FABRICATING one" side of this project's hostile-input contract,
     // and both were chosen so that the reference corpus's document-pooled adjacency macro F1 does
-    // not move AT ALL -- verified byte-identical for lattice+tagged (0.4718) and for the full
-    // arbitrated pipeline (0.8079/micro 0.8003). Full-pipeline prose false-positive rate over the
-    // 200-PDF sample: 0.1250 -> 0.0600; lattice+tagged alone 0.1050 -> 0.0350.
+    // not move AT ALL -- verified byte-identical, AS MEASURED AT THE TIME, for lattice+tagged
+    // (0.4718) and for the full arbitrated pipeline (0.8079/micro 0.8003). Full-pipeline prose
+    // false-positive rate over the 200-PDF sample: 0.1250 -> 0.0600; lattice+tagged alone
+    // 0.1050 -> 0.0350.
+    //
+    // THOSE TWO CORPUS ENDPOINTS ARE HISTORICAL, NOT CURRENT. Until ec93b10 the benchmark fed the
+    // extractor a glyph stream that differed from production's in three ways (ordering, retention of
+    // empty-unicode glyphs, ligature per-char composition). The BOUNDS below are unchanged; only the
+    // instrument that measured them was. On the corrected instrument the same two configurations
+    // measure lattice+tagged 0.5113 and full+arbitration 0.8118 / micro 0.8030 over all pages, and
+    // 0.4938 and 0.7927 / micro 0.7476 under the shipping `--pages default`. The equality property
+    // itself ("these bounds cost nothing on the corpus") has NOT been re-measured on the corrected
+    // instrument -- only the absolute endpoints have -- so treat it as a claim about the old
+    // instrument until someone re-runs the on/off comparison.
+    //
+    // The prose rates above are PAGE 1 ONLY. Under the page selection the CLI actually defaults to
+    // (first four pages plus the last) the full pipeline's rate on the same 200-PDF sample is 0.0650
+    // with the flag on and 0.0350 with it off; over the whole 1,599-PDF population it is 0.0826 and
+    // 0.0475. The 200-PDF sample therefore UNDERSTATES the population rate -- quote it as a sample.
+    // Measured by BaselineHarness and, independently, by Lever5RecalHarness.
     //
     // THE FOUR FIGURES IN THE PARAGRAPH ABOVE ARE HISTORICAL and are left as measured, because the
     // claim they support is a no-change claim about the state of the harness at the time. The
@@ -2252,12 +2269,22 @@ final class TableExtractor {
      * path existed -- no stream stage runs, {@link #arbitrate} is never called, and the emitted
      * candidate list, its ordering and {@link Result#truncated} are all unchanged. The default is
      * off because the measured quality of the whitespace path, while competitive
+<<<<<<< ours
      * (document-pooled ICDAR-2013 adjacency macro F1 0.8118 end-to-end for the arbitrated
      * pipeline, against 0.5113 for tagged+lattice alone -- both all-pages, de-duplicated GT, on the
      * corrected benchmark), sits below the best heuristic extractors, the arbitration gain depends on
      * how many borderless tables a corpus actually contains, and it raises the full-pipeline
      * false-positive rate on real-world prose PDFs from 0.0350 to 0.0650 (200 PDFs, measured under
      * the shipping page selection this default actually runs).
+=======
+     * (document-pooled ICDAR-2013 adjacency macro F1 0.8118 end-to-end for the arbitrated pipeline
+     * over all pages -- 0.7927 under the shipping page default -- against 0.5113 and 0.4938 for
+     * tagged+lattice alone), sits below the best heuristic extractors, the arbitration gain depends
+     * on how many borderless tables a corpus actually contains, and it raises the rate at which the
+     * full pipeline emits a table on a real-world prose PDF from 0.0350 to 0.0650 on the project's
+     * 200-PDF sample (0.0475 to 0.0826 over the whole 1,599-PDF population), both measured over the
+     * pages the CLI default actually processes.
+>>>>>>> theirs
      * For a security-triage tool run automatically on hostile input, emitting a table that is not
      * there is the worse failure, so the operator asks for this stage explicitly.
      *
@@ -2880,10 +2907,28 @@ final class TableExtractor {
     // CALIBRATION. The four thresholds below were chosen by a grid search over the 77-unit ICDAR
     // scoring corpus and validated LEAVE-ONE-DOCUMENT-OUT (each document scored only with parameters
     // fitted on the other 76, so no document's own ground truth can influence the parameters it is
-    // judged by): in-sample MACRO 0.7991, leave-one-out 0.7841, against 0.6884 for the positional
-    // rule they replace and a 0.8189 ceiling for a per-region chooser that is allowed to consult
-    // ground truth. The same parameters won 75 of the 77 folds, so the optimum is a plateau rather
-    // than a spike. See ArbRuleHarness / ArbOracleHarness.
+    // judged by).
+    //
+    // RE-RUN ON THE CORRECTED INSTRUMENT (ec93b10 -- the search that first chose these values was run
+    // on a benchmark glyph feed that differed from production's). Same four-parameter family, a WIDER
+    // grid than the original (1080 points: occupancy x confidence x row-ratio x row-floor), scored
+    // under the primary protocol at BOTH page scopes, with the searched family pinned to production's
+    // own arbitrate() by an exact per-document parity control:
+    //
+    //                              all pages   shipping `--pages default`
+    //   positional rule replaced      0.7393                     0.7184
+    //   THESE PARAMETERS, in-sample   0.8118                     0.7927
+    //   leave-one-document-out        0.8010                     0.7819
+    //   ground-truth oracle ceiling   0.8315                     0.8100
+    //   fraction of the ceiling       78.7%                      81.1%
+    //
+    // These values are the in-sample argmax at BOTH scopes and are tied for best in 76 of the 77
+    // leave-one-out folds, so the optimum is a plateau rather than a spike. The only grid point tied
+    // with them differs in the row-coverage floor alone (0.65 rather than 0.75) and is POINTWISE
+    // IDENTICAL on all 77 documents -- no corpus region falls between those two floors, so the corpus
+    // cannot separate them and the more conservative 0.75 is kept. Leave-one-out is unchanged to four
+    // decimals whichever of the two is preferred. No parameter moved on the corrected instrument.
+    // See ArbRuleHarness / ArbOracleHarness / Lever5RecalHarness.
 
     /** Gridness confidence a stream candidate must reach before it can displace drawn rulings. */
     static final double ARB_MIN_STREAM_CONFIDENCE = 0.65;

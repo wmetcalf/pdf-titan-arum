@@ -638,6 +638,88 @@ final class StreamTableExtractor {
 
     static final double STREAM_CONFIDENCE_MIN = 0.55;
 
+    // ------------------------------------------------------------------ column-count-scaled bar
+    //
+    // MEASURED PROBLEM (gate-oracle measurement, 77-PDF corpus + 1,599 real-world PDFs). A single
+    // flat admission bar is mis-calibrated for wide grids, because scoreGrid's own terms move the
+    // WRONG WAY as the column count rises:
+    //
+    //   * the column-count credit, 0.15 * min(1, (cols-2)/2), SATURATES at cols=4. A 9-column grid
+    //     earns exactly as much for its column count as a 4-column one, even though nine columns
+    //     require EIGHT simultaneous full-height whitespace gutters -- a coincidence prose does not
+    //     produce, and by far the strongest structural evidence the stream path has;
+    //   * colConsistency actively PENALISES width: it counts a row as consistent only if at least
+    //     cols-1 of the cols columns are populated, so as cols grows the requirement grows with it
+    //     and any legitimately SPARSE wide table (blank cells -- extremely common in wide tables)
+    //     drives the term towards 0. Adding one CORRECT column raises the requirement from cols-1 to
+    //     cols and can therefore LOWER the confidence of a table that just got better, which is the
+    //     mechanism behind the "a correct improvement deleted the whole table" reports.
+    //
+    // Net effect: past ~5 columns the evidence rises while the score falls, so a bar tuned on narrow
+    // grids deletes correct wide ones. Measured on the corpus: correct 6-to-9-column tables scoring
+    // 0.405-0.516 were being deleted outright (eu-026 p4 and p6, eu-002 p1, eu-012 p4, us-012 p1,
+    // tabula/twotables p1).
+    //
+    // FIX: keep the 0.55 bar EXACTLY as it is for grids narrower than WIDE_GRID_MIN_COLS -- that is
+    // where the false-positive risk lives (ordinary 2-to-4-column prose, forms, nav bars, receipt
+    // headers) and it is doing its job -- and use a lower bar only from WIDE_GRID_MIN_COLS columns up.
+    //
+    // WHY NOT SIMPLY LOWER THE FLAT BAR (measured and rejected): a flat 0.40 bar reaches ALL-77 stream
+    // e2e MACRO 0.6486 but costs 68/1599 = 0.0425 real-world false positives against a 50/1599 =
+    // 0.0313 baseline. Almost every real-world look-alike a flat bar admits is a 3-or-4-column layout
+    // (receipt headers, forms, nav bars) -- exactly what the two-tier bar still rejects, at 53/1599 =
+    // 0.0331.
+    //
+    // WHY 7 COLUMNS AND 0.40 -- the measured sweep (POOLED official adjacency relations, de-duplicated
+    // GT, MACRO first; "full" = the shipped tagged+lattice+non-overlapping-stream combination):
+    //
+    //   gate              stream ALL-77   full ALL-77     borderless-22   real-world FP
+    //   flat 0.55         0.6260 / .7638  0.6822 / .7582  0.6836          50/1599 = 0.0313
+    //   cols>=5 @ 0.40    0.6488 / .7658  0.6824 / .7569  0.7042          54/1599 = 0.0338
+    //   cols>=6 @ 0.40    0.6488 / .7658  0.6824 / .7569  0.7042          54/1599 = 0.0338
+    //   cols>=7 @ 0.40    0.6344 / .7645  0.6884 / .7589  0.7053          53/1599 = 0.0331
+    //   cols>=8 @ 0.40    0.6323 / .7642  0.6861 / .7585  0.6976          53/1599 = 0.0331
+    //   cols>=7 @ 0.45    0.6282 / .7638  0.6822 / .7582  0.6836          52/1599 = 0.0325
+    //   cols>=7 @ 0.35    0.6254 / .7596  0.6861 / .7550  0.6985          53/1599 = 0.0331
+    //
+    // cols>=6 wins on stream-alone-over-all-77 but that configuration scores the stream path on the
+    // 55 documents where the lattice path already recovers the table, so it is diagnostic rather than
+    // a product configuration. On the two configurations that ARE the product -- the full pipeline,
+    // and the borderless subset where stream is the only path -- cols>=7 wins on MACRO *and* on micro
+    // *and* has the lower false-positive rate, so cols>=7 is the choice.
+    //
+    // The single document that decides 6 vs 7 is eu-002 p1: at 6 columns the gate admits a candidate
+    // that swallows five rows of running PROSE above the real table and chops them into six fake
+    // columns (confidence 0.451, adjacency precision 0.278). The lattice path already recovers that
+    // page's table at F1 0.9307, and the spurious block's relations flood the pooled multiset, taking
+    // the document to 0.4949. Requiring seven columns excludes it while keeping the wide tables that
+    // motivated the change (eu-026 p6 at 9 columns, confidence 0.405, precision 0.853; eu-026 p4 at
+    // 7 columns, 0.430, 0.659). Confidence alone cannot separate those -- the prose blob scores
+    // HIGHER than both -- so the column count is the only signal available that does.
+    //
+    // 0.40 rather than 0.35/0.45: 0.45 sits above the eu-026 candidates (0.405, 0.430) and recovers
+    // nothing at all (full ALL-77 identical to baseline), while 0.35 starts admitting wide junk and
+    // is worse on every corpus aggregate. 0.40 sits just below the lowest correct wide-table reject
+    // measured on the corpus (0.405) and above the wide-junk population.
+    static final int WIDE_GRID_MIN_COLS = 7;
+    static final double STREAM_CONFIDENCE_MIN_WIDE = 0.40;
+
+    /** The admission bar a grid with {@code cols} columns must clear. */
+    static double confidenceFloorFor(int cols) {
+        return cols >= WIDE_GRID_MIN_COLS ? STREAM_CONFIDENCE_MIN_WIDE : STREAM_CONFIDENCE_MIN;
+    }
+
+    /** Production admission decision for a scored grid. */
+    static boolean acceptsGrid(Grid grid) {
+        return grid.confidence >= confidenceFloorFor(grid.colBounds.length - 1);
+    }
+
+    /** The admission bar as a function of column count, so a diagnostic harness can substitute one.
+     *  Production always uses {@link #PRODUCTION_BAR}. */
+    interface ConfidenceBar { double barFor(int cols); }
+
+    static final ConfidenceBar PRODUCTION_BAR = StreamTableExtractor::confidenceFloorFor;
+
     // See the rationale comment at the violationScore computation in scoreGrid(): a small flat
     // plateau before the penalty ramp starts, tolerating the occasional straddling word that a
     // real wrapped-cell table produces without disqualifying it, while still ramping heavily
@@ -663,6 +745,13 @@ final class StreamTableExtractor {
         float[] colBounds;          // length cols+1: [bandX0, g0.cx, g1.cx, ..., bandX1]
         double confidence;
         boolean numericLeanColumn;
+
+        // DIAGNOSTIC ONLY. Recorded by scoreGrid so a harness can attribute a confidence to its
+        // terms; never read by production logic. hardReject names the all-or-nothing gate that
+        // zeroed the confidence, or is null when the graded formula produced it.
+        double tColConsistency, tViolation, tProse, tColCount, tNumeric, tProseColFrac;
+        int nCols, nRows, nNumericCols;
+        String hardReject;
     }
 
     static Grid scoreGrid(List<Line> lines, List<Gutter> gutters, float bandX0, float bandX1) {
@@ -674,7 +763,8 @@ final class StreamTableExtractor {
         bounds[0] = bandX0; bounds[cols] = bandX1;
         for (int i = 0; i < gutters.size(); i++) bounds[i + 1] = gutters.get(i).cx();
         grid.colBounds = bounds;
-        if (cols < 2 || rows < 3) { grid.confidence = 0; return grid; }
+        grid.nCols = cols; grid.nRows = rows;
+        if (cols < 2 || rows < 3) { grid.confidence = 0; grid.hardReject = "cols<2||rows<3"; return grid; }
 
         // gutter violations
         long words = 0, viol = 0;
@@ -747,8 +837,6 @@ final class StreamTableExtractor {
         double numericBonus = cols > 0 ? (double) numericCols / cols : 0;
         grid.numericLeanColumn = numericCols > 0;
 
-        if (cols == 2 && numericBonus == 0) { grid.confidence = 0; return grid; }
-
         // Prose hard veto (spec: "reject if median cell text fills >~85% of column width
         // and wraps across lines -- the two-column-prose signature"). The graded proseScore
         // term above is NOT sufficient on its own to enforce this: for a perfectly
@@ -804,8 +892,21 @@ final class StreamTableExtractor {
             if (colFillFrac > VETO_ROW_MAJORITY_FRACTION) proseColumns++;
         }
         double proseColumnFraction = cols > 0 ? (double) proseColumns / cols : 0;
+        grid.tColConsistency = colConsistency;
+        grid.tViolation = violationScore;
+        grid.tProse = proseScore;
+        grid.tColCount = Math.min(1, (cols - 2) / 2.0);
+        grid.tNumeric = numericBonus;
+        grid.tProseColFrac = proseColumnFraction;
+        grid.nNumericCols = numericCols;
+
+        // The two remaining ALL-OR-NOTHING gates. Deliberately applied AFTER every term above has
+        // been recorded on the Grid, so a diagnostic harness can see what a hard-rejected candidate
+        // would have graded at. Behaviour is unchanged: either gate still zeroes the confidence.
+        if (cols == 2 && numericBonus == 0) { grid.confidence = 0; grid.hardReject = "cols==2-nonnumeric"; return grid; }
         if (proseColumnFraction > VETO_COLUMN_MAJORITY_FRACTION && numericCols == 0) {
             grid.confidence = 0;
+            grid.hardReject = "prose-veto";
             return grid;
         }
 
@@ -1239,6 +1340,21 @@ final class StreamTableExtractor {
      * TableExtractor.RulingOverflowException} for this block: the caller must skip the block,
      * exactly as its own catch clause would have.
      */
+    /** DIAGNOSTIC ONLY. One scored block candidate, as handed to the confidence gate. Produced only
+     *  when a harness passes a sink to the 6-arg {@link #extractPage}; production never builds these. */
+    static final class Candidate {
+        final int page;
+        final double confidence;
+        final boolean passed;                       // did it clear the emit gate it was scored against?
+        final TableExtractor.TableHit hit;          // may be null (buildHit found no cells)
+        final Grid grid;
+        Candidate(int page, double confidence, boolean passed,
+                  TableExtractor.TableHit hit, Grid grid) {
+            this.page = page; this.confidence = confidence; this.passed = passed;
+            this.hit = hit; this.grid = grid;
+        }
+    }
+
     static final class BlockGroup {
         final List<Line> lines;
         final List<Gutter> gutters;                 // null = not precomputed; caller must find them
@@ -1265,9 +1381,11 @@ final class StreamTableExtractor {
      *  confidence (or -1 when the probe could not be completed -- overflowed, or trimmed away to
      *  fewer than 3 lines -- which always means "do not merge"). */
     private static final class Probe {
-        final List<Gutter> gutters; final double confidence;
-        Probe(List<Gutter> gutters, double confidence) { this.gutters = gutters; this.confidence = confidence; }
-        static final Probe FAILED = new Probe(null, -1);
+        final List<Gutter> gutters; final double confidence; final int cols;
+        Probe(List<Gutter> gutters, double confidence, int cols) {
+            this.gutters = gutters; this.confidence = confidence; this.cols = cols;
+        }
+        static final Probe FAILED = new Probe(null, -1, 0);
     }
 
     /** Runs exactly the per-block detection stages {@link #extractPage} runs (band -> finder ->
@@ -1278,10 +1396,11 @@ final class StreamTableExtractor {
         try {
             float[] b = bandOf(block);
             List<Gutter> gutters = finder.find(block, b[0], b[1], medianSpace);
-            if (block.size() < 3) return new Probe(gutters, -1);
+            if (block.size() < 3) return new Probe(gutters, -1, gutters.size() + 1);
             List<Line> trimmed = trimEdgeLines(block, gutters, b[0], b[1], medianSpace);
-            if (trimmed.size() < 3) return new Probe(gutters, -1);
-            return new Probe(gutters, scoreGrid(trimmed, gutters, b[0], b[1]).confidence);
+            if (trimmed.size() < 3) return new Probe(gutters, -1, gutters.size() + 1);
+            Grid g = scoreGrid(trimmed, gutters, b[0], b[1]);
+            return new Probe(gutters, g.confidence, g.colBounds.length - 1);
         } catch (TableExtractor.RulingOverflowException e) {
             return Probe.FAILED;
         }
@@ -1309,6 +1428,11 @@ final class StreamTableExtractor {
         return mergeAgreeingBlocks(base, finder, medianSpace, medianPitch, MAX_BLOCK_MERGE_WORK);
     }
 
+    static List<BlockGroup> mergeAgreeingBlocks(List<List<Line>> base, GutterFinder finder,
+                                                float medianSpace, float medianPitch, long maxWork) {
+        return mergeAgreeingBlocks(base, finder, medianSpace, medianPitch, maxWork, PRODUCTION_BAR);
+    }
+
     /**
      * Step A': re-merge adjacent Step A blocks whose column model is continuous across the gap.
      * See the block comment above {@link #BLOCK_MERGE_MAX_GAP_FACTOR} for the evidence and the
@@ -1317,7 +1441,8 @@ final class StreamTableExtractor {
      * already validly computed -- i.e. the fail-safe is exactly pre-Step-A' behaviour.
      */
     static List<BlockGroup> mergeAgreeingBlocks(List<List<Line>> base, GutterFinder finder,
-                                                float medianSpace, float medianPitch, long maxWork) {
+                                                float medianSpace, float medianPitch, long maxWork,
+                                                ConfidenceBar mergeBar) {
         if (base.size() < 2) return unmerged(base, null);
 
         // Per-base-block column models. Sub-3-line blocks are never merge candidates (the
@@ -1326,7 +1451,7 @@ final class StreamTableExtractor {
         List<Probe> baseProbes = new ArrayList<>(base.size());
         long work = 0;
         for (List<Line> b : base) {
-            if (b.size() < 3) { baseProbes.add(new Probe(List.of(), -1)); continue; }
+            if (b.size() < 3) { baseProbes.add(new Probe(List.of(), -1, 0)); continue; }
             long cost = obstacleCountOf(b);
             if (work + cost > maxWork) return unmerged(base, baseProbes);   // budget out -> no merging
             work += cost;
@@ -1355,7 +1480,7 @@ final class StreamTableExtractor {
                 if (work + cost > maxWork) return unmerged(base, baseProbes);  // budget out -> no merging
                 work += cost;
                 Probe cand = probeBlock(candidate, finder, medianSpace);
-                if (cand.confidence >= STREAM_CONFIDENCE_MIN) {
+                if (cand.confidence >= mergeBar.barFor(cand.cols)) {
                     cur = candidate;
                     curProbe = cand;
                     if (nextProbe.gutters != null && refGutters != null
@@ -1419,6 +1544,22 @@ final class StreamTableExtractor {
      * couldn't be safely built at all.
      */
     static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs, GutterFinder finder) {
+        return extractPage(pageNum, glyphs, finder, PRODUCTION_BAR, PRODUCTION_BAR, null);
+    }
+
+    /**
+     * DIAGNOSTIC SEAM (measurement only; production always calls the 3-arg overload, which passes
+     * {@link #PRODUCTION_BAR} for both gates and a null sink).
+     *
+     * <p>{@code emitBar} is the gate the per-block loop applies before emitting a hit; {@code mergeBar}
+     * is the gate Step A' applies before accepting a merge. {@code sink}, when non-null, receives EVERY
+     * candidate the pipeline scored -- including the ones {@code emitBar} rejected -- so a harness can
+     * measure what the gate suppresses. Candidates are appended in page order; the hit inside a
+     * candidate is fully built (so it can be scored) regardless of whether it was emitted.
+     */
+    static List<TableExtractor.TableHit> extractPage(int pageNum, List<TextPosition> glyphs,
+                                                     GutterFinder finder, ConfidenceBar emitBar,
+                                                     ConfidenceBar mergeBar, List<Candidate> sink) {
         List<Word> words;
         List<Line> lines;
         try {
@@ -1433,7 +1574,8 @@ final class StreamTableExtractor {
         float medianSpace = 0.5f * medianFontSize(words);
 
         List<BlockGroup> blocks = mergeAgreeingBlocks(splitIntoBlocks(lines), finder, medianSpace,
-                                                      pageMedianPitch(lines));
+                                                      pageMedianPitch(lines), MAX_BLOCK_MERGE_WORK,
+                                                      mergeBar);
         List<TableExtractor.TableHit> hits = new ArrayList<>();
         long pageWork = 0;
 
@@ -1462,10 +1604,12 @@ final class StreamTableExtractor {
                 if (trimmed.size() < 3) continue;               // Step C left too little to be a table -> reject block
 
                 Grid grid = scoreGrid(trimmed, gutters, bandX0, bandX1);
-                if (grid.confidence < STREAM_CONFIDENCE_MIN) continue;
+                boolean pass = grid.confidence >= emitBar.barFor(grid.colBounds.length - 1);
+                if (!pass && sink == null) continue;
 
                 TableExtractor.TableHit hit = buildHit(pageNum, grid);
-                if (hit != null) hits.add(hit);
+                if (sink != null) sink.add(new Candidate(pageNum, grid.confidence, pass, hit, grid));
+                if (pass && hit != null) hits.add(hit);
             } catch (TableExtractor.RulingOverflowException e) {
                 // this block's own gutter search or cell-count cap blew its budget -- skip only
                 // this block (not the whole page), keeping whatever hits other blocks already

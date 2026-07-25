@@ -107,6 +107,8 @@ class BakeOffHarness {
         Map<String, Map<String, Double>> f1Matrix = new TreeMap<>();
         // pdf id -> finderName -> adjacency F1 (same shape, second metric)
         Map<String, Map<String, Double>> adjF1Matrix = new TreeMap<>();
+        // pdf id -> finderName -> OFFICIAL-definition adjacency F1 (third metric)
+        Map<String, Map<String, Double>> adjOffF1Matrix = new TreeMap<>();
 
         for (GutterFinder finder : finders) {
             FinderAgg agg = new FinderAgg(finder.name());
@@ -134,6 +136,13 @@ class BakeOffHarness {
                 agg.perPdfAdjF1.add(score.adjF1);
                 adjF1Matrix.computeIfAbsent(unit.id(), k -> new LinkedHashMap<>())
                         .put(finder.name(), score.adjF1);
+
+                agg.adjOffMatched += score.adjOffMatched;
+                agg.adjOffDetectedTotal += score.adjOffDetectedTotal;
+                agg.adjOffGtTotal += score.adjOffGtTotal;
+                agg.perPdfAdjOffF1.add(score.adjOffF1);
+                adjOffF1Matrix.computeIfAbsent(unit.id(), k -> new LinkedHashMap<>())
+                        .put(finder.name(), score.adjOffF1);
             }
         }
 
@@ -160,7 +169,8 @@ class BakeOffHarness {
                     + "prose_fp_rate section skipped.\n");
         }
 
-        String report = buildReport(units, corpus, aggs, f1Matrix, adjF1Matrix, skipNotes.toString());
+        String report = buildReport(units, corpus, aggs, f1Matrix, adjF1Matrix, adjOffF1Matrix,
+                skipNotes.toString());
         Files.createDirectories(REPORT_PATH.getParent());
         Files.writeString(REPORT_PATH, report, StandardCharsets.UTF_8);
 
@@ -192,7 +202,8 @@ class BakeOffHarness {
 
     record PdfScore(int tp, int fp, int fn, double f1, int pairedTables,
                              int dimsExactMatches, boolean detected, String error, double elapsedMs,
-                             int adjMatched, int adjDetectedTotal, int adjGtTotal, double adjF1) {}
+                             int adjMatched, int adjDetectedTotal, int adjGtTotal, double adjF1,
+                             int adjOffMatched, int adjOffDetectedTotal, int adjOffGtTotal, double adjOffF1) {}
 
     /**
      * Scores one (finder, PDF) cell per the bake-off protocol: run the full stream pipeline over
@@ -217,10 +228,13 @@ class BakeOffHarness {
         List<TableExtractor.TableHit> available = new ArrayList<>(run.hits());
         int tp = 0, fp = 0, fn = 0, paired = 0, dimsExact = 0;
         int adjMatched = 0, adjDetectedTotal = 0, adjGtTotal = 0;
+        int adjOffMatched = 0, adjOffDetectedTotal = 0, adjOffGtTotal = 0;
         for (GroundTruth.Table expected : unit.expected()) {
+            List<TableScore.GridCell> gtCells = TableScore.gridCellsFromGroundTruth(expected);
             if (available.isEmpty()) {
                 fn += nonEmptyCellCount(expected.rows());
                 adjGtTotal += TableScore.relationCount(expected.rows());
+                adjOffGtTotal += TableScore.officialRelationCount(gtCells, false, TableScore.Semantics.MULTISET);
                 continue;
             }
             TableExtractor.TableHit best = null;
@@ -245,10 +259,18 @@ class BakeOffHarness {
             adjMatched += adjResult.matched();
             adjDetectedTotal += adjResult.detectedTotal();
             adjGtTotal += adjResult.gtTotal();
+
+            TableScore.AdjResult adjOff = TableScore.scoreAdjacencyOfficial(
+                    gtCells, cellsOf(best), false, TableScore.Semantics.MULTISET);
+            adjOffMatched += adjOff.matched();
+            adjOffDetectedTotal += adjOff.detectedTotal();
+            adjOffGtTotal += adjOff.gtTotal();
         }
         for (TableExtractor.TableHit h : available) {
             fp += nonEmptyCellCount(h.rows);
             adjDetectedTotal += TableScore.relationCount(h.rows);
+            adjOffDetectedTotal += TableScore.officialRelationCount(
+                    cellsOf(h), false, TableScore.Semantics.MULTISET);
         }
 
         double precision = (tp + fp) == 0 ? 0.0 : (double) tp / (tp + fp);
@@ -259,8 +281,29 @@ class BakeOffHarness {
         double adjRecall = adjGtTotal == 0 ? 0.0 : (double) adjMatched / adjGtTotal;
         double adjF1 = adjMatched == 0 ? 0.0 : 2 * adjPrecision * adjRecall / (adjPrecision + adjRecall);
 
+        double adjOffP = adjOffDetectedTotal == 0 ? 0.0 : (double) adjOffMatched / adjOffDetectedTotal;
+        double adjOffR = adjOffGtTotal == 0 ? 0.0 : (double) adjOffMatched / adjOffGtTotal;
+        double adjOffF1 = adjOffMatched == 0 ? 0.0 : 2 * adjOffP * adjOffR / (adjOffP + adjOffR);
+
         return new PdfScore(tp, fp, fn, f1, paired, dimsExact, detected, run.error(), elapsedMs,
-                adjMatched, adjDetectedTotal, adjGtTotal, adjF1);
+                adjMatched, adjDetectedTotal, adjGtTotal, adjF1,
+                adjOffMatched, adjOffDetectedTotal, adjOffGtTotal, adjOffF1);
+    }
+
+    /** A detected table's cells as span-carrying {@link TableScore.GridCell}s, for the OFFICIAL
+     *  relation definition (see {@link TableScore#buildOfficialRelations}). Falls back to 1x1 cells
+     *  derived from the text grid if a hit carries no cell list. */
+    private static List<TableScore.GridCell> cellsOf(TableExtractor.TableHit h) {
+        if (h.cells == null || h.cells.isEmpty()) {
+            return TableScore.gridCellsFromRows(h.rows);
+        }
+        List<TableScore.GridCell> out = new ArrayList<>(h.cells.size());
+        for (TableExtractor.CellHit c : h.cells) {
+            out.add(new TableScore.GridCell(c.row, c.col,
+                    c.row + Math.max(1, c.rowSpan) - 1, c.col + Math.max(1, c.colSpan) - 1,
+                    c.text == null ? "" : c.text));
+        }
+        return out;
     }
 
     /** Mirrors TableScore's own non-empty-cell dedup ((row,col,normalizedText) key set) so
@@ -472,6 +515,12 @@ class BakeOffHarness {
         long adjMatched, adjDetectedTotal, adjGtTotal;
         final List<Double> perPdfAdjF1 = new ArrayList<>();
 
+        // Same metric under the OFFICIAL ICDAR 2013 relation definition (cell identity with spans,
+        // parallel-link dedup -- TableScore#buildOfficialRelations). Reported alongside, never
+        // instead of, the grid-derived columns so the correction's effect stays visible.
+        long adjOffMatched, adjOffDetectedTotal, adjOffGtTotal;
+        final List<Double> perPdfAdjOffF1 = new ArrayList<>();
+
         FinderAgg(String name) { this.name = name; }
 
         double microPrecision() { return (tp + fp) == 0 ? 0.0 : (double) tp / (tp + fp); }
@@ -498,6 +547,17 @@ class BakeOffHarness {
             return perPdfAdjF1.isEmpty() ? 0.0
                     : perPdfAdjF1.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
         }
+
+        double adjOffMicroPrecision() { return adjOffDetectedTotal == 0 ? 0.0 : (double) adjOffMatched / adjOffDetectedTotal; }
+        double adjOffMicroRecall()    { return adjOffGtTotal == 0 ? 0.0 : (double) adjOffMatched / adjOffGtTotal; }
+        double adjOffMicroF1() {
+            double p = adjOffMicroPrecision(), r = adjOffMicroRecall();
+            return (p + r) == 0 ? 0.0 : 2 * p * r / (p + r);
+        }
+        double adjOffMacroF1() {
+            return perPdfAdjOffF1.isEmpty() ? 0.0
+                    : perPdfAdjOffF1.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+        }
     }
 
     private static double percentile(List<Double> valuesIn, double p) {
@@ -513,15 +573,20 @@ class BakeOffHarness {
 
     private static String summaryTable(Map<String, FinderAgg> aggs, List<GutterFinder> finders, int totalUnits) {
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format("%-10s %6s %6s %6s %6s %8s %8s %8s %8s %9s %6s %4s %8s %8s %10s%n",
-                "finder", "microP", "microR", "microF1", "macroF1",
-                "adjP", "adjR", "adjF1", "adjMacF1",
+        // MACRO FIRST within every metric group: the published ICDAR 2013 figures are per-document
+        // averages, so macro is the number comparable to them. Micro follows.
+        sb.append(String.format("%-10s %9s %9s %8s %8s %9s %9s %9s %9s %8s %8s %8s %8s %9s %6s %4s %8s %8s %10s%n",
+                "finder", "adjOffMac", "adjOffF1", "adjOffP", "adjOffR",
+                "adjMacF1", "adjF1", "adjP", "adjR",
+                "macroF1", "microF1", "microP", "microR",
                 "dimsRate", "detRt", "err", "medMs", "p95Ms", "proseFP"));
         for (GutterFinder f : finders) {
             FinderAgg a = aggs.get(f.name());
-            sb.append(String.format("%-10s %6.3f %6.3f %6.3f %6.3f %8.3f %8.3f %8.3f %8.3f %9.3f %6.3f %4d %8.1f %8.1f %10s%n",
-                    a.name, a.microPrecision(), a.microRecall(), a.microF1(), a.macroF1(),
-                    a.adjMicroPrecision(), a.adjMicroRecall(), a.adjMicroF1(), a.adjMacroF1(),
+            sb.append(String.format("%-10s %9.3f %9.3f %8.3f %8.3f %9.3f %9.3f %9.3f %9.3f %8.3f %8.3f %8.3f %8.3f %9.3f %6.3f %4d %8.1f %8.1f %10s%n",
+                    a.name,
+                    a.adjOffMacroF1(), a.adjOffMicroF1(), a.adjOffMicroPrecision(), a.adjOffMicroRecall(),
+                    a.adjMacroF1(), a.adjMicroF1(), a.adjMicroPrecision(), a.adjMicroRecall(),
+                    a.macroF1(), a.microF1(), a.microPrecision(), a.microRecall(),
                     a.dimsExactRate(), a.detectionRate(totalUnits), a.errorCount,
                     a.medianMs(), a.p95Ms(),
                     Double.isNaN(a.proseFpRate) ? "n/a" : String.format("%.3f", a.proseFpRate)));
@@ -533,6 +598,7 @@ class BakeOffHarness {
                                        Map<String, FinderAgg> aggs,
                                        Map<String, Map<String, Double>> f1Matrix,
                                        Map<String, Map<String, Double>> adjF1Matrix,
+                                       Map<String, Map<String, Double>> adjOffF1Matrix,
                                        String notes) {
         List<GutterFinder> finders = List.of(
                 new BreuelGutterFinder(), new GapVotingGutterFinder(),
@@ -573,16 +639,27 @@ class BakeOffHarness {
 
         md.append("\n## Summary (per finder, across the full scoring set)\n\n");
         md.append("```\n").append(summaryTable(aggs, finders, units.size())).append("```\n");
-        md.append("\n`microP`/`microR`/`microF1`/`macroF1` are the EXACT-CELL metric ((row, col, "
+        md.append("\n**Columns are MACRO-FIRST within each metric group.** The published ICDAR 2013 "
+                + "figures are per-document averages, so the macro column is the one directly "
+                + "comparable to them; micro follows it.\n\n"
+                + "`adjOffMac`/`adjOffF1`/`adjOffP`/`adjOffR` are the ICDAR 2013 adjacency-relation "
+                + "metric under the **OFFICIAL relation definition** "
+                + "(`TableScore#buildOfficialRelations`): relations are derived from cells WITH "
+                + "SPANS and compared by cell identity, so a spanning cell is one cell (no "
+                + "self-relation from a span to itself) and a cell pair adjacent along several grid "
+                + "lines yields one relation (parallel-link dedup). **This is the corrected metric "
+                + "and the one to read.** `adjMacF1`/`adjF1`/`adjP`/`adjR` are the SAME metric under "
+                + "the older text-GRID relation derivation (`TableScore#scoreAdjacency`), retained "
+                + "so the effect of the definition change stays visible instead of silently "
+                + "re-baselining: the grid derivation charged us for an encoding difference, since "
+                + "`GroundTruth` repeats a spanning cell's text across every covered position while "
+                + "`TableHit#rows` puts it on the span anchor and blanks the rest. "
+                + "`macroF1`/`microF1`/`microP`/`microR` are the EXACT-CELL metric ((row, col, "
                 + "normalizedText) triples; see `TableScore#score`) -- unchanged from every prior "
-                + "bake-off run, for direct comparability. `adjP`/`adjR`/`adjF1`/`adjMacF1` are the "
-                + "ICDAR 2013 ADJACENCY-RELATION metric (`TableScore#scoreAdjacency`): translation- "
-                + "invariant, compares nearest-non-empty-neighbour relations between cell CONTENTS "
-                + "(RIGHT/DOWN, blanks skipped over) rather than absolute (row, col) position, so a "
-                + "global row/column offset (e.g. one phantom leading row) costs almost nothing. "
-                + "Both metrics are computed against the SAME greedy pairing, which is decided by "
-                + "exact-cell F1 only (see `BakeOffHarness#scoreUnit` javadoc) -- adjacency never "
-                + "gets to pick a different partner table. `dimsRate` = fraction of PAIRED tables "
+                + "bake-off run, for direct comparability. All three metrics are computed against "
+                + "the SAME greedy pairing, which is decided by exact-cell F1 only (see "
+                + "`BakeOffHarness#scoreUnit` javadoc) -- neither adjacency metric gets to pick a "
+                + "different partner table. `dimsRate` = fraction of PAIRED tables "
                 + "whose rowCount x colCount matched ground truth exactly. `detRt` = fraction of "
                 + "PDFs where >=1 stream table was produced. `err` = count of (finder,PDF) runs that "
                 + "threw. `proseFP` = fraction of the sampled real-world prose PDFs (page 1 only) "
@@ -633,7 +710,19 @@ class BakeOffHarness {
             md.append(" |\n");
         }
 
-        md.append("\n## Per-PDF x per-finder F1 (adjacency-relation)\n\n");
+        md.append("\n## Per-PDF x per-finder F1 (adjacency-relation, OFFICIAL definition)\n\n");
+        md.append("| PDF | breuel | gapvote | alignedge | occupancy |\n");
+        md.append("|---|---|---|---|---|\n");
+        for (Map.Entry<String, Map<String, Double>> e : adjOffF1Matrix.entrySet()) {
+            md.append("| ").append(e.getKey());
+            for (GutterFinder f : finders) {
+                Double v = e.getValue().get(f.name());
+                md.append(" | ").append(v == null ? "-" : String.format("%.3f", v));
+            }
+            md.append(" |\n");
+        }
+
+        md.append("\n## Per-PDF x per-finder F1 (adjacency-relation, legacy grid derivation)\n\n");
         md.append("| PDF | breuel | gapvote | alignedge | occupancy |\n");
         md.append("|---|---|---|---|---|\n");
         for (Map.Entry<String, Map<String, Double>> e : adjF1Matrix.entrySet()) {

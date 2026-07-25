@@ -28,8 +28,51 @@ public final class GroundTruth {
     private GroundTruth() {
     }
 
-    /** A single expected table, as rows of cell text. */
-    public record Table(List<List<String>> rows) {
+    /**
+     * One ICDAR-2013 {@code <cell>} as declared in a {@code *-str.xml}: its logical span
+     * ({@code startRow..endRow} x {@code startCol..endCol}, already shifted by its region's
+     * row/col-increment so it lands where it does in {@link Table#rows()}), its content, the
+     * 1-based PDF page its region declares, and its {@code <bounding-box>} rectangle.
+     *
+     * <p><b>Coordinate convention (important, and different from ours):</b> ICDAR bounding boxes
+     * are PDF user-space points with the origin at the page's BOTTOM-left and y increasing UPWARD,
+     * so {@code y1 < y2} means y1 is the box's BOTTOM and y2 its TOP. Everything on our side
+     * ({@code TableExtractor.TableHit#bbox}, {@code TextPosition#getYDirAdj}) is TOP-left origin
+     * with y increasing DOWNWARD. Converting one to the other therefore requires the page height
+     * and flips the two y values: {@code ourTop = pageHeight - icdarY2}, {@code ourBottom =
+     * pageHeight - icdarY1}. Callers must do that conversion; this record stores the raw ICDAR
+     * numbers verbatim so the conversion happens in exactly one place downstream.
+     *
+     * <p>{@code hasBox} is false when a cell carried no {@code <bounding-box>} element at all (none
+     * do in the shipped corpus -- all 14530 cells have one -- but a malformed file could omit it,
+     * and a geometry-consuming caller must be able to tell "no box" from "box at the origin").
+     */
+    public record Cell(int startRow, int startCol, int endRow, int endCol,
+                        String text, int page,
+                        float x1, float y1, float x2, float y2, boolean hasBox) {
+    }
+
+    /**
+     * A single expected table, as rows of cell text, plus (for ICDAR-sourced tables only) the
+     * declared {@link Cell}s behind that text.
+     *
+     * <p>{@code rows} is the EXPANDED text grid: a cell spanning several rows/columns has its
+     * content REPEATED into every position it covers (see {@link #scanCellsInto}). That expansion
+     * is what the exact-cell metric has always scored against and is deliberately unchanged.
+     * {@code cells} is the un-expanded truth -- one entry per declared cell, carrying its span --
+     * and is what the official ICDAR adjacency definition needs, because that definition treats a
+     * spanning cell as ONE cell (so it emits no relation from a spanning cell to itself, and emits
+     * at most one relation per ordered pair of cells). {@code cells} is EMPTY for CSV-sourced
+     * ground truth, which has no span information to recover; callers must fall back to deriving
+     * 1x1 cells from {@code rows} in that case (see {@code TableScore#gridCellsFromRows}).
+     */
+    public record Table(List<List<String>> rows, List<Cell> cells) {
+
+        /** CSV-sourced / hand-built table: text grid only, no declared cell geometry or spans. */
+        public Table(List<List<String>> rows) {
+            this(rows, List.of());
+        }
+
         public int rowCount() {
             return rows.size();
         }
@@ -149,6 +192,8 @@ public final class GroundTruth {
             "<cell\\b([^>]*)>", Pattern.DOTALL);
     private static final Pattern CONTENT = Pattern.compile(
             "<content>(.*?)</content>", Pattern.DOTALL);
+    private static final Pattern BOUNDING_BOX = Pattern.compile(
+            "<bounding-box\\b([^>]*)>", Pattern.DOTALL);
     private static final Pattern ATTR = Pattern.compile(
             "(\\S+)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')");
 
@@ -202,12 +247,15 @@ public final class GroundTruth {
         }
 
         Map<Long, String> grid = new LinkedHashMap<>();
+        List<Cell> cells = new ArrayList<>();
         int maxRow = -1;
         int maxCol = -1;
 
         if (regionStarts.isEmpty()) {
-            // No region wrapper: scan the whole chunk as one region, zero increment.
-            int[] mm = scanCellsInto(chunk, 0, 0, grid);
+            // No region wrapper: scan the whole chunk as one region, zero increment. No <region>
+            // means no page attribute either -- page 0 is the "unknown page" sentinel here (real
+            // ICDAR pages are 1-based), and a geometry-consuming caller must skip such cells.
+            int[] mm = scanCellsInto(chunk, 0, 0, 0, grid, cells);
             maxRow = Math.max(maxRow, mm[0]);
             maxCol = Math.max(maxCol, mm[1]);
         } else {
@@ -218,7 +266,8 @@ public final class GroundTruth {
                 Map<String, String> attrs = parseAttrs(regionAttrs.get(r));
                 int colInc = parseIntAttr(attrs, "col-increment", 0);
                 int rowInc = parseIntAttr(attrs, "row-increment", 0);
-                int[] mm = scanCellsInto(body, rowInc, colInc, grid);
+                int page = parseIntAttr(attrs, "page", 0);
+                int[] mm = scanCellsInto(body, rowInc, colInc, page, grid, cells);
                 maxRow = Math.max(maxRow, mm[0]);
                 maxCol = Math.max(maxCol, mm[1]);
             }
@@ -236,7 +285,7 @@ public final class GroundTruth {
             }
             rows.add(row);
         }
-        return new Table(rows);
+        return new Table(rows, List.copyOf(cells));
     }
 
     /** Finds where the next region's body should stop -- just reuses the next start's tag start. */
@@ -257,8 +306,15 @@ public final class GroundTruth {
      * (start-row+rowInc, start-col+colInc), expanding to any end-row/end-col
      * span by repeating the content across the spanned cells. Returns
      * {maxRowSeen, maxColSeen}.
+     *
+     * <p>Also appends one {@link Cell} per declared cell to {@code cellsOut} -- the UN-expanded
+     * view (span kept as a span, not repeated), carrying the cell's {@code <bounding-box>} and its
+     * region's declared 1-based {@code page}. The expanded {@code grid} is untouched in shape or
+     * content by this addition; {@code cellsOut} is purely additive information that was
+     * previously discarded.
      */
-    private static int[] scanCellsInto(String body, int rowInc, int colInc, Map<Long, String> grid) {
+    private static int[] scanCellsInto(String body, int rowInc, int colInc, int page,
+                                        Map<Long, String> grid, List<Cell> cellsOut) {
         int maxRow = -1;
         int maxCol = -1;
         Matcher cm = CELL_START.matcher(body);
@@ -292,6 +348,27 @@ public final class GroundTruth {
             int c0 = startCol + colInc;
             int r1 = Math.max(endRow, startRow) + rowInc;
             int c1 = Math.max(endCol, startCol) + colInc;
+
+            float bx1 = 0f, by1 = 0f, bx2 = 0f, by2 = 0f;
+            boolean hasBox = false;
+            Matcher bbM = BOUNDING_BOX.matcher(segment);
+            if (bbM.find()) {
+                Map<String, String> bb = parseAttrs(bbM.group(1));
+                Float ax1 = parseFloatAttr(bb, "x1");
+                Float ay1 = parseFloatAttr(bb, "y1");
+                Float ax2 = parseFloatAttr(bb, "x2");
+                Float ay2 = parseFloatAttr(bb, "y2");
+                if (ax1 != null && ay1 != null && ax2 != null && ay2 != null) {
+                    // Normalize so x1<=x2 and y1<=y2 regardless of how the file ordered them.
+                    bx1 = Math.min(ax1, ax2);
+                    bx2 = Math.max(ax1, ax2);
+                    by1 = Math.min(ay1, ay2);
+                    by2 = Math.max(ay1, ay2);
+                    hasBox = true;
+                }
+            }
+            cellsOut.add(new Cell(r0, c0, r1, c1, content, page, bx1, by1, bx2, by2, hasBox));
+
             for (int r = r0; r <= r1; r++) {
                 for (int c = c0; c <= c1; c++) {
                     grid.put(key(r, c), content);
@@ -364,6 +441,21 @@ public final class GroundTruth {
             map.put(name, value);
         }
         return map;
+    }
+
+    /** Returns null (rather than a sentinel) when the attribute is absent or unparseable, so a
+     *  partially-specified {@code <bounding-box>} is treated as "no box" rather than silently
+     *  contributing a zero coordinate to a region union. */
+    private static Float parseFloatAttr(Map<String, String> attrs, String name) {
+        String v = attrs.get(name);
+        if (v == null) {
+            return null;
+        }
+        try {
+            return Float.parseFloat(v.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private static int parseIntAttr(Map<String, String> attrs, String name, int fallback) {

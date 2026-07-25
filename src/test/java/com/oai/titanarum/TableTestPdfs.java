@@ -899,6 +899,93 @@ final class TableTestPdfs {
     }
 
     /**
+     * A tagged table AT RANK 2x2 (passes {@link TableExtractor#MIN_TAGGED_RANK}, so it is actually
+     * emitted) whose row-2/col-1 TD has the SAME sparse shape as {@link
+     * #taggedSparseTwoMcidCellPlusSeparateRuledTable}'s reproducer: one cell, /K listing TWO MCIDs
+     * whose glyphs are drawn far apart on the page ("A" near the top, "B" near the bottom). Unlike
+     * that fixture (rank 1x1, now rejected before emission), this one exists purely to cover the
+     * multi-MCID-concatenation behaviour itself end-to-end: a single TD referencing more than one
+     * MCID must have ALL of them concatenated into that cell's resolved text, not just the first.
+     * No dedup/IoU machinery is exercised here -- there is no separate ruled table on this page.
+     */
+    static void taggedTwoMcidCellRank2x2(Path file) throws IOException {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+
+            try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
+                COSDictionary dName = new COSDictionary();
+                dName.setInt(COSName.MCID, 0);
+                cs.beginMarkedContent(COSName.getPDFName("TH"), PDPropertyList.create(dName));
+                text(cs, 60, 700, "Name");
+                cs.endMarkedContent();
+
+                COSDictionary dQty = new COSDictionary();
+                dQty.setInt(COSName.MCID, 1);
+                cs.beginMarkedContent(COSName.getPDFName("TH"), PDPropertyList.create(dQty));
+                text(cs, 180, 700, "Qty");
+                cs.endMarkedContent();
+
+                // Sparse cell: TWO MCIDs, glyphs drawn far apart (top "A", bottom "B") -- the
+                // multi-MCID-concatenation reproducer, at a rank the extractor actually emits.
+                COSDictionary d2 = new COSDictionary();
+                d2.setInt(COSName.MCID, 2);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d2));
+                text(cs, 60, 670, "A");
+                cs.endMarkedContent();
+
+                COSDictionary d3 = new COSDictionary();
+                d3.setInt(COSName.MCID, 3);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d3));
+                text(cs, 480, 40, "B");
+                cs.endMarkedContent();
+
+                COSDictionary d4 = new COSDictionary();
+                d4.setInt(COSName.MCID, 4);
+                cs.beginMarkedContent(COSName.getPDFName("TD"), PDPropertyList.create(d4));
+                text(cs, 180, 670, "3");
+                cs.endMarkedContent();
+            }
+
+            PDStructureTreeRoot root = new PDStructureTreeRoot();
+            doc.getDocumentCatalog().setStructureTreeRoot(root);
+            PDStructureElement table = new PDStructureElement("Table", root);
+            table.setPage(page);
+            root.appendKid(table);
+
+            PDStructureElement tr0 = new PDStructureElement("TR", table);
+            tr0.setPage(page);
+            table.appendKid(tr0);
+            PDStructureElement thName = new PDStructureElement("TH", tr0);
+            thName.setPage(page);
+            thName.getCOSObject().setInt(COSName.K, 0);
+            tr0.appendKid(thName);
+            PDStructureElement thQty = new PDStructureElement("TH", tr0);
+            thQty.setPage(page);
+            thQty.getCOSObject().setInt(COSName.K, 1);
+            tr0.appendKid(thQty);
+
+            PDStructureElement tr1 = new PDStructureElement("TR", table);
+            tr1.setPage(page);
+            table.appendKid(tr1);
+            PDStructureElement tdSparse = new PDStructureElement("TD", tr1);
+            tdSparse.setPage(page);
+            // /K = [2, 3] -- ONE cell, TWO MCIDs, far apart -- the concatenation reproducer.
+            COSArray k = new COSArray();
+            k.add(COSInteger.get(2));
+            k.add(COSInteger.get(3));
+            tdSparse.getCOSObject().setItem(COSName.K, k);
+            tr1.appendKid(tdSparse);
+            PDStructureElement tdQtyVal = new PDStructureElement("TD", tr1);
+            tdQtyVal.setPage(page);
+            tdQtyVal.getCOSObject().setInt(COSName.K, 4);
+            tr1.appendKid(tdQtyVal);
+
+            doc.save(file.toFile());
+        }
+    }
+
+    /**
      * FIX 2 round-4 (post-review) reproducer: a STRUCTURALLY-REAL 9-cell tagged table (a genuine
      * 3x3 TR/TD grid, own MCID text in every cell -- unlike round-2/round-3's degenerate 1-cell
      * sparse-MCID reproducer) whose 9 cells are legitimately SPREAD across almost the entire page

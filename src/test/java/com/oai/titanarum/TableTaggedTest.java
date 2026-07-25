@@ -823,6 +823,34 @@ class TableTaggedTest {
     }
 
     @Test
+    void multiMcidTdConcatenatesAllReferencedFragmentsIntoOneCellText() throws Exception {
+        // Coverage gap (adversarial review, finding 1): the sparse-tagged-cell fixtures above build
+        // a TD whose /K lists two far-apart MCIDs, but their tagged tables are rank 1x1 and are now
+        // rejected by MIN_TAGGED_RANK before ever being emitted -- so nothing in the suite actually
+        // asserts on the resolved text of a multi-MCID cell any more. This fixture is rank 2x2 (a
+        // real TH/TH header row plus a TD/TD data row), so MIN_TAGGED_RANK lets it through, and its
+        // row-2/col-1 TD is the same "one cell, two MCIDs, far apart" shape ("A" near the top of the
+        // page, "B" near the bottom). The production behaviour under test is resolveCellText's use
+        // of collectGlyphs (which walks EVERY /K entry, not just the first) followed by joinText
+        // (which clusters far-apart glyphs onto separate lines): a single TD referencing multiple
+        // MCIDs must have every one of those fragments concatenated into that cell's text.
+        Path pdf = tmp.resolve("multi_mcid_cell.pdf");
+        TableTestPdfs.taggedTwoMcidCellRank2x2(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            TableExtractor.Result r = TableExtractor.extract(doc, List.of(1), Map.of());
+            assertEquals(1, r.tables.size(), "the rank-2x2 tagged table must be emitted: " + r.tables);
+            TableExtractor.TableHit tagged = r.tables.get(0);
+            assertEquals("tagged", tagged.extractionMethod);
+            assertEquals(2, tagged.rowCount);
+            assertEquals(2, tagged.colCount);
+            // cells is row-major: index 2 is row 1, col 0 -- the multi-MCID TD.
+            assertEquals("A\nB", tagged.cells.get(2).text,
+                    "a TD whose /K lists two far-apart MCIDs must concatenate BOTH fragments into "
+                            + "that cell's text, not just the first: " + tagged.cells.get(2).text);
+        }
+    }
+
+    @Test
     void spreadNineCellTaggedTableDoesNotSuppressDistinctNineCellRuledTable() throws Exception {
         // FIX 2 round-4 (post-review) reproducer: round-3's cell-count guard is bypassed by a
         // STRUCTURALLY-REAL 9-cell tagged table (a genuine 3x3 TR/TD grid, own MCID text in every

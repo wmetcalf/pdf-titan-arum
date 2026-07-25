@@ -505,6 +505,33 @@ final class TableExtractor {
         // fields see no change in shape for the common case.
         public Boolean likelyDuplicateOfTagged;
 
+        /**
+         * ADVISORY arbitration provenance, same contract as {@link #likelyDuplicateOfTagged}: set
+         * only on a candidate that WON a contested region in {@link #arbitrate}, so a consumer can
+         * tell that a fully-built, successfully-extracted candidate for this region was discarded on
+         * a quality judgement rather than there having been only one answer.
+         *
+         * <p>{@code displacedRuledCandidate} is set on a surviving STREAM hit that took its region
+         * from one or more drawn-ruling ("lattice") candidates; {@code displacedStreamCandidate} is
+         * set on a surviving RULED hit that kept its region against one or more stream candidates.
+         * Both are left null (and so omitted from report.json via the class's NON_NULL inclusion)
+         * whenever the region was never contested, which is the common case -- existing consumers
+         * that ignore unknown fields see no change in shape.
+         *
+         * <p>WHY THIS EXISTS. Arbitration is the only path in this class that discards a complete
+         * table on a QUALITY judgement rather than on a cap or an error. Every other drop path
+         * (extractTagged's three catches, the per-page lattice catches, the document lattice budget,
+         * extractStreamPage's caps, capTablesPerPage) surfaces itself through {@link
+         * Result#truncated}; arbitration used to be invisible, so a region whose correct table was
+         * arbitrated away was byte-identical in report.json to a region that had no table at all.
+         * {@link Result#truncated} now also fires (plus one WARNING per affected page), and these
+         * two flags say WHICH hit the surviving answer replaced.
+         */
+        public Boolean displacedRuledCandidate;
+
+        /** @see #displacedRuledCandidate */
+        public Boolean displacedStreamCandidate;
+
         /** Stream-path only: gridness confidence in [0,1]. null (omitted) for lattice/tagged. */
         public Double confidence;
     }
@@ -533,6 +560,13 @@ final class TableExtractor {
          * inferring it from wall-clock time.
          */
         long latticeWorkCharged = 0;
+        /**
+         * How many fully-built candidates {@link #arbitrate} discarded on this document because they
+         * lost a contested region. Not serialized (this class is internal) -- it exists so the tests
+         * and measurement probes can read the exact count through the real entry point instead of
+         * inferring it from {@link #truncated}, which many other paths also set.
+         */
+        int arbitrationDisplaced = 0;
     }
 
     // ---------------------------------------------------------------- views
@@ -2450,7 +2484,11 @@ final class TableExtractor {
         if (streamHits != null && !streamHits.isEmpty()) {
             List<TableHit> merged;
             try {
-                merged = arbitrate(new ArrayList<>(result.tables), streamHits);
+                // The 3-arg form: a candidate that LOSES a contested region is a fully-built table
+                // discarded on a quality judgement, and must be surfaced (result.truncated + one
+                // WARNING per affected page + an advisory marker on the winner) exactly as every
+                // other drop path in this class surfaces itself. See arbitrate's own javadoc.
+                merged = arbitrate(new ArrayList<>(result.tables), streamHits, result);
             } catch (RulingOverflowException e) {
                 // Arbitration's work budget tripped. This is unreachable on any legitimate document
                 // (see MAX_ARBITRATION_WORK: it needs ~8900 pages ALL saturating both per-page
@@ -2876,16 +2914,16 @@ final class TableExtractor {
     //
     // WHY THESE SIGNALS. A drawn grid is the better answer when the rulings really do form a grid
     // over the region. Three measurable ways they fail to:
-    //   1. GRID OCCUPANCY. rowCount x colCount declares a grid; cells.size() says how many of those
+    //   1. GRID OCCUPANCY. rowCount x colCount declares a grid; the cells say how many of those
     //      slots a ruling intersection actually produced. Partially ruled regions (a few long lines
     //      across a page, no interior verticals) declare a big grid and fill a fraction of it.
     //   2. A MISSED COLUMN SEPARATOR. Stream resolves strictly more columns: the rulings merged two
     //      columns that whitespace separates cleanly.
     //   3. UNDER-SEGMENTED ROWS. Stream resolves several times more rows in the same region: the
     //      rulings drew a handful of tall bands where there are many text rows.
-    // In all three the stream candidate must ALSO clear a gridness-confidence floor AND a
-    // row-coverage floor -- an unconfident whitespace guess never displaces drawn rulings, and a
-    // stream candidate that only read part of the region never takes the whole of it. Both are the
+    // In all three the stream candidate must ALSO clear a gridness-confidence floor AND row- and
+    // column-coverage floors -- an unconfident whitespace guess never displaces drawn rulings, and a
+    // stream candidate that only read part of the region never takes the whole of it. All are the
     // conservative direction: on hostile input, and on a table the rulings got right, the cost of
     // keeping the drawn grid is bounded, while the cost of handing the region to a partial answer is
     // silently losing content.
@@ -2894,6 +2932,49 @@ final class TableExtractor {
     // tree, i.e. the author's statement about their own table, which no geometric heuristic
     // outranks. (The scoring corpus contains zero tagged tables, so this is a safety rule chosen on
     // principle, not a measured one -- stated plainly rather than implied.)
+    //
+    // FOUR CORRECTNESS FIXES to the way the signals above are COMPUTED (all found by adversarial
+    // review with runnable probes against this function; none of them re-tunes a threshold):
+    //
+    //   F2 OCCUPANCY WAS SPAN-BLIND. buildTable emits ONE CellHit per MERGED cell carrying
+    //      rowSpan/colSpan, so `cells.size() / (rowCount*colCount)` under-counts a fully covered grid
+    //      the moment it has a merged title/header/TOTAL row. This class's own fixture
+    //      TableTestPdfs.mergedHeader -- a COMPLETE ruled 2x2 asserted correct by
+    //      TableLatticeTest#mergedHeaderProducesColSpan2 -- scored 3/4 = 0.750, below the 0.80 floor,
+    //      and so lost to any 2-row stream guess at confidence >= 0.65. Coverage is now
+    //      sum(rowSpan*colSpan) clamped to the declared slot count, which is 1.000 for that fixture.
+    //
+    //   F4 OCCUPANCY WAS POOLED ACROSS THE COMPONENT. declaredSlots/actualCells used to be SUMMED
+    //      over every ruled member and one pooled ratio decided the whole component. declaredSlots is
+    //      quadratic in a junk fragment's declared shape, so a single bad fragment dominated the
+    //      denominator and condemned every correct table transitively chained to it through the
+    //      contest graph (demonstrated: a 5-node chain in which two PERFECT tables were dropped for a
+    //      pooled 0.417). The occupancy clause is now decided PER CANDIDATE and fires only when EVERY
+    //      ruled member of the component is itself partially ruled -- a correct table can no longer be
+    //      condemned by a neighbour's occupancy.
+    //
+    //   F3 THE RULED SIDE MIXED max WITH THE STREAM SIDE'S TOTALS. ruledRows was Math.max over the
+    //      ruled members, so when the rulings split one region into K fragments -- exactly the case
+    //      the component traversal exists to handle -- both the row-coverage floor and the
+    //      under-segmentation ratio compared the stream side's whole-region row count against ONE
+    //      fragment's, and fired mechanically as K grew (demonstrated: three disjoint PERFECT 5x3
+    //      tables deleted by one 15x3 stream candidate, 15/5 = 3.0 >= 2.5). ruledRows is now the row
+    //      count of the component's UNION (see #ruledRowsOfComponent): summed across bands that are
+    //      disjoint in y, max within a band. A blind sum was tried first and is WRONG -- it treats two
+    //      side-by-side halves of one table as twice the rows, which cost eu-022 0.0215 adjacency F1
+    //      before the band grouping was added. ruledCols stays a max: a row-wise split preserves the
+    //      column structure, and summing columns would silently disable clause 5 (the
+    //      missed-column-separator signal) for any fragmented ruled side.
+    //
+    //   F5 THERE WAS NO COLUMN-COVERAGE FLOOR. The content-loss guard's own doc says content loss is
+    //      the threat, but only the ROW half was implemented -- so a 20x8 partially-ruled table lost
+    //      to a 20x2 stream candidate, concatenating six columns of data into two cells per row.
+    //      Content loss is measured in CELLS, not rows; the floor is now symmetric.
+    //
+    // Two further defensive rules, neither reachable from today's builders (both paths reject a
+    // candidate below 2x2), stated because this is a package-private API that tests and harnesses
+    // call directly: a candidate whose bbox is non-finite or whose declared shape is degenerate takes
+    // part in NO contest, and a stream side with no non-degenerate member NEVER wins one.
     //
     // CALIBRATION. The four thresholds below were chosen by a grid search over the 77-unit ICDAR
     // scoring corpus and validated LEAVE-ONE-DOCUMENT-OUT (each document scored only with parameters
@@ -2924,8 +3005,12 @@ final class TableExtractor {
     /** Gridness confidence a stream candidate must reach before it can displace drawn rulings. */
     static final double ARB_MIN_STREAM_CONFIDENCE = 0.65;
 
-    /** Below this fraction of its declared rowCount x colCount slots filled, a drawn grid counts as
-     *  only partially ruled and loses to a confident stream candidate. */
+    /** Below this fraction of its declared rowCount x colCount slots COVERED, a drawn grid counts as
+     *  only partially ruled and loses to a confident stream candidate. Coverage is
+     *  {@code sum(rowSpan*colSpan)} over the candidate's cells, clamped to the declared slot count --
+     *  NOT {@code cells.size()}, which under-counts every merged cell (fix F2 above). Evaluated PER
+     *  CANDIDATE, and the clause fires only when every ruled member of the component is below it
+     *  (fix F4 above). */
     static final double ARB_MIN_GRID_OCCUPANCY = 0.80;
 
     /** How many times more rows stream must resolve in the same region before the rulings count as
@@ -2936,10 +3021,26 @@ final class TableExtractor {
      * CONTENT-LOSS GUARD. Fraction of the ruled row count a stream candidate must itself reach before
      * it is allowed to take the region at all. A stream candidate that read 5 rows of a 20-row region
      * may look better on every other signal, but handing it the region drops 15 rows of content --
-     * the outcome this threat model treats as worst. This guard is checked before every other clause,
-     * so no amount of confidence or occupancy evidence can override it.
+     * the outcome this threat model treats as worst. This guard is checked before every clause that
+     * can hand the region to stream, so no amount of confidence or occupancy evidence can override it.
      */
     static final double ARB_MIN_ROW_COVERAGE = 0.75;
+
+    /**
+     * CONTENT-LOSS GUARD, COLUMN HALF (fix F5 above). Fraction of the ruled column count a stream
+     * candidate must itself reach before it can take the region. The row floor alone left the guard
+     * half-implemented: content loss is measured in CELLS, and a stream candidate that resolved 2 of
+     * a region's 8 columns loses six columns' worth of every row it did read -- measurably worse than
+     * the row-only failure the floor above was added for (demonstrated: a 20-row x 8-column
+     * partially-ruled table, 80 cells, taken by a 20x2 stream candidate).
+     *
+     * <p>DELIBERATELY THE SAME VALUE as {@link #ARB_MIN_ROW_COVERAGE}, and NOT separately calibrated:
+     * the corpus grid search that fitted the other four thresholds never contained this parameter, so
+     * choosing anything else here would be a number invented to fit a score. Stated plainly rather
+     * than implied -- if the corrected behaviour needs re-calibration, that is a separate, measured
+     * follow-up, not a knob turned here.
+     */
+    static final double ARB_MIN_COL_COVERAGE = 0.75;
 
     /**
      * Coverage fraction at which two candidates are treated as answers to the SAME region: either
@@ -2975,17 +3076,48 @@ final class TableExtractor {
     static final long MAX_ARBITRATION_WORK = 40_000_000L;
 
     /**
+     * Convenience overload for callers that have no {@link Result} to report into -- the bake-off /
+     * calibration harnesses and the unit tests, which score or assert on the returned list only.
+     * Behaves EXACTLY as {@link #arbitrate(List, List, Result)}: same decisions, same output, same
+     * advisory per-hit markers. The only difference is that the loss report (the {@code truncated}
+     * flag and the displaced-candidate count) goes into a throwaway {@link Result} nobody reads.
+     */
+    static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream) {
+        return arbitrate(ruled, stream, new Result());
+    }
+
+    /**
      * Select, per contested region, between the drawn-ruling candidates and the whitespace-path
      * candidates. Returns the surviving candidates: every {@code ruled} candidate that won or was
      * never contested, in input order, followed by every surviving {@code stream} candidate in input
-     * order. Inputs are never mutated.
+     * order. Neither input LIST is mutated or reordered.
      *
-     * <p>Both inputs may be empty; a candidate with no {@code bbox} cannot be shown to contest
-     * anything and therefore always survives. Throws {@link RulingOverflowException} if the
-     * candidate lists are large enough to exceed {@link #MAX_ARBITRATION_WORK} -- see that field for
-     * why no legitimate document can.
+     * <p>REPORTING THE LOSS. Arbitration is the only path in this class that discards a fully-built,
+     * successfully-extracted table on a QUALITY judgement rather than on a cap or an error, and it
+     * used to do so invisibly: a region whose correct table was arbitrated away was byte-identical in
+     * report.json to a region that never had a table. Every discarded candidate now
+     * <ul>
+     *   <li>sets {@code result.truncated} (which {@code PdfTitanArumApp} surfaces as
+     *       {@code tablesTruncated}), exactly as every sibling drop path in this class does,</li>
+     *   <li>increments {@link Result#arbitrationDisplaced}, and</li>
+     *   <li>leaves an ADVISORY marker on the WINNER ({@link TableHit#displacedRuledCandidate} /
+     *       {@link TableHit#displacedStreamCandidate}) so a consumer can see which hit replaced
+     *       what -- the same "flag, never suppress silently" pattern as
+     *       {@link TableHit#likelyDuplicateOfTagged}.</li>
+     * </ul>
+     * One WARNING is emitted per affected PAGE (not per region: a hostile document sitting at both
+     * per-page candidate caps has up to 50 components per page, and the sibling drop paths log
+     * per-page too).
+     *
+     * <p>Surviving candidate OBJECTS may therefore have those two advisory fields set; nothing else
+     * about them is touched.
+     *
+     * <p>Both inputs may be empty; a candidate with no {@code bbox}, a non-finite bbox, or a
+     * degenerate declared shape cannot be shown to contest anything and therefore always survives.
+     * Throws {@link RulingOverflowException} if the candidate lists are large enough to exceed
+     * {@link #MAX_ARBITRATION_WORK} -- see that field for why no legitimate document can.
      */
-    static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream) {
+    static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream, Result result) {
         if (ruled == null || ruled.isEmpty()) {
             return stream == null ? new ArrayList<>() : new ArrayList<>(stream);
         }
@@ -3023,6 +3155,7 @@ final class TableExtractor {
             List<Integer> sIdx = streamByPage.get(e.getKey());
             if (sIdx == null || sIdx.isEmpty()) continue;
             int lp = rIdx.size(), sp = sIdx.size();
+            int pageDisplaced = 0;
 
             // Contest graph for this page, in page-local indices. The budget is charged BEFORE the
             // adjacency matrix is allocated: charging afterwards would let a hostile candidate list
@@ -3065,9 +3198,40 @@ final class TableExtractor {
                         for (int a = 0; a < lp; a++) if (adj[a][b] && !seenR[a]) { seenR[a] = true; qr.add(a); }
                     }
                 }
-                boolean streamWins = streamWinsRegion(ruled, compR, stream, compS);
-                for (int i : compR) keepRuled[i] = !streamWins;
-                for (int j : compS) keepStream[j] = streamWins;
+                RegionOutcome outcome = decideRegion(ruled, compR, stream, compS);
+                if (outcome == RegionOutcome.STREAM_WINS) {
+                    // A tagged candidate is NEVER arbitrated away. decideRegion clause 2 already
+                    // refuses STREAM_WINS for any component holding one, so this skip is unreachable
+                    // today -- it is kept as a STRUCTURAL guarantee of that invariant, so a future
+                    // change to clause 2 can never turn into a silently dropped tagged table here.
+                    int dropped = 0;
+                    for (int i : compR) {
+                        if ("tagged".equals(ruled.get(i).extractionMethod)) continue;
+                        if (keepRuled[i]) dropped++;
+                        keepRuled[i] = false;
+                    }
+                    if (dropped > 0) {
+                        pageDisplaced += dropped;
+                        for (int j : compS) stream.get(j).displacedRuledCandidate = Boolean.TRUE;
+                    }
+                } else {
+                    int dropped = 0;
+                    for (int j : compS) {
+                        if (keepStream[j]) dropped++;
+                        keepStream[j] = false;
+                    }
+                    if (dropped > 0) {
+                        pageDisplaced += dropped;
+                        for (int i : compR) ruled.get(i).displacedStreamCandidate = Boolean.TRUE;
+                    }
+                }
+            }
+            if (pageDisplaced > 0) {
+                result.truncated = true;
+                result.arbitrationDisplaced += pageDisplaced;
+                System.err.println("WARNING: table path arbitration discarded " + pageDisplaced
+                        + " contested table candidate(s) on page " + e.getKey()
+                        + " (a drawn-ruling and a borderless candidate answered the same region)");
             }
         }
 
@@ -3084,10 +3248,19 @@ final class TableExtractor {
 
     /**
      * True when the two candidates are answers to the same region: either one's area lies more than
-     * {@link #ARB_CONTEST_COVERAGE} inside the other's. Same page only; a null bbox never contests.
+     * {@link #ARB_CONTEST_COVERAGE} inside the other's. Same page only.
+     *
+     * <p>A candidate that is not {@link #arbitrable} -- no bbox, a non-finite bbox, a zero-area bbox,
+     * or a degenerate declared shape -- contests NOTHING and therefore always survives, the same
+     * documented treatment a null bbox already had. Today's builders reject any candidate below 2x2
+     * on both paths, so this is a defensive invariant on a package-private API rather than a live
+     * path; before it was stated, a {@code 10 rows x 0 cols} ruled candidate produced occupancy 0.0
+     * and lost its region to any confident stream guess, and a NaN bbox silently fell through every
+     * comparison to the same "no contest" answer by accident rather than by rule.
      */
     private static boolean contestsSameRegion(TableHit a, TableHit b) {
-        if (a.page != b.page || a.bbox == null || b.bbox == null) return false;
+        if (a.page != b.page) return false;
+        if (!arbitrable(a) || !arbitrable(b)) return false;
         float inter = bboxIntersectionArea(a.bbox, b.bbox);
         if (inter <= 0f) return false;
         float aArea = bboxArea(a.bbox), bArea = bboxArea(b.bbox);
@@ -3096,58 +3269,223 @@ final class TableExtractor {
     }
 
     /**
-     * THE DECISION. Signals only -- see the block comment above {@link #ARB_MIN_STREAM_CONFIDENCE}
-     * for why each one is evidence that the rulings do not form a grid over this region.
+     * Whether a candidate has enough well-formed geometry and shape to take part in a contest at all:
+     * a finite, positive-area bbox and a declared grid of at least one row and one column. Used only
+     * by {@link #contestsSameRegion} -- a non-arbitrable candidate is never dropped, it is simply
+     * never contested.
      */
-    private static boolean streamWinsRegion(List<TableHit> ruled, List<Integer> compR,
-                                            List<TableHit> stream, List<Integer> compS) {
-        if (compS.isEmpty()) return false;
+    private static boolean arbitrable(TableHit t) {
+        if (t.bbox == null || t.bbox.length < 4) return false;
+        for (float v : t.bbox) if (!Float.isFinite(v)) return false;
+        if (!(t.bbox[2] > t.bbox[0]) || !(t.bbox[3] > t.bbox[1])) return false;
+        return t.rowCount > 0 && t.colCount > 0;
+    }
 
-        // 1. The structure tree is authoritative: never arbitrated away.
-        for (int i : compR) if ("tagged".equals(ruled.get(i).extractionMethod)) return false;
+    /** What arbitration decided for one contested region. */
+    private enum RegionOutcome {
+        /** The drawn-ruling side keeps the region; every stream candidate in it is discarded. */
+        RULED_WINS,
+        /** The stream side takes the region; every LATTICE candidate in it is discarded (a tagged
+         *  candidate is never arbitrated away and survives regardless -- see decideRegion clause 2,
+         *  which already refuses this outcome for any component holding one). */
+        STREAM_WINS
+    }
 
-        // 2. Confidence floor. A stream candidate with no confidence at all is no evidence.
+    /**
+     * THE DECISION. Signals only -- see the block comment above {@link #ARB_MIN_STREAM_CONFIDENCE}
+     * for why each one is evidence that the rulings do not form a grid over this region, and for the
+     * four computation fixes (F2-F5) this function carries.
+     */
+    private static RegionOutcome decideRegion(List<TableHit> ruled, List<Integer> compR,
+                                              List<TableHit> stream, List<Integer> compS) {
+        if (compS.isEmpty()) return RegionOutcome.RULED_WINS;
+
+        // 0. DEGENERATE STREAM SIDE. A candidate with no rows, no columns or no cells carries no
+        //    content, so it can never be evidence that the rulings are wrong -- and must never be
+        //    handed a region. (Defensive: StreamTableExtractor rejects anything below 2x2.)
+        boolean anyRealStream = false;
+        for (int j : compS) {
+            TableHit s = stream.get(j);
+            if (s.rowCount > 0 && s.colCount > 0 && s.cells != null && !s.cells.isEmpty()) {
+                anyRealStream = true;
+                break;
+            }
+        }
+        if (!anyRealStream) return RegionOutcome.RULED_WINS;
+
+        // 1. Confidence floor. A stream candidate with no confidence at all is no evidence.
         double confSum = 0;
         for (int j : compS) {
             Double c = stream.get(j).confidence;
-            if (c == null) return false;
+            if (c == null || !Double.isFinite(c)) return RegionOutcome.RULED_WINS;
             confSum += c;
         }
-        if (confSum / compS.size() < ARB_MIN_STREAM_CONFIDENCE) return false;
+        if (confSum / compS.size() < ARB_MIN_STREAM_CONFIDENCE) return RegionOutcome.RULED_WINS;
 
-        int ruledRows = 0, ruledCols = 0, streamRows = 0, streamCols = 0;
-        long declaredSlots = 0, actualCells = 0;
-        for (int i : compR) {
-            TableHit r = ruled.get(i);
-            ruledRows = Math.max(ruledRows, r.rowCount);
-            ruledCols = Math.max(ruledCols, r.colCount);
-            declaredSlots += (long) Math.max(0, r.rowCount) * Math.max(0, r.colCount);
-            actualCells += r.cells == null ? 0 : r.cells.size();
-        }
+        int streamRows = 0, streamCols = 0;
         for (int j : compS) {
             TableHit s = stream.get(j);
             streamRows = Math.max(streamRows, s.rowCount);
             streamCols = Math.max(streamCols, s.colCount);
         }
 
-        // 3. CONTENT-LOSS GUARD, checked before any evidence in stream's favour: a stream candidate
-        //    that resolved materially fewer rows than the rulings did is reading only part of the
-        //    region, and must never be handed the whole of it.
-        if (ruledRows > 0 && streamRows < ARB_MIN_ROW_COVERAGE * ruledRows) return false;
+        // 2. THE STRUCTURE TREE IS AUTHORITATIVE: a tagged candidate is never arbitrated away, and it
+        //    vetoes the stream side for the whole component.
+        //
+        //    F6 (REVIEWED, DELIBERATELY NOT RELAXED -- and the evidence is in this repo). The review
+        //    that produced fixes F2-F5 also asked for this component-wide veto to be scoped or made
+        //    advisory, on the grounds that HTML-to-PDF converters emit LAYOUT <table>s, that
+        //    MIN_TAGGED_RANK=2 admits any 2x2 wrapper, and that a 2x2 wrapper whose glyph-union bbox
+        //    spans the page therefore deletes a real 30x5 borderless table nested inside it. That
+        //    demonstration reproduces exactly as described. It is nevertheless NOT actionable at this
+        //    level, because the fixture
+        //    TableTestPdfs#taggedHollowMiddleTwoDenseBlocksPlusDistinctRuledTableInGap presents
+        //    arbitration with the SAME SHAPES and requires the OPPOSITE outcome (measured):
+        //
+        //      demonstration : tagged 2x2, page-spanning bbox; stream 30x5 conf 0.85 -> must SURVIVE
+        //      repo fixture  : tagged 2x2, bbox [60,86,149,691]; stream 10x4 conf 0.725 x2
+        //                      -> must LOSE (they are two prose paragraphs re-read as grids;
+        //                         TableStreamWiringTest#aTaggedTableIsNeverLostWhenTheStreamStageIsEnabled
+        //                         asserts zero stream hits survive that page)
+        //
+        //    Both are a 2x2 tagged grid whose cells hold multi-line text, contested by a stream
+        //    candidate with several times more rows and more columns. Every scoping signal available
+        //    here -- row ratio (5.0 vs 15.0), column comparison (4>=2 vs 5>=2), per-cell footprint
+        //    containment (the stream hit sits inside ONE tagged cell in BOTH cases) -- either fires on
+        //    both or on neither. Separating them would mean choosing a threshold between 5 and 15,
+        //    i.e. a number invented to make one case pass and the other fail, on a rule the corpus
+        //    cannot measure at all (it contains zero tagged tables). What IS fixed instead is the
+        //    VISIBILITY of the drop: a stream candidate lost to this veto now sets Result.truncated,
+        //    increments Result.arbitrationDisplaced, flags the tagged winner
+        //    displacedStreamCandidate, and logs a WARNING naming the page. A real relaxation needs a
+        //    LAYOUT-TABLE discriminator on the tagged path itself (is the declared grid commensurate
+        //    with its own cells' glyph rows?) plus a corpus that contains tagged tables to measure it
+        //    on -- a separate, measured change, not a threshold turned here.
+        for (int i : compR) if ("tagged".equals(ruled.get(i).extractionMethod)) return RegionOutcome.RULED_WINS;
 
-        // 4. Partially ruled grid: most of the declared grid has no cell in it.
-        double occupancy = declaredSlots == 0 ? 0.0 : (double) actualCells / declaredSlots;
-        if (occupancy < ARB_MIN_GRID_OCCUPANCY) return true;
+        // Ruled-side shape, COMPONENT-WIDE (fix F3). ruledRows used to be Math.max over the members,
+        // so a region the rulings split into K stacked fragments was compared against ONE fragment's
+        // row count and both the floor below and clause 6 fired mechanically as K grew. It is now the
+        // row count of the component's UNION -- see #ruledRowsOfComponent, which sums across bands
+        // that are disjoint in y and takes the max within a band, so stacked fragments add (correct:
+        // splitComponent divides a ruled region by ROWS) while SIDE-BY-SIDE fragments do not
+        // (measured: eu-022's two 15x2 halves sit at x 58-210 and 210-318 over the SAME 15 rows, and
+        // a blind sum called that 30 rows and cost that document 0.0215 adjacency F1). Columns stay a
+        // MAX: a row-wise split preserves the column structure, and summing them would silently
+        // disable clause 5 (the missed-column-separator signal) for any fragmented ruled side.
+        long ruledRows = ruledRowsOfComponent(ruled, compR);
+        int ruledCols = 0;
+        for (int i : compR) ruledCols = Math.max(ruledCols, ruled.get(i).colCount);
+
+        // 3. CONTENT-LOSS GUARD, checked before any evidence in stream's favour: a stream candidate
+        //    that resolved materially fewer rows -- or materially fewer COLUMNS (fix F5) -- than the
+        //    rulings did is reading only part of the region, and must never be handed the whole of it.
+        //    Content loss is measured in CELLS, so both halves are needed: losing 6 of 8 columns
+        //    concatenates six fields into one cell on EVERY row stream did read.
+        if (ruledRows > 0 && streamRows < ARB_MIN_ROW_COVERAGE * ruledRows) return RegionOutcome.RULED_WINS;
+        if (ruledCols > 0 && streamCols < ARB_MIN_COL_COVERAGE * ruledCols) return RegionOutcome.RULED_WINS;
+
+        // 4. Partially ruled grid: most of the declared grid is not covered by a cell. PER CANDIDATE
+        //    (fix F4) -- pooling declaredSlots/actualCells across the component let one junk fragment,
+        //    whose declared slot count is quadratic in its declared shape, dominate the denominator
+        //    and condemn every correct table chained to it. Coverage counts SPANS (fix F2): buildTable
+        //    emits one CellHit per merged cell, so a complete grid with a merged header row covers
+        //    every slot while carrying fewer cells than slots.
+        boolean everyRuledMemberIsPartiallyRuled = true;
+        for (int i : compR) {
+            if (gridCoverage(ruled.get(i)) >= ARB_MIN_GRID_OCCUPANCY) {
+                everyRuledMemberIsPartiallyRuled = false;
+                break;
+            }
+        }
+        if (everyRuledMemberIsPartiallyRuled) return RegionOutcome.STREAM_WINS;
 
         // 5. A column separator the rulings missed. No cap on stream's row count here -- guard 3
         //    already refuses a stream candidate that under-covers the region, which is the failure
         //    this clause needed protecting from.
-        if (streamCols > ruledCols) return true;
+        if (streamCols > ruledCols) return RegionOutcome.STREAM_WINS;
 
         // 6. Under-segmented rows: several times more text rows than ruled bands.
         return ruledRows > 0
-                && (double) streamRows / ruledRows >= ARB_ROW_UNDERSEGMENTATION_RATIO;
+                && (double) streamRows / ruledRows >= ARB_ROW_UNDERSEGMENTATION_RATIO
+                ? RegionOutcome.STREAM_WINS : RegionOutcome.RULED_WINS;
     }
+
+    /**
+     * How many ruled ROWS a contested region's ruling-derived side describes in total: the row count
+     * of the UNION of its members, not of any one of them (fix F3).
+     *
+     * <p>Members are grouped into BANDS that are disjoint along y. Within a band the count is a MAX --
+     * fragments that share the same vertical extent are answers to the same rows, side by side (two
+     * halves of one table split by a missing centre ruling; eu-022's two 15x2 halves over the same 15
+     * rows). Across bands the counts ADD -- {@link #splitComponent} divides a ruled region by ROWS, so
+     * stacked fragments really do describe successive row groups, and comparing the stream side's
+     * whole-region row count against just the tallest fragment is what made the row-coverage floor and
+     * the under-segmentation ratio fire purely as a function of how many pieces the rulings came in.
+     *
+     * <p>Bounded work: the member count is capped by {@link #MAX_TABLES_PER_PAGE} (50), so the sort is
+     * over at most 50 entries per component.
+     */
+    private static long ruledRowsOfComponent(List<TableHit> ruled, List<Integer> compR) {
+        int n = compR.size();
+        if (n == 0) return 0;
+        if (n == 1) return Math.max(0, ruled.get(compR.get(0)).rowCount);
+        // [y0, y1, rowCount] per member; a member with no usable bbox forms its own band.
+        float[][] spans = new float[n][3];
+        for (int k = 0; k < n; k++) {
+            TableHit r = ruled.get(compR.get(k));
+            boolean usable = r.bbox != null && r.bbox.length >= 4
+                    && Float.isFinite(r.bbox[1]) && Float.isFinite(r.bbox[3]);
+            spans[k][0] = usable ? r.bbox[1] : Float.NEGATIVE_INFINITY;
+            spans[k][1] = usable ? Math.max(r.bbox[1], r.bbox[3]) : Float.NEGATIVE_INFINITY;
+            spans[k][2] = Math.max(0, r.rowCount);
+        }
+        java.util.Arrays.sort(spans, (a, b) -> Float.compare(a[0], b[0]));
+        long total = 0;
+        float bandEnd = Float.NEGATIVE_INFINITY;
+        float bandMax = 0;
+        boolean open = false;
+        for (float[] s : spans) {
+            if (open && s[0] < bandEnd) {                 // overlaps the open band: same rows
+                bandEnd = Math.max(bandEnd, s[1]);
+                bandMax = Math.max(bandMax, s[2]);
+            } else {
+                if (open) total += (long) bandMax;
+                bandEnd = s[1];
+                bandMax = s[2];
+                open = true;
+            }
+        }
+        if (open) total += (long) bandMax;
+        return total;
+    }
+
+    /**
+     * Fraction of a candidate's declared {@code rowCount x colCount} slots that its cells actually
+     * COVER, in [0,1]. Counts {@code rowSpan*colSpan} per cell -- {@link #buildTable} emits exactly
+     * one {@link CellHit} per merged cell, so {@code cells.size()} under-counts a complete grid with
+     * any merged header/title/TOTAL row (fix F2). The sum is clamped to the declared slot count so a
+     * candidate with over-declared spans can never score above 1.0.
+     *
+     * <p>A candidate that declares no slots at all returns 1.0, i.e. "no evidence of a partial
+     * ruling": the occupancy clause exists to detect a grid that was declared and not filled, and a
+     * grid that was never declared is not evidence for the stream side. Returning 0.0 (as the pooled
+     * arithmetic used to) made a {@code rows x 0} candidate lose its region on absent evidence, which
+     * is the wrong direction for this threat model.
+     */
+    private static double gridCoverage(TableHit t) {
+        long slots = (long) Math.max(0, t.rowCount) * Math.max(0, t.colCount);
+        if (slots <= 0) return 1.0;
+        long covered = 0;
+        if (t.cells != null) {
+            for (CellHit c : t.cells) {
+                covered += (long) Math.max(1, c.rowSpan) * Math.max(1, c.colSpan);
+                if (covered >= slots) return 1.0;
+            }
+        }
+        return (double) covered / slots;
+    }
+
 
     /**
      * Decides which grouped components (from {@link #groupIntoTables}) actually become kept

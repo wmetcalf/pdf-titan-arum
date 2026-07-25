@@ -220,6 +220,51 @@ class TableStreamWiringTest {
         }
     }
 
+    /**
+     * THE ARBITRATION DROP MUST REACH THE Result, THROUGH THE REAL WIRING.
+     *
+     * <p>{@code arbitrate} used to take no {@link TableExtractor.Result} parameter at all, so a
+     * candidate that lost a contested region set nothing: {@code tablesTruncated} stayed absent from
+     * report.json and no per-hit marker existed either, which made a table arbitrated away
+     * byte-identical to a region that never had a table. Every SIBLING drop path in the class
+     * (extractTagged's three catches, the per-page lattice catches, the document lattice budget,
+     * extractStreamPage's caps, capTablesPerPage) surfaces itself; this pins that arbitration now
+     * does too, and does so through {@code extract()} rather than only in the unit test that drives
+     * {@code arbitrate} directly.
+     *
+     * <p>Same fixture as the test above, chosen because its contest is real and its OUTCOME is
+     * already asserted there: two genuine stream candidates lose to the tagged answer.
+     */
+    @Test
+    void aContestLostInsideExtractIsSurfacedOnTheResult() throws Exception {
+        Path pdf = tmp.resolve("tagged.pdf");
+        TableTestPdfs.taggedHollowMiddleTwoDenseBlocksPlusDistinctRuledTableInGap(pdf);
+        try (PDDocument doc = Loader.loadPDF(pdf.toFile())) {
+            List<Integer> pages = pagesOf(doc);
+            Map<Integer, List<TextPosition>> glyphs = glyphsOf(doc);
+
+            TableExtractor.Result off = TableExtractor.extract(doc, pages, glyphs);
+            assertFalse(off.truncated, "sanity: with the stream stage OFF there is no contest at all");
+            assertEquals(0, off.arbitrationDisplaced);
+
+            TableExtractor.Result on = TableExtractor.extract(doc, pages, glyphs, true);
+            assertTrue(on.truncated,
+                    "two fully-built stream candidates were discarded on a quality judgement: "
+                            + "report.json must say tablesTruncated, not stay silent");
+            assertEquals(2, on.arbitrationDisplaced,
+                    "both discarded candidates must be counted, exactly");
+            TableExtractor.TableHit tagged = on.tables.stream()
+                    .filter(t -> "tagged".equals(t.extractionMethod)).findFirst().orElseThrow();
+            assertEquals(Boolean.TRUE, tagged.displacedStreamCandidate,
+                    "the surviving answer must record that it replaced a borderless candidate");
+            assertNull(tagged.displacedRuledCandidate);
+            for (TableExtractor.TableHit t : on.tables) {
+                assertNull(t.displacedRuledCandidate,
+                        "no candidate here displaced a drawn-ruling answer: " + sig(t));
+            }
+        }
+    }
+
     // ------------------------------------------------------- 3. contract: never throw, no partials
 
     @Test

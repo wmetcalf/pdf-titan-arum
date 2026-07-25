@@ -768,6 +768,22 @@ final class StreamTableExtractor {
         return false;
     }
 
+    // MEASURED (false-positive study, 77-PDF corpus + 1,599 real-world PDFs, shipping page scope).
+    // Raising this to 0.60 was proposed as a free precision win on the strength of two claims, BOTH
+    // of which are false:
+    //
+    //   * "the corpus has ZERO candidates in [0.55, 0.60), so the raise cannot move it". It has SIX
+    //     graded candidates in that band, five of them narrow grids the raise WOULD newly reject
+    //     (eu-003 p1 0.5823, eu-009a p1 0.5878, eu-025 p2 0.5517, us-001 p2 0.5996, us-013 p2
+    //     0.5842; the sixth, eu-026 p6, has 7 columns and is governed by STREAM_CONFIDENCE_MIN_WIDE
+    //     instead). us-001 p2 sits 0.0004 under the proposed bar -- the opposite of a safe margin.
+    //   * "pointwise identical on all 77 documents at both page scopes and every subset". Only the
+    //     single headline full+arbitration ALL-77 POOLED cell is unchanged; the baseline report
+    //     differs in 556 lines. Stream-alone macro falls 0.6575 -> 0.6488 all-pages and the
+    //     stream region-given-rerun macro falls 0.7410 -> 0.7035.
+    //
+    // What it actually buys is 3 documents of the 1,599 (0.0819 -> 0.0800). The three mechanism
+    // fixes below buy 36 for a macro GAIN, so the bar stays where it was calibrated.
     static final double STREAM_CONFIDENCE_MIN = 0.55;
 
     // ------------------------------------------------------------------ column-count-scaled bar
@@ -889,6 +905,32 @@ final class StreamTableExtractor {
     // straddling ("really is prose") grids down to zero violationScore by the ceiling.
     static final double VIOLATION_TOLERANCE = 0.02;  // <=2% straddling words: no penalty
     static final double VIOLATION_CEILING   = 0.09;  // >=9% straddling words: violationScore = 0
+
+    // ------------------------------- MEASURED AND NOT SHIPPED: a minimum populated-cell count
+    //
+    // scoreGrid refuses fewer than 2 columns and fewer than 3 rows, but those are ONE-DIMENSIONAL
+    // minima: between them they admit a 3x2 grid carrying as little as SIX populated cells. The
+    // false-positive study measured the two-dimensional companion ("the grid must carry at least N
+    // populated (line, column) cells"), and it is a real win on both axes -- at N=9, on top of the
+    // prose-fill fix: real-world false positives 120 -> 109 of 1,599 and 13/200 -> 11/200, with corpus
+    // MACRO RISING further, 0.8147 -> 0.8173 all-pages and 0.7948 -> 0.7974 shipping.
+    //
+    // It is NOT shipped because no value of N above 6 can be had without overriding this suite's own
+    // notion of a minimal valid grid, and that notion is the only evidence available about shapes the
+    // 77-PDF corpus does not contain:
+    //   * N=9 rejects the 3-row x 2-column post-trim union in StreamSegmentationTest's
+    //     adjacentBlocksWithDifferentColumnModelsAreNotMerged (6 populated cells, scored 0.800 here);
+    //   * N=10 additionally rejects every fully populated 3x3 grid, which breaks both fixture-sanity
+    //     assertions in mergeIsRejectedWhenMergedBlockFailsGridnessGate. N=10 buys 6 further
+    //     real-world rejections over N=9 for identical corpus MACRO.
+    //   * N=7 is worse than N=9 on BOTH axes (112 real-world FPs at MACRO 0.8148).
+    // A CELL-DENSITY floor was measured as the alternative that spares small dense grids, and it is
+    // strictly worse: 0.60 costs 0.0041 MACRO for 8 real-world rejections and moves the 200-sample not
+    // at all; 0.70 costs 0.0266 MACRO. Also measured and rejected: requiring numeric corroboration up
+    // to 3 columns (corpus-MACRO-neutral and 22 fewer real-world FPs, but it deletes the
+    // Animal|Action|Result all-text table that StreamGridnessTest asserts twice must survive), and
+    // retuning the five confidence weights (every variant tried cost MACRO; raising the prose weight
+    // before fixing the prose TERM made real-world false positives WORSE, 131 -> 136).
 
     // Prose hard-veto constants. See the rationale comment at the veto site in scoreGrid().
     // VETO_FILL_THRESHOLD mirrors the spec's own wording ("fills >~85% of column width").
@@ -1015,14 +1057,56 @@ final class StreamTableExtractor {
         double colConsistency = (double) consistentRows / rows;
         colConsistency = Math.min(1, colConsistency / 0.85); // full credit at 85%
 
-        // prose fill: median widest-cell fill fraction of its column width
+        // ------------------------------------------------------------------ prose fill, per CELL
+        //
+        // MEASURED DEFECT (this term used to read `w.width() / colW`, i.e. the widest WORD).
+        // A Word is ONE whitespace-delimited token, so the term asked "does the longest single TOKEN
+        // fill 85% of its column?" -- while its own comment, and the spec clause it implements
+        // ("reject if median CELL TEXT fills >~85% of column width and wraps across lines -- the
+        // two-column-prose signature"), both say CELL. The two differ by exactly the thing that
+        // distinguishes prose from data: a data cell is usually one token, so token width IS its
+        // cell width, but a line of prose is MANY SHORT tokens that together span the column. The
+        // token-based reading therefore handed prose the term designed to detect it, at FULL credit:
+        // measured over the 57 stream candidates that produce a false positive on a real-world
+        // document, 55 scored tProse >= 0.20 and the overwhelming majority scored exactly 1.000 --
+        // a free 0.20 of confidence for being prose. (The prose HARD VETO below always did compute
+        // the cell extent correctly; only this graded term was wrong, which is why the veto catches
+        // the >=0.85 extreme and everything in the 0.60-0.85 band sailed through.)
+        //
+        // Every prose fixture in StreamGridnessTest renders each cell as ONE very long token
+        // spanning the whole column, so token width and cell width coincide there and the tests
+        // could never have caught this. StreamProseFillAndEvidenceTest adds the realistic case.
+        //
+        // MEASURED EFFECT of the fix alone: corpus MACRO 0.8069 -> 0.8147 all-pages and
+        // 0.7876 -> 0.7948 shipping (it also REMOVES fabrications that were stealing regions from
+        // correct lattice tables), prose false positives 15/200 -> 13/200 and 131/1,599 -> 120/1,599.
+        //
+        // COST: unchanged. lo/hi/any are allocated ONCE for the whole grid and only the columns a
+        // line actually touches are read and reset (tracked in `touched`), so this is O(total words)
+        // with NO cols factor -- strictly cheaper than the prose-veto pass below, and far inside the
+        // O(cols x words) that #gridWorkFor already charged up front for this block.
         List<Double> fills = new ArrayList<>();
+        float[] cellLo = new float[cols], cellHi = new float[cols];
+        boolean[] cellAny = new boolean[cols];
+        int[] touched = new int[cols];
         for (Line l : lines) {
-            double maxFill = 0;
+            int nTouched = 0;
             for (Word w : l.words) {
                 int c = colOf(w.cx(), bounds);
+                if (!cellAny[c]) {
+                    cellAny[c] = true; cellLo[c] = w.x0; cellHi[c] = w.x1;
+                    touched[nTouched++] = c;
+                } else {
+                    cellLo[c] = Math.min(cellLo[c], w.x0);
+                    cellHi[c] = Math.max(cellHi[c], w.x1);
+                }
+            }
+            double maxFill = 0;
+            for (int i = 0; i < nTouched; i++) {
+                int c = touched[i];
                 float colW = bounds[c + 1] - bounds[c];
-                if (colW > 0) maxFill = Math.max(maxFill, w.width() / colW);
+                if (colW > 0) maxFill = Math.max(maxFill, (cellHi[c] - cellLo[c]) / colW);
+                cellAny[c] = false;                       // reset only what this line touched
             }
             fills.add(maxFill);
         }

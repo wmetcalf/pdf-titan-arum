@@ -1,0 +1,35 @@
+-- Put the jobs.stream_tables COLUMN default back to FALSE.
+--
+-- V9 moved it to TRUE to match the product default flipping on. That was the wrong lever: the column
+-- default is not what makes any supported surface default-on, and pointing it at TRUE made the
+-- database disagree with what an OLD binary does mid-rolling-deploy.
+--
+-- WHY NOT JUST DELETE V9. Migrations are append-only in effect, not just by convention. Flyway runs
+-- with validateOnMigrate=true and no ignoreMigrationPatterns, so any database whose
+-- flyway_schema_history already contains version 9 fails at startup with
+--   FlywayValidateException: Detected applied migration not resolved locally: 9
+-- and the exception propagates out of ServerCommand.serverMain -- the server refuses to boot. That is
+-- not hypothetical: the repo's docker-compose.yml keeps a persistent `pgdata` volume, so every
+-- developer or staging database that ran this branch is in exactly that state. "V9 was never
+-- released" is not the same claim as "no database ever applied V9", and only the second one would
+-- justify deleting the file.
+--
+-- Deleting V9 also would not have undone anything: SET DEFAULT TRUE had already executed on those
+-- databases, so removing the file leaves the default at TRUE while the test suite -- passing against
+-- a fresh Testcontainer -- asserts it is FALSE. This migration actually performs the revert, so the
+-- invariant holds on migrated and fresh databases alike.
+--
+-- WHAT THIS DOES AND DOES NOT CHANGE. SET DEFAULT only affects INSERTs that OMIT the column:
+--   * EXISTING ROWS KEEP THEIR STORED VALUE, including pending rows no worker has claimed. A deploy
+--     never silently re-interprets already-submitted work.
+--   * ApiRoutes and JobRepository.insert always supply the column explicitly, so no supported
+--     application path reads this default. It is the backstop for an INSERT that omits it, which in
+--     practice means an OLD APPLICATION BINARY mid-rolling-deploy or a hand-written/administrative
+--     INSERT -- and for those, FALSE (the conservative, pre-flip behaviour) is what we want, because
+--     an old binary should keep behaving the way its own code expects.
+--
+-- The shipping default for new jobs lives in application code (PdfTitanArumApp.STREAM_TABLES_DEFAULT,
+-- overridable fleet-wide via TITANARUM_STREAM_TABLES_DEFAULT); it deliberately does NOT come from
+-- this column default. Keeping the two decoupled is the point of this migration.
+ALTER TABLE jobs
+    ALTER COLUMN stream_tables SET DEFAULT FALSE;

@@ -24,6 +24,11 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
+import java.util.HashMap;
+import java.io.StringWriter;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.ParameterizedTest;
+import io.pebbletemplates.pebble.PebbleEngine;
 
 /**
  * {@code POST /api/jobs} form binding, driven over real HTTP through the real
@@ -344,6 +349,49 @@ class ServerApiRoutesFormBindingTest {
     }
 
     /**
+     * RENDERED output must follow the fleet default, in both directions.
+     *
+     * <p>The source-level test above only proves the template references the model. This renders it
+     * through the same Pebble configuration the server uses and asserts the box is unticked when the
+     * fleet default is off -- which is what actually makes {@code TITANARUM_STREAM_TABLES_DEFAULT}
+     * work for the web UI. It used to be hardcoded {@code checked}, so every browser submission
+     * carried an explicit value and the override was inert on the primary human surface.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void renderedJobListChecksTheBoxOnlyWhenTheFleetDefaultIsOn(boolean fleetDefault)
+            throws Exception {
+        PebbleEngine engine = new PebbleEngine.Builder()
+                .newLineTrimming(false)
+                .autoEscaping(true)
+                .defaultEscapingStrategy("html")
+                .build();
+        Map<String, Object> model = new HashMap<>();
+        model.put("jobs", List.of());
+        model.put("page", 0);
+        model.put("totalPages", 1);
+        model.put("totalCount", 0);
+        model.put("statusFilter", null);
+        model.put("streamTablesDefault", fleetDefault);
+
+        StringWriter sw = new StringWriter();
+        engine.getTemplate("templates/job-list.html").evaluate(sw, model);
+        String html = sw.toString();
+
+        int box = html.indexOf("type=\"checkbox\" name=\"streamTables\"");
+        assertTrue(box >= 0, "rendered page must contain the streamTables checkbox");
+        String tag = html.substring(box, html.indexOf('>', box) + 1);
+        assertEquals(fleetDefault, tag.contains("checked"),
+                "with the fleet default " + (fleetDefault ? "ON" : "OFF")
+                        + " the rendered checkbox must be " + (fleetDefault ? "checked" : "UNCHECKED")
+                        + " -- a box that renders ticked while the fleet default is off submits an "
+                        + "explicit true and silently defeats the off switch; got: " + tag);
+        // The paired hidden false must survive either way, or the box cannot be unticked at all.
+        assertTrue(html.contains("type=\"hidden\" name=\"streamTables\" value=\"false\""),
+                "the paired hidden false must be present regardless of the default");
+    }
+
+    /**
      * The UI is the only way most operators will reach the flag, so the checkbox has to exist and
      * carry the exact name {@code boolForm} looks up. A renamed checkbox fails silently.
      */
@@ -354,9 +402,16 @@ class ServerApiRoutesFormBindingTest {
         String html = Files.readString(template);
         assertTrue(html.contains("name=\"streamTables\""),
                 "job-list.html must offer a streamTables control");
-        assertTrue(html.contains("type=\"checkbox\" name=\"streamTables\" value=\"true\" checked"),
-                "the streamTables checkbox must be CHECKED, matching the ON default, and must carry "
-                        + "an explicit value=\"true\"");
+        assertTrue(html.contains("type=\"checkbox\" name=\"streamTables\" value=\"true\""),
+                "the streamTables checkbox must carry an explicit value=\"true\"");
+        // Must be DRIVEN by the resolved default, never hardcoded. A hardcoded `checked` meant the
+        // pair always submitted an explicit value, so TITANARUM_STREAM_TABLES_DEFAULT could not
+        // affect any job submitted from this form -- while the box still rendered ticked.
+        assertTrue(html.contains("{% if streamTablesDefault %} checked{% endif %}"),
+                "`checked` must come from streamTablesDefault (ApiRoutes.fleetStreamTablesDefault()), "
+                        + "not be hardcoded -- hardcoding it silently defeats the fleet-wide off switch");
+        assertFalse(html.contains("value=\"true\" checked"),
+                "found a hardcoded `checked` on the streamTables checkbox");
         assertTrue(html.contains("type=\"hidden\" name=\"streamTables\" value=\"false\""),
                 "the checkbox needs its paired hidden false: an unticked checkbox submits nothing, "
                         + "which for a default-ON flag is indistinguishable from 'field omitted' and "

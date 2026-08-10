@@ -229,7 +229,7 @@ java -jar target/pdf-titan-arum-server-1.3.0.jar server \
 | `OPENAI_BASE_URL`  | —       | OpenAI-compatible API base URL; enables AI analysis when set  |
 | `OPENAI_API_KEY`   | —       | API key (use `none` for local unauthenticated models)         |
 | `OPENAI_MODEL`     | —       | Model name (auto-detected from `/models` if not set)          |
-| `TITANARUM_STREAM_TABLES_DEFAULT` | on (unset) | Fleet-wide `streamTables` default for a REST submission that omits the field — `false`/`0`/`off`/`no` disables it for every job submitted from that point on; requires restarting the server process to take effect. Explicit per-job `streamTables=` still overrides it either way. See [Turning it off](#turning-it-off). |
+| `TITANARUM_STREAM_TABLES_DEFAULT` | on (unset) | Fleet-wide `streamTables` default — `false`/`0`/`off`/`no` disables it for every job submitted from that point on; requires restarting the server process to take effect. Applies to a REST submission that omits the field **and** to the web UI, whose checkbox is rendered from this same value (it is not hardcoded). Explicit per-job `streamTables=` still overrides it either way. See [Turning it off](#turning-it-off). |
 
 ### AI analysis (server)
 
@@ -706,7 +706,7 @@ The flag is switchable off **per job on every surface**, and none of these fall 
 | REST | form field `streamTables=false` (also `0`, `off`, `no`), or untick the box in the web UI |
 | blastbox `job.json` | `"stream_tables": false` |
 | blastbox env | `TITANARUM_STREAM_TABLES=0` (also `false`, `no`, `off`) |
-| whole fleet, no redeploy | `TITANARUM_STREAM_TABLES_DEFAULT=false` (also `0`, `off`, `no`) in the Java server's environment, plus `TITANARUM_STREAM_TABLES=0` for the sandboxed workers |
+| whole fleet, no redeploy | `TITANARUM_STREAM_TABLES_DEFAULT=false` (also `0`, `off`, `no`) in the Java server's environment, plus `TITANARUM_STREAM_TABLES=0` for the sandboxed workers. With the bundled `docker-compose.yml`, set it in that file's `environment:` map — it is an explicit map, so exporting the variable in your shell does not reach the container. |
 
 Note that an **empty** `TITANARUM_STREAM_TABLES=` (or `TITANARUM_STREAM_TABLES_DEFAULT=`) means "no
 opinion", not "off" — exactly as it does for every sibling toggle — so it leaves the default in place.

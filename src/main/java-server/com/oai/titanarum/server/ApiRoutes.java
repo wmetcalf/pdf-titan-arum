@@ -22,9 +22,27 @@ public class ApiRoutes {
      * the fleet-wide env override end to end through the real route without mutating the JVM's actual
      * environment (which Java cannot do for a running process anyway) -- mirrors the {@code nanoClock}
      * injectable seam {@code PdfTitanArumApp#awaitGoSignal} uses for the same reason. Must be restored
-     * to {@code System::getenv} after any test that swaps it.
+     * to {@code System::getenv} after any test that swaps it. {@code volatile} because tests
+     * write it from the JUnit thread while Jetty worker threads read it -- without it there is
+     * no happens-before edge and the override can be observed stale.
      */
-    static java.util.function.UnaryOperator<String> streamTablesDefaultEnvLookup = System::getenv;
+    static volatile java.util.function.UnaryOperator<String> streamTablesDefaultEnvLookup =
+            System::getenv;
+
+    /**
+     * The fleet-wide stream-tables default, resolved once per call from the environment.
+     *
+     * <p>Single source of truth ON PURPOSE. The web UI must render its checkbox from the SAME
+     * value the REST binding uses as its absent-field default: when the two were resolved
+     * independently, the UI hardcoded {@code checked} and every browser submission therefore
+     * carried an EXPLICIT value, so the env override could never take effect on the primary
+     * human surface even though the README advertised it as fleet-wide.
+     */
+    public static boolean fleetStreamTablesDefault() {
+        return PdfTitanArumApp.resolveRestStreamTablesDefault(
+                streamTablesDefaultEnvLookup.apply(
+                        PdfTitanArumApp.STREAM_TABLES_REST_DEFAULT_ENV));
+    }
 
     public static void wire(Javalin app, JobRepository repo, ArtifactStore store, WorkerPool pool) {
 
@@ -58,10 +76,7 @@ public class ApiRoutes {
                     // Default-ON, so absent must mean the shipping default rather than false. The
                     // default itself is resolved fresh per request so a fleet-wide env override
                     // (TITANARUM_STREAM_TABLES_DEFAULT) needs only a process restart, not a redeploy.
-                    boolFormDefault(ctx, "streamTables",
-                            PdfTitanArumApp.resolveRestStreamTablesDefault(
-                                    streamTablesDefaultEnvLookup.apply(
-                                            PdfTitanArumApp.STREAM_TABLES_REST_DEFAULT_ENV))),
+                    boolFormDefault(ctx, "streamTables", fleetStreamTablesDefault()),
                     boolForm(ctx, "skipPageExport"),
                     boolForm(ctx, "skipTextUrls"),
                     boolForm(ctx, "skipQr"),

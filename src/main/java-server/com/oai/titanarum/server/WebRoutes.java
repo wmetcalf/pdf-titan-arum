@@ -36,6 +36,10 @@ public class WebRoutes {
             model.put("totalPages", totalPages);
             model.put("totalCount", total);
             model.put("statusFilter", statusFilter);
+            // Render the checkbox from the SAME resolved default the REST binding uses. Hardcoding
+            // `checked` made every browser submission carry an explicit value, so the fleet-wide
+            // env override could never affect the UI at all.
+            model.put("streamTablesDefault", ApiRoutes.fleetStreamTablesDefault());
             render(ctx, "job-list.html", model);
         });
 

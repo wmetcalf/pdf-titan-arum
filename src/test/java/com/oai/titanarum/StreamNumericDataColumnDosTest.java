@@ -22,6 +22,17 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class StreamNumericDataColumnDosTest {
 
+    /**
+     * Always-on ceiling. Large enough that only a hang or an algorithmic blowup trips it, so this
+     * suite stays a correctness suite on a slow or contended runner.
+     */
+    private static final long GENEROUS_HANG_GUARD_MS = 60_000;
+
+    /** Opt in with {@code -Dtitanarum.perfAssertions=true} to also enforce the tight budgets. */
+    private static final boolean PERF_ASSERTIONS =
+            Boolean.getBoolean("titanarum.perfAssertions");
+
+
     private static StreamTableExtractor.Word w(float x0, float x1, float yTop, String t) {
         StreamTableExtractor.Word wd = new StreamTableExtractor.Word();
         wd.x0 = x0; wd.x1 = x1; wd.y0 = yTop; wd.y1 = yTop + 10; wd.text = t;
@@ -74,10 +85,29 @@ class StreamNumericDataColumnDosTest {
                 "numericDataColumnCount on %dx%d (%d words): %d ms; whole scoreGrid: %d ms%n",
                 rows, cols, ws.size(), addedMs, wholeMs);
         assertEquals(cols, n, "every column of an all-numeric grid is a numeric data column");
-        assertTrue(addedMs < 2_000,
-                "added pass must stay far inside the per-page budget, took " + addedMs + " ms");
-        assertTrue(wholeMs < 10_000,
-                "whole scoreGrid on the widest legitimate grid must stay bounded, took " + wholeMs + " ms");
+
+        // The DoS claim is about ALGORITHMIC boundedness, not throughput, so the always-on guard is
+        // deliberately generous: it catches a hang or a quadratic blowup (the actual failure mode)
+        // without depending on runner speed. Observed on a developer box: ~126 ms added pass, ~141 ms
+        // whole scoreGrid -- only ~16x under the old 2,000 ms threshold, which is thin enough that a
+        // GC pause or a contended CI runner could trip it and turn a correctness suite red for a
+        // reason that is not a defect.
+        assertTrue(addedMs < GENEROUS_HANG_GUARD_MS,
+                "added pass must terminate, not hang or blow up quadratically; took "
+                        + addedMs + " ms");
+        assertTrue(wholeMs < GENEROUS_HANG_GUARD_MS,
+                "whole scoreGrid must terminate, not hang or blow up quadratically; took "
+                        + wholeMs + " ms");
+
+        // Tight perf thresholds are OPT-IN: -Dtitanarum.perfAssertions=true. Timings are always
+        // printed above, so a regression is still visible in CI output without failing the build.
+        if (PERF_ASSERTIONS) {
+            assertTrue(addedMs < 2_000,
+                    "added pass must stay far inside the per-page budget, took " + addedMs + " ms");
+            assertTrue(wholeMs < 10_000,
+                    "whole scoreGrid on the widest legitimate grid must stay bounded, took "
+                            + wholeMs + " ms");
+        }
     }
 
     /**

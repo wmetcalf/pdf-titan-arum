@@ -1336,14 +1336,31 @@ final class TableExtractor {
     static void fillCellsFromPositions(List<CellRect> cells, List<TextPosition> positions,
                                         int rotation, float unrotatedW, float unrotatedH,
                                         long[] work, long budget) {
+        // A glyph's rotated midpoint depends only on the glyph and the page rotation, NOT on the
+        // cell -- but it used to be computed inside the per-cell loop, so each position paid four
+        // PDFBox accessor calls (each re-deriving from the text matrix) plus a float[] allocation
+        // once PER CELL. MEASURED at 2.49us per (cell, glyph) pair, which meant the 20,000,000-pair
+        // MAX_TEXTFILL_WORK budget took ~50s to trip: the budget bounded the pair COUNT but not the
+        // CPU it exists to bound, which is the DoS this cap was added for.
+        // Hoisted to O(positions) instead of O(cells x positions). The precompute is charged against
+        // the same budget so the bound covers all the work, not just the comparison phase.
+        final int n = positions.size();
+        final float[] mx = new float[n];
+        final float[] my = new float[n];
+        for (int i = 0; i < n; i++) {
+            if (++work[0] > budget) throw new RulingOverflowException();
+            TextPosition tp = positions.get(i);
+            float ux = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
+            float uy = tp.getYDirAdj() - tp.getHeightDir() / 2;
+            float[] v = applyPageRotation(ux, uy, rotation, unrotatedW, unrotatedH);
+            mx[i] = v[0];
+            my[i] = v[1];
+        }
         for (CellRect c : cells) {
             List<TextPosition> in = new ArrayList<>();
-            for (TextPosition tp : positions) {
+            for (int i = 0; i < n; i++) {
                 if (++work[0] > budget) throw new RulingOverflowException();
-                float ux = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
-                float uy = tp.getYDirAdj() - tp.getHeightDir() / 2;
-                float[] v = applyPageRotation(ux, uy, rotation, unrotatedW, unrotatedH);
-                if (v[0] >= c.x0 && v[0] <= c.x1 && v[1] >= c.y0 && v[1] <= c.y1) in.add(tp);
+                if (mx[i] >= c.x0 && mx[i] <= c.x1 && my[i] >= c.y0 && my[i] <= c.y1) in.add(positions.get(i));
             }
             c.text = joinText(in);
         }

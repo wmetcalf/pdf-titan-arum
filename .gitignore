@@ -38,3 +38,8 @@ AGENTS.md
 .venv/
 .superpowers/
 corpus/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/

@@ -5,13 +5,11 @@
 # here — the WORKER image (Dockerfile.titanarum-cold-worker) carries those;
 # this tier is the pure-Python host.
 #
-# Clone of RedTusk's deploy/docker/Dockerfile.host. titanarum has no ingress
-# extension yet (no titanarum/blastbox_ingress.py) — so, unlike RedTusk, this
-# image does NOT set BLASTBOX_INGRESS_EXTENSION and does NOT import a
-# titanarum ingress module. It imports `blastbox.host.ingress.app` (the
-# generic core: submit/status/list/artifacts/result/similar/auth/health/
-# metrics) and `titanarum.engine` only. Add the ingress extension + its ENV
-# here once titanarum/blastbox_ingress.py exists.
+# Clone of RedTusk's deploy/docker/Dockerfile.host. Mirrors RedTusk: the
+# titanarum ingress extension (titanarum/blastbox_ingress.py) mounts the
+# packaged web UI + the report.json convenience route on top of
+# `blastbox.host.ingress.app` (the generic core: submit/status/list/artifacts/
+# result/auth/health/metrics) via BLASTBOX_INGRESS_EXTENSION below.
 #
 # Build context = repo root:
 #   docker build -f deploy/docker/Dockerfile.titanarum-host -t titanarum:<tag> .
@@ -51,10 +49,12 @@ RUN python3 -m venv /opt/titanarum \
     && /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]==0.1.17" \
     && /opt/titanarum/bin/pip install --no-cache-dir /tmp/build \
     && rm -rf /tmp/build \
-    && /opt/titanarum/bin/python -c "import blastbox.host.ingress.app, titanarum.engine; print('host ok')"
+    && /opt/titanarum/bin/python -c "import blastbox.host.ingress.app, titanarum.engine, titanarum.blastbox_ingress; print('host ok')"
 
 ENV PATH=/opt/titanarum/bin:$PATH \
-    BLASTBOX_ALLOWED_ENGINES=titanarum
+    BLASTBOX_ALLOWED_ENGINES=titanarum \
+    BLASTBOX_INGRESS_EXTENSION=titanarum.blastbox_ingress:make_extension \
+    TITANARUM_SERVE_UI=1
 
 USER 10001:10001
 WORKDIR /var/lib/titanarum

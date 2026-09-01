@@ -7,12 +7,14 @@
 # names (titanarum-bb-*) by project, so this stack cannot collide with any
 # other blastbox.host project (e.g. redtusk-bb, clippyshot) sharing the host.
 #
-# The ingress is `blastbox serve`; titanarum has no ingress extension yet
-# (no titanarum/blastbox_ingress.py), so the api runs the generic blastbox
-# core routes only (submit/status/list/artifacts/result/similar/auth/health/
-# metrics) — no BLASTBOX_INGRESS_EXTENSION is set. The dispatcher is
-# `blastbox dispatch`: it claims queued jobs and launches one hardened,
-# disposable titanarum-cold-worker container per job (runsc by default).
+# The ingress is `blastbox serve`; the api mounts titanarum's ingress extension
+# (titanarum/blastbox_ingress.py, via BLASTBOX_INGRESS_EXTENSION below) on top
+# of the generic blastbox core routes (submit/status/list/artifacts/result/
+# auth/health/metrics) — this is what serves the packaged web UI + the
+# report.json convenience route. The dispatcher does NOT set
+# BLASTBOX_INGRESS_EXTENSION (it never serves HTTP, only `blastbox dispatch`:
+# it claims queued jobs and launches one hardened, disposable
+# titanarum-cold-worker container per job (runsc by default)).
 # Only the dispatcher touches the Docker socket; the api never does.
 #
 # Clone of RedTusk's deploy/docker/docker-compose.yml (see that file for the
@@ -114,10 +116,10 @@ services:
       # gate there enforces equality).
       - BLASTBOX_MAX_METADATA=${BLASTBOX_MAX_METADATA:-104857600}
       - BLASTBOX_ALLOWED_ENGINES=titanarum
-      # NOTE: no BLASTBOX_INGRESS_EXTENSION here — titanarum/blastbox_ingress.py
-      # does not exist yet. Add
-      # `BLASTBOX_INGRESS_EXTENSION=titanarum.blastbox_ingress:make_extension`
-      # once it lands (and rebuild Dockerfile.titanarum-host to import it).
+      - BLASTBOX_INGRESS_EXTENSION=titanarum.blastbox_ingress:make_extension
+      # Set to 0 to skip mounting the packaged web UI (still serves the generic
+      # blastbox JSON API + titanarum's report.json convenience route).
+      - TITANARUM_SERVE_UI=${TITANARUM_SERVE_UI:-1}
       # Per-job tier routing (target_tier pins which dispatcher tier claims a job) is an
       # OPERATOR/TEST knob — needed for the 3-tier (cold/FC/gVisor) parity gate.
       # Default ON here (unlike RedTusk's default-off) per the titanarum deploy plan.

@@ -1,0 +1,138 @@
+name: CI
+
+# NOTE ON TRIGGERS: `pull_request` deliberately has NO `branches:` filter.
+# This repo develops in stacked PRs (#3 -> #4 -> #5), where each PR targets the
+# branch below it rather than master. A `branches: [master]` filter — the common
+# default — would silently skip every one of them, which is exactly how an
+# ~8,000-line stack went six weeks without a single automated check.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  java:
+    name: Java (mvn test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+          cache: maven
+
+      # -Pserver is deliberate. The DEFAULT profile does not compile
+      # src/main/java-server and excludes **/Server*Test.java plus
+      # LocalArtifactStoreTest, so a default-profile run leaves the server
+      # sources and 4 test classes entirely unbuilt. Running the default profile
+      # here would have shipped a CI that never compiled a chunk of the tree --
+      # and in fact LocalArtifactStoreTest was already broken and invisible.
+      # 517 tests under -Pserver vs 487 under the default.
+      - name: mvn test (server profile)
+        run: mvn -B --no-transfer-progress -Pserver test
+
+      # A green `mvn` exit code is not by itself proof the tests ran: a surefire
+      # misconfiguration can pass with zero tests executed. Assert a real count.
+      - name: Assert the suite actually ran
+        run: |
+          python3 - <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+          reports = glob.glob("target/surefire-reports/TEST-*.xml")
+          if not reports:
+              sys.exit("no surefire reports: the test phase did not run")
+          t = f = e = s = 0
+          for x in reports:
+              r = ET.parse(x).getroot()
+              t += int(r.get("tests", 0)); f += int(r.get("failures", 0))
+              e += int(r.get("errors", 0)); s += int(r.get("skipped", 0))
+          print(f"tests={t} failures={f} errors={e} skipped={s} classes={len(reports)}")
+          if t < 400:
+              sys.exit(f"expected the full suite (~517 under -Pserver), only {t} ran")
+          if f or e:
+              sys.exit(f"{f} failure(s), {e} error(s)")
+          PY
+
+      - name: Upload surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: ignore
+
+  python:
+    name: Python (ruff + mypy + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      # node is used by tests/test_app_js_url_schemes.py, which drives the real
+      # functions out of static/assets/app.js rather than re-implementing them.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff
+        run: ruff check .
+
+      - name: mypy
+        run: mypy titanarum
+
+      # jvm/docker-marked tests need a built jar or a Docker daemon; the java job
+      # covers the JVM side. Deselecting them here is deliberate, not an omission.
+      - name: pytest
+        run: pytest tests/ -m "not jvm and not docker"
+
+  integration:
+    name: Python -> JVM integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # The `jvm` marker covers the Python adapter driving the REAL jar. The java
+      # job runs JUnit only and cannot reach that boundary; the python job
+      # deselects it. Without this job nothing exercises it at all. The jar
+      # fixture builds via `mvn -DskipTests package` when target/ is empty.
+      - name: pytest -m jvm
+        run: pytest tests/ -m "jvm"

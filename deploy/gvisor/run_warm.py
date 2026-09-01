@@ -22,6 +22,7 @@ from pathlib import Path
 
 from blastbox.limits import Limits
 from blastbox.worker.warm import FileWarmControl, serve_warm
+
 # NOTE: `engines` (/opt/blastbox/engines.py, on sys.path[0]) is imported LAZILY inside main()
 # so an import/engine-resolution failure is caught + logged + breadcrumbed rather than killing
 # the process at module load (before logging is configured), and so this module stays importable
@@ -80,7 +81,9 @@ def main() -> None:
     except Exception as exc:
         # Bad engine name / missing engines.py would otherwise be a silent death → host
         # ready-timeout with no cause. Log loudly + breadcrumb, then exit non-zero.
-        _log.exception("run_warm: engine setup failed (engine=%r) — worker cannot serve", _engine_name())
+        _log.exception(
+            "run_warm: engine setup failed (engine=%r) — worker cannot serve", _engine_name()
+        )
         _write_setup_breadcrumb(f"engine setup failed: {exc!r}")
         raise
     _log.info(

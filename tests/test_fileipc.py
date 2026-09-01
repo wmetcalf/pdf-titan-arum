@@ -194,7 +194,8 @@ def test_stream_tables_falsey_env_values_are_off_exactly_like_its_siblings(monke
         over = eng._env_param_overrides()
         assert over["stream_tables"] is True, f"{value!r} must be ON"
         assert over["stream_tables"] is over["skip_images"], f"{value!r} must parse like siblings"
-    # Empty string = "operator set the compose variable but left it blank" -> NOT INJECTED AT ALL, so
+    # Empty string = "operator set the compose variable but left it blank" -> NOT INJECTED
+    # AT ALL, so
     # _DEFAULT_JOB applies. Note what this means now that the default is ON: an empty
     # TITANARUM_STREAM_TABLES leaves the stream path ENABLED. Empty means "no opinion", not "off" --
     # exactly as it does for every sibling toggle. To disable, send a falsey value, not a blank one.

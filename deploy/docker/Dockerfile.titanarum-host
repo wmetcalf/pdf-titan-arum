@@ -35,18 +35,18 @@ https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.lis
     && groupadd --gid 10001 titanarum \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin titanarum
 
-# Pin blastbox[host] to the exact deployed wheel (0.1.17) so the whole
+# Pin blastbox[host] to the exact deployed wheel (0.1.27) so the whole
 # titanarum-bb stack — this host image AND the cold-worker image
 # (Dockerfile.titanarum-cold-worker) — runs one blastbox version. Then
 # install the local titanarum package WITH its declared deps (pip sees
-# blastbox already satisfied within its >=0.1.15,<0.2 range and reuses it
+# blastbox already satisfied within its >=0.1.27,<0.2 range and reuses it
 # rather than re-resolving), so titanarum.engine imports cleanly.
 WORKDIR /tmp/build
 COPY pyproject.toml README.md /tmp/build/
 COPY titanarum /tmp/build/titanarum
 RUN python3 -m venv /opt/titanarum \
     && /opt/titanarum/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]==0.1.17" \
+    && /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]==0.1.27" \
     && /opt/titanarum/bin/pip install --no-cache-dir /tmp/build \
     && rm -rf /tmp/build \
     && /opt/titanarum/bin/python -c "import blastbox.host.ingress.app, titanarum.engine, titanarum.blastbox_ingress; print('host ok')"

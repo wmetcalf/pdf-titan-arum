@@ -44,6 +44,13 @@ mvn package
 mvn package -Pserver
 ```
 
+No prebuilt JAR ships in this repo — **build it**. `mvn package` also drops a convenience copy
+in `dist/` (the `copy-to-dist` antrun execution), which is a build output and is gitignored;
+`target/…` is the path every command below, and every `deploy/` Dockerfile, actually uses. Two
+builds of identical source are not byte-identical (the shade plugin stamps entry timestamps), so
+a committed JAR could never be verified against source anyway — treat any `dist/` JAR you find as
+being exactly as old as your last `mvn package`.
+
 ---
 
 ## Quick Start
@@ -93,6 +100,7 @@ java -jar target/pdf-titan-arum-1.3.0.jar \
   [--skip-images]                 # skip drawn and resource image extraction
   [--skip-phones]                 # skip phone number extraction
   [--skip-tables]                 # skip table extraction (tables: [] in report.json)
+  [--stream-tables[=<true|false>]] # ALSO extract borderless (whitespace-only) tables — ON by default; --stream-tables=false disables
   [--skip-page-export]            # skip per-page PDF export
   [--skip-text-urls]              # skip PDFTextStripper; only annotation URLs extracted (~370ms faster)
   [--no-skip-blanks]              # disable blank-page replacement; process original selection including blanks
@@ -221,6 +229,7 @@ java -jar target/pdf-titan-arum-server-1.3.0.jar server \
 | `OPENAI_BASE_URL`  | —       | OpenAI-compatible API base URL; enables AI analysis when set  |
 | `OPENAI_API_KEY`   | —       | API key (use `none` for local unauthenticated models)         |
 | `OPENAI_MODEL`     | —       | Model name (auto-detected from `/models` if not set)          |
+| `TITANARUM_STREAM_TABLES_DEFAULT` | on (unset) | Fleet-wide `streamTables` default — `false`/`0`/`off`/`no` disables it for every job submitted from that point on; requires restarting the server process to take effect. Applies to a REST submission that omits the field **and** to the web UI, whose checkbox is rendered from this same value (it is not hardcoded). Explicit per-job `streamTables=` still overrides it either way. See [Turning it off](#turning-it-off). |
 
 ### AI analysis (server)
 
@@ -273,13 +282,33 @@ Each job's `report.json` (and the web UI) will include an `aiAnalysis` block:
 
 | Method   | Path                              | Description                                                   |
 |----------|-----------------------------------|---------------------------------------------------------------|
-| `POST`   | `/api/jobs`                       | Submit a PDF (`multipart/form-data`, field `file`). Boolean fields: `skipScreenshots`, `skipImages`, `skipPhones`, `skipPageExport`, `skipTextUrls`, `skipQr`, `ocrScreenshots`, `ocrUrlCrops`, `addLinkAnnotations`, `noSkipBlanks`. String fields: `password` (encrypted PDFs; cleared from DB after worker reads it), `pagesSpec` (e.g. `1-4,z` or `all`; default: server default), `ocrLang` (e.g. `eng+deu`; default: server `OCR_LANG`). Numeric fields: `dpi` (50–600; default: 150), `timeoutSeconds` (5–3600; default: server `TIMEOUT`). Returns `{id, status, filename}`. |
+| `POST`   | `/api/jobs`                       | Submit a PDF (`multipart/form-data`, field `file`). Boolean fields: `skipScreenshots`, `skipImages`, `skipPhones`, `skipTables`, `skipPageExport`, `skipTextUrls`, `skipQr`, `ocrScreenshots`, `ocrUrlCrops`, `addLinkAnnotations`, `noSkipBlanks` — all default **off**, so sending nothing means off. `streamTables` is the exception: it defaults **on**, so omitting it leaves borderless extraction enabled and disabling it needs an explicit `streamTables=false` (`0`/`off`/`no` also work). String fields: `password` (encrypted PDFs; cleared from DB after worker reads it), `pagesSpec` (e.g. `1-4,z` or `all`; default: server default), `ocrLang` (e.g. `eng+deu`; default: server `OCR_LANG`). Numeric fields: `dpi` (50–600; default: 150), `timeoutSeconds` (5–3600; default: server `TIMEOUT`). Returns `{id, status, filename}`. |
 | `GET`    | `/api/jobs`                       | List jobs. Query params: `page`, `size`, `status`.            |
 | `GET`    | `/api/jobs/{id}`                  | Job detail including full `report` JSON.                      |
 | `DELETE` | `/api/jobs/{id}`                  | Delete job and all artifacts.                                 |
 | `GET`    | `/api/jobs/{id}/download`         | Download all artifacts as ZIP.                                |
 | `GET`    | `/api/jobs/{id}/artifacts/{path}` | Serve individual artifact file.                               |
 | `GET`    | `/api/jobs/{id}/status`           | SSE stream of live job status updates.                        |
+
+Both table-extraction knobs are exposed: `skipTables` (default off) and `streamTables` (default
+**on** — see [Borderless tables are on by default](#borderless-tables-are-on-by-default--and-what-that-costs)).
+`WorkerPool.configureApp` copies the stored row onto the triage app, so whatever a submission asked for
+is what the worker runs.
+
+Because `streamTables` defaults on, its form field is **tri-state**: an absent field means the shipping
+default, and only an explicit falsey value disables it. The web UI therefore pairs a hidden
+`streamTables=false` with a pre-checked checkbox — an unticked HTML checkbox submits nothing at all,
+which for a default-on flag is indistinguishable from "field omitted", so without the hidden companion
+the box could not be unticked.
+
+The same default is declared independently in four places that must agree, in three languages (CLI
+`@Option`, the `PdfTitanArumApp.streamTables` field initializer, `JobDescriptor`'s absent-key
+resolution, and `titanarum/engine.py`'s `_DEFAULT_JOB`). The three Java ones all read
+`PdfTitanArumApp.STREAM_TABLES_DEFAULT`; `StreamTablesDefaultCoherenceTest` parses the Python source
+and fails if it disagrees, so the default cannot be flipped on one surface only. (The
+`jobs.stream_tables` column default is deliberately *not* one of these four — see
+[Turning it off](#turning-it-off) — and neither is the `TITANARUM_STREAM_TABLES_DEFAULT` env override
+described there, which has nothing to drift from.)
 
 ---
 
@@ -408,14 +437,25 @@ keys are dropped before the allowlist). They map onto the same knobs as the CLI 
 | `TITANARUM_DPI` | render DPI (clamped to 1–600) | 150 |
 | `TITANARUM_PAGES` | page spec (`1-4,z`, `all`) | first 4 + last |
 | `TITANARUM_SKIP_QR` · `_SCREENSHOTS` · `_IMAGES` · `_PHONES` · `_TABLES` · `_PAGE_EXPORT` · `_TEXT_URLS` | disable a stage | off |
+| `TITANARUM_STREAM_TABLES` | borderless (whitespace-only) table extraction — set `0`/`false`/`no`/`off` to **disable**; see [Tables](#tables) for the measured quality and its limits. An *empty* value means "no opinion" (like every sibling toggle) and leaves it enabled | **on** |
 | `TITANARUM_OCR_SCREENSHOTS` · `_OCR_URL_CROPS` · `_OCR_LANG` | OCR toggles + language | off / `eng` |
 | `TITANARUM_NO_SKIP_BLANKS` · `_ADD_LINK_ANNOTATIONS` | blank-page + link-annotation behavior | off |
 | `TITANARUM_PASSWORD` | password for encrypted PDFs (cleared after the worker reads it) | — |
 
 **Allowlist:** the compose stack forwards only `TITANARUM_SKIP_SCREENSHOTS`, `TITANARUM_SKIP_IMAGES`,
-`TITANARUM_DPI`, `TITANARUM_PAGES` **by default** (`BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS` in
-`docker-compose.yml` / `.env`). To forward any other row above, add its key to that allowlist —
-unlisted (and any lowercase) keys are dropped before they reach the worker.
+`TITANARUM_DPI`, `TITANARUM_PAGES`, `TITANARUM_STREAM_TABLES`, `TITANARUM_SKIP_TABLES` **by default**
+(`BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS` in `docker-compose.yml` / `.env`). To forward any other row
+above, add its key to that allowlist — unlisted (and any lowercase) keys are dropped before they
+reach the worker, SILENTLY (no error, no rejected job — the job just runs without that knob; the
+dispatcher logs one `dropping non-allowlisted extra_env key` warning, which is the only trace).
+
+> **Upgrading an existing deploy:** the compose files spell the allowlist
+> `${BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS:-<default>}`, so an **`.env` you created earlier wins over
+> the default above**. `TITANARUM_STREAM_TABLES` / `TITANARUM_SKIP_TABLES` were added to the default
+> set after the first deploys; if your `deploy/docker/.env` still pins the older four-key value, the
+> table knobs are dropped and **borderless extraction runs at its default (now on) no matter what a job
+> asks for** — including a job that asked to turn it off. Diff your `.env` against
+> `deploy/docker/.env.example` after pulling.
 
 Stack-level env (`deploy/docker/.env.example`): `POSTGRES_PASSWORD` (required), `TITANARUM_PORT`
 (8004), `TITANARUM_BIND_ADDR` (set `127.0.0.1` to keep it off the network — **the api does not
@@ -583,6 +623,133 @@ Four additional action types in a unified `actions[]` model:
 - libphonenumber extraction from visible page text and JavaScript content
 - E.164 normalisation, country code, geocode
 
+### Tables
+
+Three independent extraction paths feed `tables[]`, each tagging its hits with `extractionMethod`:
+
+| Path | `extractionMethod` | Evidence it rests on | Default |
+|---|---|---|---|
+| Tagged | `tagged` | the PDF's own structure tree (`/Table`, `/TR`, `/TD`) | **on** |
+| Lattice | `lattice` | rulings actually drawn on the page | **on** |
+| Stream | `stream` | whitespace alone — no rulings, no tags | **on** (disable with `--stream-tables=false`) |
+
+When more than one path produces a candidate for the same region, a per-region arbitration picks one
+using extraction-time signals only (drawn-grid occupancy, row/column counts, and the stream path's own
+gridness confidence). A `tagged` candidate is never arbitrated away.
+
+#### Borderless tables are on by default — and what that costs
+
+The whitespace path is **on by default**. It infers a table from glyph positions alone, with no
+ruling and no tag to rest on, so the case for enabling it by default is entirely empirical.
+
+**Quality.** ICDAR 2013 competition set, adjacency-relation F1 over de-duplicated ground truth
+(156 tables / 25,317 relations), macro over 77 units:
+
+| Configuration | document-POOLED, all pages | POOLED, shipping `--pages default` | 1:1 pairing, all pages |
+|---|---|---|---|
+| `tagged` + `lattice` only | 0.5114 | 0.4938 | 0.5207 |
+| full arbitrated pipeline (default) | **0.8199** | **0.7999** | **0.8675** |
+
+Two protocols are quoted because they answer different questions. POOLED is the harness's end-to-end
+number, but it is **blind to table segmentation quality** (feeding ground truth in as its own detector
+scores 0.9531 pooled versus 0.4238 at 1:1), so it flatters any extractor that gets the cells right and
+the boundaries wrong. The number comparable to published work is **~0.73 end-to-end under 1:1**, which
+places this between TABFIND (0.6962) and Nitro (0.7535), and below Acrobat (0.7685), TEXUS (0.8259),
+Nurminen (0.8374, the best pure heuristic), OmniPage (0.8420) and FineReader (0.8772). It is not
+state of the art.
+
+**The gain is corpus-composition dependent, and that is the honest headline.** On the 22 documents in
+the set whose tables are genuinely borderless, the ruled and tagged paths score **0.0000** and this
+scores **0.7507** — they cannot see those tables at all. On the icdar-EU subset the flag is worth
+about **+0.20**; on icdar-US about **+0.055**; on a corpus whose tables are all ruled it is worth
+**nothing**. If your documents are all invoices with drawn grids, this default changes nothing for you
+except a little CPU.
+
+The clearest signal is not the metric but content recovery — of ground-truth cell text, ignoring table
+shape entirely: exact recovery rises **26.0% → 86.8%** and content lost falls **67.7% → 11.5%**.
+
+**Cost.** On a 200-PDF sample of real-world (phishing-corpus) PDFs, under the shipping page selection,
+the share of documents where the pipeline emits **at least one table at all** — prose with no table in
+it — rises:
+
+| | flag off | flag on |
+|---|---|---|
+| 200-PDF sample | 7/200 | 12/200 |
+| 1,599-PDF population | 76/1,599 | 118/1,599 |
+
+Taken at face value that is +2.5 percentage points of false positives. It is worth less than it looks:
+all 44 documents the flag adds across the population were hand-adjudicated, and **25 are genuine
+tables** the ruled path was missing, **10 are arguable**, and **9 were fabrications** — of which 4 have
+since been fixed. So the real added-fabrication rate is about **0.3%**, not 2.5%. That is the number
+the default was chosen on; the raw rate is reported here too because it is what the metric says.
+
+**Why on, for a tool that triages hostile input.** A fabricated table is still the more expensive
+error. What justifies the default is the per-document ledger: **39 documents improve, 3 regress** —
+85:1 by relation weight over all pages, 115:1 under the shipping page selection, never below 84:1
+under any scope tested. All three regressions were hand-adjudicated as **metric artifacts** whose
+flag-on output contains strictly *more* ground-truth content than the flag-off output. Over 1,599
+real-world PDFs: 42 documents gain a table, 1 has a table replaced by a superset of itself, and **0
+lose one**.
+
+**Speed is not the constraint.** Marginal cost of the stream path is p50 **0.077 ms**, p95 **4.7 ms**,
+worst real document **+16.7 ms**; end-to-end p50 moves 260.8 ms → 261.2 ms. A hostile page stays
+bounded by the `MAX_STREAM_*` work budgets: worst constructible case ~405 ms/page and ~1.9 s/document,
+always reported with `truncated=true` rather than partial output.
+
+#### Turning it off
+
+The flag is switchable off **per job on every surface**, and none of these fall back to the default:
+
+| Surface | Off switch |
+|---|---|
+| CLI | `--stream-tables=false` (a bare `--stream-tables` still means *on*) |
+| REST | form field `streamTables=false` (also `0`, `off`, `no`), or untick the box in the web UI |
+| blastbox `job.json` | `"stream_tables": false` |
+| blastbox env | `TITANARUM_STREAM_TABLES=0` (also `false`, `no`, `off`) |
+| whole fleet, no redeploy | `TITANARUM_STREAM_TABLES_DEFAULT=false` (also `0`, `off`, `no`) in the Java server's environment, plus `TITANARUM_STREAM_TABLES=0` for the sandboxed workers. With the bundled `docker-compose.yml`, set it in that file's `environment:` map — it is an explicit map, so exporting the variable in your shell does not reach the container. |
+
+Note that an **empty** `TITANARUM_STREAM_TABLES=` (or `TITANARUM_STREAM_TABLES_DEFAULT=`) means "no
+opinion", not "off" — exactly as it does for every sibling toggle — so it leaves the default in place.
+Use `0` to disable.
+
+**"No redeploy" means no new binary, not "no restart."** The Java server resolves
+`TITANARUM_STREAM_TABLES_DEFAULT` from its own process environment on every submission, so a running
+server does not pick up a changed value until its container/process is restarted with the new env var
+set — a config-and-restart operation, not a code deployment. Do **not** use
+`ALTER TABLE jobs ALTER COLUMN stream_tables SET DEFAULT FALSE;` for this: `JobRepository.insert`
+always supplies the `stream_tables` column explicitly, so the column's own default is never consulted
+by a REST submission and that `ALTER` changes nothing an operator can observe. The column default
+exists solely to protect a rolling deploy against a pre-upgrade binary that predates this column
+entirely, and is pinned to `FALSE` for that reason regardless of the shipping default above (see
+`StreamTablesDefaultCoherenceTest`).
+
+Stream hits carry a `confidence` float in `[0,1]` (omitted entirely on `tagged`/`lattice` hits), so a
+downstream consumer can filter them further.
+
+**Caveats, stated plainly.**
+- With `--skip-text-urls` the stream path produces nothing at all: it is glyph-only and has no
+  region-strip fallback (the lattice path does, and still works).
+- `--skip-tables` disables every path and wins over `--stream-tables`.
+- The stream stage runs on at most the first 64 pages of a document that it does real work on; past
+  that it stops and sets `tablesTruncated`. That bounds a hostile document's worst case at roughly
+  26s of whitespace analysis (measured 411ms for the most expensive page constructible) instead of
+  growing without limit. No real document in either measured sample exceeds 15 pages.
+- Turning the flag on roughly doubles table-extraction cost on real documents (measured p50 0.3ms →
+  0.4ms, p95 13.5ms → 17.9ms per document over 277 real PDFs) — but table extraction is a small part
+  of a run, so end-to-end p50 moves 260.8ms → 261.2ms.
+- The default is declared in **four** independent places that must all agree (the CLI `@Option`, the
+  `PdfTitanArumApp.streamTables` field initializer, `JobDescriptor`'s absent-key resolution, and
+  `titanarum/engine.py`'s `_DEFAULT_JOB`). The three Java ones read
+  `PdfTitanArumApp.STREAM_TABLES_DEFAULT`; `StreamTablesDefaultCoherenceTest` parses the Python and
+  fails if it drifts. Flip all four or none.
+- The `jobs.stream_tables` column DEFAULT is deliberately **not** one of those four: it stays `FALSE`
+  regardless of the shipping default, because it only governs an INSERT from a binary that predates
+  this column and never calls `setStreamTables` — matching the shipping default there would let that
+  old binary's stored row claim a behaviour it never ran. `TITANARUM_STREAM_TABLES_DEFAULT` (the REST
+  env override above) is likewise not a fifth declaration to keep in sync: unset or unrecognised, it
+  falls straight through to `PdfTitanArumApp.STREAM_TABLES_DEFAULT`, so there is nothing for it to
+  drift from.
+
 ### Page PDFs
 - Selected pages exported as individual single-page PDFs
 - SHA-256 per exported page
@@ -661,7 +828,7 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 | `resourceImages`  | array  | `ImageArtifact[]` (XObject resource images)          |
 | `pagePdfs`        | array  | `PagePdfArtifact[]`                                  |
 | `pageTexts`       | array  | Per-page extracted text (first N processed pages)    |
-| `tables`          | array  | `TableHit[]` — extracted tables (tagged-structure and ruled/lattice detection); empty if none or `--skip-tables` |
+| `tables`          | array  | `TableHit[]` — extracted tables (tagged-structure and ruled/lattice detection, plus borderless/whitespace detection, which is on unless `--stream-tables=false`); empty if none or `--skip-tables`. `stream` hits carry a `confidence` float; see [Tables](#tables) |
 | `tablesTruncated` | bool   | `true` if table extraction hit an internal safety cap (omitted otherwise) |
 | `ocgLayers`       | array  | `OcgLayer[]` — optional content groups / hidden layers |
 | `formFields`      | array  | `FormFieldHit[]` — suspicious AcroForm fields (hidden, base64 payloads, Name value encoding) |

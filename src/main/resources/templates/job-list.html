@@ -31,6 +31,16 @@
         </label>
       </div>
       <div style="margin-top:6px; display:flex; flex-direction:column; gap:3px; padding-left:2px; border-top:1px solid #333; padding-top:6px">
+        <!-- An unchecked HTML checkbox submits NOTHING, which a default-ON flag cannot distinguish
+             from "field omitted". The paired hidden field makes unchecked submit an explicit false;
+             checked submits [false, true] and ApiRoutes' boolFormDefault takes the LAST value. Do
+             not remove the hidden input: without it the box becomes impossible to untick.
+
+             `checked` is driven by streamTablesDefault (ApiRoutes.fleetStreamTablesDefault(), i.e.
+             TITANARUM_STREAM_TABLES_DEFAULT) and must NOT be hardcoded. It was, and because the
+             pair always submits an explicit value, the fleet-wide off switch had no effect on any
+             job submitted from this form -- while the box still rendered ticked. -->
+        <label title="Extract borderless (whitespace-aligned) tables as well as ruled/tagged ones. ON by default: big recall win on borderless tables (ICDAR-2013 macro F1 0.5114 -> 0.8199), small precision cost on prose. Ignored when 'Skip table extraction' is checked."><input type="hidden" name="streamTables" value="false"><input type="checkbox" name="streamTables" value="true"{% if streamTablesDefault %} checked{% endif %}> Extract borderless tables (stream) <span style="color:#777">&mdash; {% if streamTablesDefault %}on{% else %}off{% endif %} by default</span></label>
         <label><input type="checkbox" name="addLinkAnnotations"> Add link annotations for bare URLs</label>
         <label><input type="checkbox" name="noSkipBlanks"> Disable blank-page skipping</label>
         <label style="display:flex; gap:6px; align-items:center">

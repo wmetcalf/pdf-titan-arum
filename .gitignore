@@ -1,5 +1,13 @@
 # Maven
 target/
+# `mvn package` copies the fat JAR here (the copy-to-dist antrun execution, in BOTH the
+# default build and the -Pserver profile), so this directory is a BUILD OUTPUT, not a
+# release artifact. It used to hold a tracked pdf-titan-arum-1.3.0.jar; that jar was
+# months stale (it predated the whole table-extraction subsystem -- its --help had no
+# --stream-tables/--skip-tables and it shipped 2 of the 10 top-level classes), nothing in
+# the repo referenced it (README/Dockerfiles/deploy scripts all use target/), and every
+# `mvn package` rewrote it and dirtied the working tree. Build it instead: see README "Build".
+dist/
 pom.xml.tag
 pom.xml.releaseBackup
 pom.xml.versionsBackup

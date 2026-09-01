@@ -1,6 +1,7 @@
 package com.oai.titanarum.server;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.oai.titanarum.PdfTitanArumApp;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HttpStatus;
@@ -14,6 +15,34 @@ import java.util.*;
 public class ApiRoutes {
 
     private static final long MAX_UPLOAD_BYTES = 500L * 1024 * 1024;
+
+    /**
+     * Environment lookup for {@link PdfTitanArumApp#STREAM_TABLES_REST_DEFAULT_ENV}, real
+     * {@code System::getenv} in production. Package-private and swappable ONLY so tests can exercise
+     * the fleet-wide env override end to end through the real route without mutating the JVM's actual
+     * environment (which Java cannot do for a running process anyway) -- mirrors the {@code nanoClock}
+     * injectable seam {@code PdfTitanArumApp#awaitGoSignal} uses for the same reason. Must be restored
+     * to {@code System::getenv} after any test that swaps it. {@code volatile} because tests
+     * write it from the JUnit thread while Jetty worker threads read it -- without it there is
+     * no happens-before edge and the override can be observed stale.
+     */
+    static volatile java.util.function.UnaryOperator<String> streamTablesDefaultEnvLookup =
+            System::getenv;
+
+    /**
+     * The fleet-wide stream-tables default, resolved once per call from the environment.
+     *
+     * <p>Single source of truth ON PURPOSE. The web UI must render its checkbox from the SAME
+     * value the REST binding uses as its absent-field default: when the two were resolved
+     * independently, the UI hardcoded {@code checked} and every browser submission therefore
+     * carried an EXPLICIT value, so the env override could never take effect on the primary
+     * human surface even though the README advertised it as fleet-wide.
+     */
+    public static boolean fleetStreamTablesDefault() {
+        return PdfTitanArumApp.resolveRestStreamTablesDefault(
+                streamTablesDefaultEnvLookup.apply(
+                        PdfTitanArumApp.STREAM_TABLES_REST_DEFAULT_ENV));
+    }
 
     public static void wire(Javalin app, JobRepository repo, ArtifactStore store, WorkerPool pool) {
 
@@ -44,6 +73,10 @@ public class ApiRoutes {
                     boolForm(ctx, "skipImages"),
                     boolForm(ctx, "skipPhones"),
                     boolForm(ctx, "skipTables"),
+                    // Default-ON, so absent must mean the shipping default rather than false. The
+                    // default itself is resolved fresh per request so a fleet-wide env override
+                    // (TITANARUM_STREAM_TABLES_DEFAULT) needs only a process restart, not a redeploy.
+                    boolFormDefault(ctx, "streamTables", fleetStreamTablesDefault()),
                     boolForm(ctx, "skipPageExport"),
                     boolForm(ctx, "skipTextUrls"),
                     boolForm(ctx, "skipQr"),
@@ -231,6 +264,35 @@ public class ApiRoutes {
     private static boolean boolForm(Context ctx, String name) {
         String v = ctx.formParam(name);
         return "true".equals(v) || "on".equals(v) || "1".equals(v);
+    }
+
+    /**
+     * TRI-STATE form flag: an ABSENT field means {@code def}, a present one means what it says.
+     *
+     * <p>{@link #boolForm} cannot express a default-ON flag. It maps absent to false, which is right
+     * for every {@code skip*} toggle (absent == unchecked == don't skip) but would make a default-ON
+     * flag impossible to leave on: a plain HTML checkbox submits NOTHING when unchecked, so
+     * "unchecked" and "field not sent at all" arrive identically. This helper distinguishes them by
+     * reading ALL values for the name rather than the first, which lets the template pair a hidden
+     * {@code false} with a checked checkbox -- unchecked submits {@code [false]}, checked submits
+     * {@code [false, true]}, and the LAST value wins (HTML submits controls in document order). A
+     * raw API client that omits the field entirely gets {@code def}.
+     *
+     * <p>An UNRECOGNISED value resolves to {@code def}, not to false: for a default-ON flag, letting
+     * a typo silently disable a detection stage is the worse failure.
+     */
+    private static boolean boolFormDefault(Context ctx, String name, boolean def) {
+        List<String> values = ctx.formParams(name);
+        for (int i = values.size() - 1; i >= 0; i--) {
+            String v = values.get(i) == null ? "" : values.get(i).trim();
+            if (v.isEmpty()) continue;
+            if (v.equalsIgnoreCase("true") || v.equals("1")
+                    || v.equalsIgnoreCase("on") || v.equalsIgnoreCase("yes")) return true;
+            if (v.equalsIgnoreCase("false") || v.equals("0")
+                    || v.equalsIgnoreCase("off") || v.equalsIgnoreCase("no")) return false;
+            return def;
+        }
+        return def;
     }
 
     /** Returns a validated float from a form field, or null if absent/invalid/out-of-range. */

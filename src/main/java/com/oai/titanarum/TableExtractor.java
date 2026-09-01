@@ -24,6 +24,7 @@ import org.apache.pdfbox.text.TextPosition;
 
 import java.awt.geom.Point2D;
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -48,6 +49,161 @@ final class TableExtractor {
 
     // Hostile-input bounds — over-cap drops the page/table and sets Result.truncated.
     static final int MAX_TABLES_PER_PAGE = 50;
+    /**
+     * Pages of ONE document the borderless ("stream") stage will run on before it stops and flags
+     * {@link Result#truncated}. Only relevant when that stage is enabled (see
+     * {@link #extract(PDDocument, List, Map, boolean)}); with it off nothing here runs.
+     *
+     * <p>WHY A DOCUMENT-LEVEL BOUND AT ALL. Every stream budget that existed before this stage was
+     * wired into production was PER PAGE. Measured (see {@code WiredDosProbe}), those per-page
+     * budgets do hold: the most expensive page that could be constructed -- a brick-offset word
+     * layout in which no two rows share a column boundary, so the gutter search can never terminate
+     * cheaply -- costs 411ms, and that figure is FLAT from 12,000 to 108,000 glyphs (at 108k the
+     * word/line caps abort the page early and it drops to 63ms). What was unbounded is the AGGREGATE:
+     * cost is linear in page count, 40 such pages measured at 15.5s, and {@code --timeout} defaults
+     * to 0 (no limit) on the CLI. So a hostile document could buy arbitrary stream work by simply
+     * being long.
+     *
+     * <p>SIZING, from measurements on real documents rather than taste. Across the 277 real PDFs this
+     * project measures on (the 77-unit ICDAR/tabula scoring corpus plus the 200-PDF real-world prose
+     * sample) the LONGEST document is 15 pages, and the deepest page index that ever produced a
+     * stream table is 14. The shipping page selection ({@code --pages default}) processes 5 pages.
+     * At 64 this budget is more than 4x the longest real document in either sample, so no real
+     * document measured here is affected, while the worst case a hostile document can buy from the
+     * stream stage is bounded at 64 x 411ms = ~26s instead of growing without limit.
+     *
+     * <p>RETRACTED PREMISE (this is the important part of this doc). The paragraph below used to
+     * justify measuring this stage in PAGES rather than in work by asserting that "the stream stage's
+     * per-page cost is nearly flat (411ms whatever the page holds, so pages are a good proxy for
+     * work)". That is <b>wrong by roughly 500x</b>, and the argument built on it was wrong with it.
+     * MEASURED through the production {@link #extract}: a single page of six 3-row x 3,000-column
+     * blocks of size-0.4 digits (a 135,316-byte file, 54,000 glyphs = 18% of {@code
+     * MAX_STREAM_GLYPHS}) cost <b>215.2 seconds</b>, not 411ms. Cost is linear in page count (1 page
+     * 9.2s, 4 pages 35.6s at cols=1,000). And because several {@code /Page} objects may SHARE one
+     * {@code /Contents} stream, page count is nearly free in FILE BYTES -- exactly the property the
+     * sibling {@link #MAX_LATTICE_DOC_WORK} doc cites as why lattice needed a WORK budget instead of a
+     * page count. Both together, measured end to end: EIGHT {@code /Page} objects sharing ONE
+     * {@code /Contents} stream, a <b>135,399-byte</b> file (83 bytes larger than the one-page
+     * version), cost <b>1,690,639 ms = 28.2 MINUTES</b> and reported {@code truncated=false}. At that
+     * measured 211 s/page, this constant's own 64-page allowance was <b>~3.8 HOURS</b> of CPU on a
+     * ~135KB file against the ~26 s bound claimed two paragraphs above -- with {@code --timeout}
+     * defaulting to 0 and the interrupt observed only BETWEEN pages, so even a configured timeout
+     * overruns by a whole page.
+     *
+     * <p>WHAT THIS CONSTANT IS NOW. Pages are no longer the instrument that bounds this stage; {@link
+     * #MAX_STREAM_DOC_WORK} is, levied on real charged work exactly like the lattice sibling. This
+     * page cap is RETAINED as a cheap secondary structural ceiling (it bounds the number of times the
+     * per-page fixed costs -- word/line clustering, block splitting -- are paid, which the work budget
+     * prices but does not itself limit), and its value is unchanged so no document's output moves
+     * because of this fix. It is no longer load-bearing for the DoS argument.
+     *
+     * <p>SUPERSEDED NOTE. This constant's doc used to record, as a deliberate non-claim, that it
+     * left the stream stage MORE tightly bounded than the lattice path, "whose own per-page cost
+     * (measured 157ms on a hostile page that drives {@link #MAX_TEXTFILL_WORK}) is still linear in
+     * page count with no document-level cap". That asymmetry is CLOSED: see {@link
+     * #MAX_LATTICE_DOC_WORK}. Both cut the document tail in page order and both set {@link
+     * Result#truncated}.
+     *
+     * <p>A legitimate 100-page document with borderless tables past page 64 loses them, with
+     * {@code tablesTruncated} set in report.json -- missing a table loudly, which this threat model
+     * prefers to either fabricating one or hanging.
+     */
+    static final int MAX_STREAM_PAGES_PER_DOC = 64;
+    /**
+     * Units of REAL borderless ("stream") work ONE document may charge before the stream stage stops
+     * processing further pages and flags {@link Result#truncated}. The work-budget sibling of {@link
+     * #MAX_LATTICE_DOC_WORK}, and the constant that actually bounds this stage (see the retracted
+     * premise on {@link #MAX_STREAM_PAGES_PER_DOC} for why its page count does not).
+     *
+     * <p>DENOMINATION. {@link StreamTableExtractor.PageAccount#totalWork()} -- the page's charged
+     * (column x word) grid work plus its charged gutter-search work scaled into the same unit by
+     * {@link StreamTableExtractor#FINDER_WORK_PER_GRID_UNIT}. Checked and accumulated BETWEEN pages,
+     * never inside one: the per-page budgets ({@link StreamTableExtractor#MAX_STREAM_PAGE_GRID_WORK},
+     * {@link StreamTableExtractor#MAX_GUTTER_SCAN_WORK}) already bound a single page, and stopping
+     * mid-page is the one thing this class never does.
+     *
+     * <p>SIZING, measured over the 277 real PDFs this project uses (77-unit ICDAR/tabula scoring
+     * corpus + 200-PDF real-world prose sample) -- 503 pages of 297 documents, ALL pages. Per-document
+     * total: p50 485, p90 20,548, p95 46,239, <b>WORST {@value
+     * StreamTableExtractor#REAL_CORPUS_WORST_DOC_WORK}</b> (us-018.pdf). At 24,000,000 this budget is
+     * <b>75x</b> the worst real document; even 64 pages each as expensive as the worst real PAGE
+     * measured (107,655) would reach only 6.9M, 29% of it. No document of either sample is affected --
+     * verified by re-running the full ICDAR adjacency benchmark at both page scopes under both
+     * protocols and the prose false-positive sample, and getting identical numbers.
+     *
+     * <p>WHAT IT BUYS, in wall clock. Every unit of this budget is at most ~32 ns of real time (grid
+     * work measured at 16.6 ns/unit at the worst shape the column cap admits; search work billed at
+     * 32 raw units = 21.4 ns per budget unit), so 24,000,000 units is <b>~0.8 s</b>, and the
+     * between-pages check lets one final page overrun by at most its own per-page budgets (~0.26 s of
+     * grid + ~0.38 s of search), for a worst case of <b>~1.4 s</b> of stream work per document.
+     *
+     * <p>WHAT THIS DELIBERATELY DOES NOT CLAIM. Like its lattice sibling, it does not bound PDFBox's
+     * own text-extraction cost: the CLI harvests glyphs for every selected page before {@link
+     * #extract} is called, and no budget in this class bounds that. It also does not price a
+     * bake-off-only {@link GutterFinder} implementation's search work (only the production {@link
+     * BreuelGutterFinder} reports it -- see {@link GutterFinder#find(java.util.List, float, float,
+     * float, long[])}), which is a measurement-harness concern, not a production one.
+     */
+    static final long MAX_STREAM_DOC_WORK = 24_000_000L;
+    /**
+     * Units of REAL lattice work ONE document may charge before the lattice path stops processing
+     * further pages and flags {@link Result#truncated}. Charged and checked between pages in
+     * {@link #extract(PDDocument, List, Map, boolean, long)}; the per-page budgets are untouched.
+     *
+     * <p>WHY A DOCUMENT-LEVEL BOUND AT ALL. Until this constant existed, EVERY lattice budget was
+     * per page ({@link #MAX_RULINGS_PER_PAGE}, {@link #MAX_INTERSECTIONS}, {@link
+     * #MAX_FINDCELLS_WORK}, {@link #MAX_GROUPING_WORK}, {@link #MAX_SPLIT_WORK}, {@link
+     * #MAX_TEXTFILL_WORK}, {@link #MAX_CLUMP_SPLIT_WORK}, {@link #MAX_CELLS_PER_TABLE}, {@link
+     * #MAX_TABLES_PER_PAGE}). Those hold: measured ({@code LatticeDosProbe}) the most expensive
+     * single lattice page constructible costs 278ms and charges 32M. What was UNBOUNDED is the
+     * aggregate -- measured 139.4ms/page, FLAT from 1 to 64 pages (64 pages = 8.9s), and page count
+     * is attacker-controlled at near-zero file cost because many page objects may share ONE content
+     * stream. {@code --pages all} admits up to 1,000 pages ({@code MAX_PAGES_ALL}) -- 139s of
+     * lattice -- and an explicit spec ({@code --pages 1-z}) is not capped by page count at all,
+     * while {@code --timeout} defaults to 0 (no limit) and the watchdog is not even started then.
+     * The sibling stages have each had a document-level bound since they were wired in (stream:
+     * {@link #MAX_STREAM_PAGES_PER_DOC}; tagged: {@link #MAX_STRUCTURE_WORK}; arbitration: {@link
+     * #MAX_ARBITRATION_WORK}); lattice was the only one without one.
+     *
+     * <p>WHY WORK AND NOT A PAGE COUNT, unlike {@link #MAX_STREAM_PAGES_PER_DOC}. Measured over the
+     * 277 real PDFs this project uses (77-unit ICDAR/tabula scoring corpus + 200-PDF real-world
+     * prose sample), ALL pages: a real page charges p50 2,889, p95 372,085, worst 2,151,463
+     * (schools.pdf p3). A hostile page charges 21M-32M. Work separates real from hostile by TWO
+     * ORDERS OF MAGNITUDE; page count does not separate them at all. So this budget lets a long
+     * legitimate document through while stopping a short hostile one, which a page cap cannot do.
+     *
+     * <p>SIZING, from those measurements. Worst REAL document = 9,825,547 (schools.pdf, 5pp);
+     * a synthetic 300-page document with an ordinary 25x6 ruled table on every page charges
+     * 34,464,900. At 800M this budget is <b>81x the worst real document</b> and 23x that 300-page
+     * one, and it admits ~400 pages at the density of the densest real document measured. On the
+     * hostile side, charged work runs at a measured 2.9-13.7 ns/unit (6.4 ns/unit for the reference
+     * textfill attack), so 800M caps the lattice stage at <b>~3-7 seconds</b> of work per document
+     * instead of growing linearly without limit.
+     *
+     * <p>WHAT THIS DELIBERATELY DOES NOT CLAIM. It does not bound PDFBox's content-stream
+     * TOKENIZING cost for non-path operators: {@link #collectRulings} walks the whole stream, and a
+     * page whose stream is all text charges ~nothing for that walk. Measured, that residual is
+     * 0.015ms per empty page, 0.134ms per 200-text-op page and 2.8ms per 5,000-text-op page -- real
+     * but small, proportional to stream bytes, and strictly SMALLER than the same walk the CLI's own
+     * glyph harvest already performs on every selected page before {@link #extract} is called, which
+     * no budget in this class bounds and which this one does not pretend to. Bounding that is a
+     * page-selection / {@code --timeout} concern, not a table-extraction one.
+     */
+    static final long MAX_LATTICE_DOC_WORK = 800_000_000L;
+    /**
+     * Units charged per path-construction operator dispatch in {@link RulingCollector} (see
+     * {@code pathOpsSeen}), so that geometry-side work is commensurate with the (cell, glyph) and
+     * (cell, cell) units the rest of {@link #MAX_LATTICE_DOC_WORK} is denominated in.
+     *
+     * <p>MEASURED, not chosen: a page of 400,000 {@code lineTo} operators costs 69.5ms, i.e. 174ns
+     * per operator, against 6.4ns per unit for the reference textfill attack -- a 27x mismatch at
+     * weight 1, which would have let an operator-flood document buy ~27x more wall time per unit of
+     * budget than any other shape. At weight 20 the same page charges 8.7 ns/unit and the whole
+     * measured hostile spread compresses to 2.9-13.7 ns/unit, i.e. within ~2x of the reference in
+     * both directions. Real documents barely notice: the worst real page's charge moved 2,144,338 ->
+     * 2,151,463 (+0.3%) when this weighting was introduced, because real pages draw few paths.
+     */
+    static final long LATTICE_PATH_OP_CHARGE = 20;
     static final int MAX_CELLS_PER_TABLE = 10_000;
     static final int MAX_RULINGS_PER_PAGE = 10_000;
     // Tagged-path RowSpan/ColSpan are attacker-controlled ints straight from the structure tree
@@ -79,6 +235,32 @@ final class TableExtractor {
     // grid at that size completes in low hundreds of thousands of pair checks, comfortably under
     // 1% of this budget). Counts each touches() pair evaluation across the whole call.
     static final long MAX_GROUPING_WORK = 60_000_000;
+    // ---- over-clumped-cell split (see splitClumpedCells) -----------------------------------
+    // Candidate cap: the most clumped cells ONE lattice table may re-split. A real under-ruled
+    // band is one row (the reported bug) up to a whole under-ruled table BODY (measured on the
+    // scoring corpus: eu-016 p3 and eu-017 p2 have 30 and 26 such rows respectively -- every data
+    // row of the table). 512 is ~17x the worst REAL case measured and still bounds the
+    // O(candidates x words) assignment loop below. Over the cap the split pass gives up on the
+    // whole table and leaves it EXACTLY as it is today -- never drops it.
+    static final int MAX_CLUMP_CANDIDATES_PER_TABLE = 512;
+    // Work budget for the split pass, counted cumulatively across every table on ONE page:
+    // (a) one (glyph -> candidate-union bbox) containment test per page glyph per table that has
+    // any candidate at all, and (b) one (candidate, word) containment test per pair. (b) is the
+    // quadratic-shaped one and is what this budget exists for.
+    //
+    // MEASURED, replaying extractLatticePage's exact sequence over every page of the 77-PDF
+    // scoring corpus and reading this counter directly (ClumpWorkProbe): 15 pages charge anything
+    // at all, p50 = 2,465 units, WORST REAL PAGE = 6,051 units (eu-001 p1) = 0.076% of this
+    // budget, and the pass costs 19.0ms summed over every page of every PDF in the corpus.
+    //
+    // MEASURED at the hostile end (TableClumpSplitDosTest): the worst shape a single Letter page
+    // can actually carry -- this class's candidate cap (512 clumped cells) crossed with a 20,000-run
+    // glyph bomb (40,000 glyphs -> ~10,000 words) -- charges 5,160,000 units in ~34ms, i.e. 64% of
+    // this budget. So the budget is set to LET THE WORST REAL PAGE THROUGH with ~1,300x headroom
+    // while capping the worst hostile page at tens of milliseconds; beyond it the pass gives up and
+    // the table ships exactly as it does today. Charged per unit of REAL work examined, like every
+    // sibling budget in this class.
+    static final long MAX_CLUMP_SPLIT_WORK = 8_000_000;
     // Bounds the --skip-text-urls region-fill fallback (fillCellsByRegion) on the MEMORY side.
     //
     // round-6 (THIS fix, supersedes rounds 3-5 below): fillCellsByRegion no longer uses
@@ -205,6 +387,129 @@ final class TableExtractor {
     // recursing further -- a plausible-if-imperfect placement, never a crash.
     static final int MAX_SPLIT_DEPTH = 64;
 
+    // ------------------------------------------------------------------ prose false positives
+    //
+    // MEASUREMENT (lever 4). Over the project's 200-PDF real-world prose sample (page 1 only), the
+    // tagged+lattice configuration emitted >=1 table on 21/200 documents (0.1050) and the full
+    // arbitrated pipeline on 25/200 (0.1250) -- ordinary mail attachments, not tabular reports.
+    // Classifying all 21 by mechanism found that FIFTEEN are the TAGGED path (HTML-email layout
+    // <table>s that survived conversion into the PDF structure tree), of which twelve emit ONLY
+    // tables of rank below 2x2, and FOUR are lattice grids -- a drawn border box or a
+    // banner+disclaimer rule pair -- carrying 0, 1, 2 and 3 textful cells respectively. The
+    // remaining two documents genuinely contain tables (a vendor invoice, an attachment
+    // name/size list) and nothing here targets them.
+    //
+    // The two bounds below close 14 of those 21 documents. Both are precision-only rules on the
+    // "prefer MISSING a table over FABRICATING one" side of this project's hostile-input contract,
+    // and both were chosen so that the reference corpus's document-pooled adjacency macro F1 does
+    // not move AT ALL -- verified byte-identical, AS MEASURED AT THE TIME, for lattice+tagged
+    // (0.4718) and for the full arbitrated pipeline (0.8079/micro 0.8003). Full-pipeline prose
+    // false-positive rate over the 200-PDF sample: 0.1250 -> 0.0600; lattice+tagged alone
+    // 0.1050 -> 0.0350.
+    //
+    // THOSE TWO CORPUS ENDPOINTS ARE HISTORICAL, NOT CURRENT. Until ec93b10 the benchmark fed the
+    // extractor a glyph stream that differed from production's in three ways (ordering, retention of
+    // empty-unicode glyphs, ligature per-char composition). The BOUNDS below are unchanged; only the
+    // instrument that measured them was. On the corrected instrument the same two configurations
+    // measure lattice+tagged 0.5113 and full+arbitration 0.8118 / micro 0.8030 over all pages, and
+    // 0.4938 and 0.7927 / micro 0.7476 under the shipping `--pages default`. The equality property
+    // itself ("these bounds cost nothing on the corpus") has NOT been re-measured on the corrected
+    // instrument -- only the absolute endpoints have -- so treat it as a claim about the old
+    // instrument until someone re-runs the on/off comparison.
+    //
+    // The prose rates above are PAGE 1 ONLY. Under the page selection the CLI actually defaults to
+    // (first four pages plus the last) the full pipeline's rate on the same 200-PDF sample is 0.0650
+    // with the flag on and 0.0350 with it off; over the whole 1,599-PDF population it is 0.0826 and
+    // 0.0475. The 200-PDF sample therefore UNDERSTATES the population rate -- quote it as a sample.
+    // Measured by BaselineHarness and, independently, by Lever5RecalHarness.
+    //
+    // THE FOUR FIGURES IN THE PARAGRAPH ABOVE ARE HISTORICAL and are left as measured, because the
+    // claim they support is a no-change claim about the state of the harness at the time. The
+    // benchmark has since been corrected (it now feeds production's own glyph harvest and reports
+    // the shipping page scope): the SAME configurations measure lattice+tagged 0.5113 and
+    // full+arbitration 0.8118/micro 0.8030 (all-pages, POOLED, de-duplicated GT), and the 0.0600
+    // prose rate above was a PAGE-1 measurement -- under the shipping page selection the same
+    // sample measures 0.0650 with the stream flag on and 0.0350 with it off. The no-change
+    // verification itself was re-run on the corrected instrument and still holds.
+    //
+    // Variants measured and REJECTED, recorded so the thresholds are not re-litigated blind:
+    //   * lattice "text must also span 2 distinct grid ROWS": prose FP identical, but lattice+tagged
+    //     macro 0.4718 -> 0.4716 (2 matched relations lost on icdar-eu/eu-024, 2 on eu-025 -- real
+    //     tables whose data rows failed text assignment, leaving only a textful header row -- against
+    //     14 spurious relations removed on eu-012).
+    //   * lattice "at least 4 textful cells": removes one further prose false positive, but also
+    //     removes the legitimate 2x2-with-column-spanning-header shape (3 textful cells).
+    //   * dropping a lattice grid with NO text at all: zero measured prose-FP benefit (no sampled
+    //     document has a textless-only lattice hit), and it costs full+arbitration macro
+    //     0.8079 -> 0.8077, because a textless ruled grid currently suppresses an overlapping stream
+    //     candidate in both merge rules. Left in place -- see #textContradictsColumnStructure.
+
+    /** Minimum structural rank a TAGGED table must reach to be emitted, per dimension. The lattice
+     *  path enforced this from the start; the tagged path did not, and 12 of the 21 measured prose
+     *  false positives are tagged tables of rank 1x1, Nx1 or 1xN (a paragraph in a layout cell, a
+     *  "View in OneDrive" button, a stack of prose blocks). A rank-1 table declares no relation in
+     *  the collapsed dimension at all. COST ON THE REFERENCE CORPUS: exactly zero, and provably so
+     *  -- the tagged path finds 0 tables on all 77 ICDAR/CSV scoring PDFs (measured, all pages), so
+     *  no corpus output can change. */
+    static final int MIN_TAGGED_RANK = 2;
+
+    /** Minimum number of DISTINCT grid COLUMNS a LATTICE table's TEXT-CARRYING cells must occupy,
+     *  once it carries any text at all. The geometry gate in {@link #buildTable} has already
+     *  established that two columns of RULINGS were drawn; this asks the CONTENT to support that
+     *  claim. When every textful cell anchors in a single column, the vertical rulings are a border,
+     *  not column separators -- precisely the measured prose shape: full-width prose blocks stacked
+     *  inside a drawn box, each anchoring in column 0. Three of the four measured lattice prose
+     *  false positives fail it: a bordered ID-verification notice (1 textful cell), a bordered
+     *  attachment-expiry notice (1 textful cell), and a full-width banner plus full-width disclaimer
+     *  separated by a rule (2 textful cells sharing anchor column 0).
+     *
+     *  <p>Deliberately NOT mirrored on rows, and deliberately NOT applied to a grid with no text at
+     *  all -- both variants were implemented and measured, and both cost corpus macro F1 for no
+     *  additional prose-FP benefit. See the measurement block above this constant. */
+    static final int MIN_LATTICE_TEXTFUL_COLUMNS = 2;
+
+    /** True when {@code s} contains at least one non-whitespace character. Early-exit scan rather
+     *  than {@code trim().isEmpty()}: never allocates a copy of a (bounded but potentially large)
+     *  cell string. Total cost across a page is O(total filled cell text), which the region/glyph
+     *  budgets already bound -- no new DoS surface. */
+    private static boolean hasText(String s) {
+        if (s == null) return false;
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isWhitespace(s.charAt(i))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * True when {@code t} carries text but that text CONTRADICTS the drawn column structure -- i.e.
+     * at least one cell is textful, yet every textful cell anchors in fewer than {@link
+     * #MIN_LATTICE_TEXTFUL_COLUMNS} distinct grid columns. Uses each textful cell's ANCHOR column,
+     * never its span: a cell spanning the full width of the grid still contributes exactly one
+     * column, which is what makes a full-width banner + full-width disclaimer pair fail this test
+     * while a column-spanning header sitting above two real columns passes it.
+     *
+     * <p>A grid with NO textful cell at all returns FALSE (not a contradiction): there is no content
+     * evidence either way, dropping such grids was measured to buy nothing on the prose sample, and
+     * it costs corpus macro F1 because a textless ruled grid currently suppresses an overlapping
+     * stream candidate in both merge rules. Removing only what there is positive evidence against is
+     * also the minimum-change reading of this project's "prefer missing over fabricating" contract
+     * -- an all-empty grid fabricates no CONTENT, since every cell of it renders as "".
+     *
+     * <p>Bounded work: one int set over t.cells (already capped at {@link #MAX_CELLS_PER_TABLE})
+     * plus one early-exit scan per cell string (total O(filled cell text), already bounded by the
+     * region/glyph budgets). Short-circuits as soon as the column count is reached.
+     */
+    private static boolean textContradictsColumnStructure(TableHit t) {
+        Set<Integer> colsWithText = new HashSet<>();
+        for (CellHit c : t.cells) {
+            if (!hasText(c.text)) continue;
+            if (colsWithText.add(c.col) && colsWithText.size() >= MIN_LATTICE_TEXTFUL_COLUMNS) {
+                return false;
+            }
+        }
+        return !colsWithText.isEmpty();
+    }
+
     // PR re-review P2 (DoS): collectByType's FIX 1 identity-memoization only dedups node visits
     // WITHIN one call -- a fresh IdentityHashMap-backed visited set is created per call (see that
     // method's doc). extractTagged calls collectByType ONCE PER Table element found (the "Table"
@@ -242,7 +547,7 @@ final class TableExtractor {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public static class TableHit {
         public int page;
-        public String extractionMethod;   // "tagged" | "lattice"
+        public String extractionMethod;   // "tagged" | "lattice" | "stream"
         public float[] bbox;              // [x0, y0, x1, y1], top-left-origin points
         public int rowCount;
         public int colCount;
@@ -257,6 +562,56 @@ final class TableExtractor {
         // for any lattice table that isn't flagged, so existing consumers that ignore unknown
         // fields see no change in shape for the common case.
         public Boolean likelyDuplicateOfTagged;
+
+        /**
+         * ADVISORY arbitration provenance, same contract as {@link #likelyDuplicateOfTagged}: set
+         * only on a candidate that WON a contested region in {@link #arbitrate}, so a consumer can
+         * tell that a fully-built, successfully-extracted candidate for this region was discarded on
+         * a quality judgement rather than there having been only one answer.
+         *
+         * <p>{@code displacedRuledCandidate} is set on a surviving STREAM hit that took its region
+         * from one or more drawn-ruling ("lattice") candidates; {@code displacedStreamCandidate} is
+         * set on a surviving RULED hit that kept its region against one or more stream candidates.
+         * Both are left null (and so omitted from report.json via the class's NON_NULL inclusion)
+         * whenever the region was never contested, which is the common case -- existing consumers
+         * that ignore unknown fields see no change in shape.
+         *
+         * <p>WHY THIS EXISTS. Arbitration is the only path in this class that discards a complete
+         * table on a QUALITY judgement rather than on a cap or an error. Every other drop path
+         * (extractTagged's three catches, the per-page lattice catches, the document lattice budget,
+         * extractStreamPage's caps, capTablesPerPage) surfaces itself through {@link
+         * Result#truncated}; arbitration used to be invisible, so a region whose correct table was
+         * arbitrated away was byte-identical in report.json to a region that had no table at all.
+         * These two flags now always say WHICH hit the surviving answer replaced, on BOTH sides of a
+         * contest -- unlike {@link Result#truncated} (see {@link #arbitrate}'s own doc), which fires
+         * only when {@code displacedRuledCandidate} is the one set, because only that direction drops
+         * content the flag-off pipeline would have emitted. A report.json consumer that wants to know
+         * "did a borderless guess ever replace a drawn-ruling answer on this document", independent of
+         * whether {@code tablesTruncated} is set, can still answer it by scanning {@code tables} for
+         * {@code displacedRuledCandidate: true} -- these markers are not gated by that decision.
+         */
+        public Boolean displacedRuledCandidate;
+
+        /** @see #displacedRuledCandidate */
+        public Boolean displacedStreamCandidate;
+
+        /** Stream-path only: gridness confidence in [0,1]. null (omitted) for lattice/tagged. */
+        public Double confidence;
+
+        /**
+         * Stream-path only, and DELIBERATELY NOT SERIALIZED (package-private, so Jackson's default
+         * PUBLIC_ONLY field visibility never sees it; {@code @JsonIgnore} as belt-and-braces should
+         * that config ever change): {@link #confidence} BEFORE the 3-decimal rounding applied for
+         * report.json readability.
+         *
+         * <p>WHY. {@link #ARB_MIN_STREAM_CONFIDENCE} (0.65) is a calibrated admission floor. Comparing
+         * the ROUNDED confidence against it made the effective floor 0.6495, so a candidate the
+         * calibration excluded was admitted and could displace a drawn-ruling answer. The gate now
+         * reads this exact value, falling back to {@link #confidence} when it is absent (e.g. a
+         * candidate a test built by hand).
+         */
+        @com.fasterxml.jackson.annotation.JsonIgnore
+        Double confidenceUnrounded;
     }
 
     /** One cell (span anchor) of a table. */
@@ -275,6 +630,38 @@ final class TableExtractor {
     static final class Result {
         final List<TableHit> tables = new ArrayList<>();
         boolean truncated = false;
+        /**
+         * Units of REAL lattice work this document charged against {@link #MAX_LATTICE_DOC_WORK},
+         * summed over every page the lattice path ran on. Not serialized (this class is internal;
+         * only {@link TableHit} reaches report.json) -- it exists so the DoS tests and the
+         * measurement probes can read the actual charge through the real entry point instead of
+         * inferring it from wall-clock time.
+         */
+        long latticeWorkCharged = 0;
+        /**
+         * Units of REAL borderless ("stream") work this document charged against {@link
+         * #MAX_STREAM_DOC_WORK}, summed over every page the stream path ran on. Same purpose and
+         * same non-serialization as {@link #latticeWorkCharged}: it lets the DoS tests and the
+         * corpus-sizing harness read the actual charge through the real entry point rather than
+         * inferring it from wall-clock time.
+         */
+        long streamWorkCharged = 0;
+        /**
+         * How many fully-built candidates {@link #arbitrate} discarded on this document because they
+         * lost a contested region -- BOTH directions (a stream candidate losing to the ruled/tagged
+         * side, and a ruled/lattice candidate losing to a confident stream one), unlike {@link
+         * #truncated} which {@code arbitrate} only sets for the latter (see that method's doc for why:
+         * only that direction removes content the flag-off pipeline would have emitted). Not
+         * serialized (this class is internal) -- it exists so the tests and measurement probes can
+         * read the exact count through the real entry point instead of inferring it from {@link
+         * #truncated}, which many other paths also set and which no longer even tracks the same
+         * total. A report.json consumer cannot recover this exact integer (it is not serialized), but
+         * can still tell WHETHER either direction occurred anywhere in the document: scan {@code
+         * tables} for an entry carrying {@code displacedRuledCandidate} (content-losing) or {@code
+         * displacedStreamCandidate} (not) -- one flag per WINNING hit, not per discarded candidate, so
+         * it answers "did this happen", not "how many".
+         */
+        int arbitrationDisplaced = 0;
     }
 
     // ---------------------------------------------------------------- views
@@ -412,6 +799,21 @@ final class TableExtractor {
      * survives once the dashes are merged into one long logical ruling.
      */
     static List<Ruling> normalize(List<Ruling> raw) {
+        return normalize(raw, new long[1]);
+    }
+
+    /**
+     * As {@link #normalize(List)}, additionally ADDING this call's real work to {@code charge[0]}
+     * for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}). The term that matters
+     * is the {@code intersectsAny} keep-filter below, which is a full {@code horiz x vert} scan --
+     * the SAME quadratic shape {@link #findCells} charges, and one no cap in this class bounds
+     * (both lists are post-merge, so their sizes are bounded by page dimensions / SNAP, and PDF
+     * page dimensions go to 14,400pt). Rulings that this filter DROPS still cost that scan, so a
+     * page of deliberately non-crossing ruling fans -- which returns zero rulings and would
+     * otherwise charge almost nothing -- is charged for the scan it forced.
+     */
+    static List<Ruling> normalize(List<Ruling> raw, long[] charge) {
+        charge[0] += raw.size();
         List<Ruling> horiz = new ArrayList<>();
         List<Ruling> vert = new ArrayList<>();
         for (Ruling r : raw) {
@@ -424,6 +826,7 @@ final class TableExtractor {
         horiz.removeIf(h -> h.length() < MIN_RULING_LEN);
         vert.removeIf(v -> v.length() < MIN_RULING_LEN);
 
+        charge[0] += 2L * horiz.size() * vert.size();   // the two intersectsAny keep-filter scans
         List<Ruling> keptH = new ArrayList<>();
         for (Ruling h : horiz) if (intersectsAny(h, vert)) keptH.add(h);
         List<Ruling> keptV = new ArrayList<>();
@@ -479,6 +882,24 @@ final class TableExtractor {
      * forms a cell. Spanning cells fall out naturally where internal edges are absent.
      */
     static List<CellRect> findCells(List<Ruling> horiz, List<Ruling> vert) {
+        return findCells(horiz, vert, new long[1]);
+    }
+
+    /**
+     * As {@link #findCells(List, List)}, additionally ADDING the real work this call performs to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}).
+     * Two terms, both charged even when the call throws (so a page that trips a per-page cap is
+     * still charged for the work it forced):
+     * <ul>
+     *   <li>the intersection scan, which is exactly {@code horiz.size() x vert.size()}
+     *       {@code intersects()} calls -- charged UP FRONT, because this loop is bounded only by
+     *       {@link #MAX_INTERSECTIONS} (a cap on RETAINED points): two ruling fans that never cross
+     *       produce zero points and so run the full product with nothing to stop them;</li>
+     *   <li>the top-left/bottom-right corner scan, i.e. the {@link #MAX_FINDCELLS_WORK} counter.</li>
+     * </ul>
+     */
+    static List<CellRect> findCells(List<Ruling> horiz, List<Ruling> vert, long[] charge) {
+        charge[0] += (long) horiz.size() * vert.size();
         // All intersection points, sorted (y, x).
         java.util.TreeSet<Long> pts = new java.util.TreeSet<>();
         List<float[]> points = new ArrayList<>();
@@ -512,25 +933,29 @@ final class TableExtractor {
 
         List<CellRect> cells = new ArrayList<>();
         long work = 0;
-        for (int i = 0; i < points.size(); i++) {
-            float[] tl = points.get(i);
-            CellRect best = null;
-            for (int j = i + 1; j < points.size() && best == null; j++) {
-                if (++work > MAX_FINDCELLS_WORK) throw new RulingOverflowException();
-                float[] br = points.get(j);
-                if (br[0] <= tl[0] + EPS || br[1] <= tl[1] + EPS) continue;
-                if (!pointSet.contains(pkey(br[0], tl[1]))) continue; // top-right corner
-                if (!pointSet.contains(pkey(tl[0], br[1]))) continue; // bottom-left corner
-                if (edgeCoveredH(hByY, tl[1], tl[0], br[0])
-                        && edgeCoveredH(hByY, br[1], tl[0], br[0])
-                        && edgeCoveredV(vByX, tl[0], tl[1], br[1])
-                        && edgeCoveredV(vByX, br[0], tl[1], br[1])) {
-                    CellRect c = new CellRect();
-                    c.x0 = tl[0]; c.y0 = tl[1]; c.x1 = br[0]; c.y1 = br[1];
-                    best = c;
+        try {
+            for (int i = 0; i < points.size(); i++) {
+                float[] tl = points.get(i);
+                CellRect best = null;
+                for (int j = i + 1; j < points.size() && best == null; j++) {
+                    if (++work > MAX_FINDCELLS_WORK) throw new RulingOverflowException();
+                    float[] br = points.get(j);
+                    if (br[0] <= tl[0] + EPS || br[1] <= tl[1] + EPS) continue;
+                    if (!pointSet.contains(pkey(br[0], tl[1]))) continue; // top-right corner
+                    if (!pointSet.contains(pkey(tl[0], br[1]))) continue; // bottom-left corner
+                    if (edgeCoveredH(hByY, tl[1], tl[0], br[0])
+                            && edgeCoveredH(hByY, br[1], tl[0], br[0])
+                            && edgeCoveredV(vByX, tl[0], tl[1], br[1])
+                            && edgeCoveredV(vByX, br[0], tl[1], br[1])) {
+                        CellRect c = new CellRect();
+                        c.x0 = tl[0]; c.y0 = tl[1]; c.x1 = br[0]; c.y1 = br[1];
+                        best = c;
+                    }
                 }
+                if (best != null) cells.add(best);
             }
-            if (best != null) cells.add(best);
+        } finally {
+            charge[0] += work;
         }
         return cells;
     }
@@ -583,7 +1008,18 @@ final class TableExtractor {
      * oversight, favoring near-linear performance on realistic input.
      */
     static List<List<CellRect>> groupIntoTables(List<CellRect> cells) {
+        return groupIntoTables(cells, new long[1]);
+    }
+
+    /**
+     * As {@link #groupIntoTables(List)}, additionally ADDING this call's real work to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}):
+     * the {@code n} bucket insertions plus every {@code touches()} pair evaluation (the
+     * {@link #MAX_GROUPING_WORK} counter), charged even when the call throws.
+     */
+    static List<List<CellRect>> groupIntoTables(List<CellRect> cells, long[] charge) {
         int n = cells.size();
+        charge[0] += n;
         int[] parent = new int[n];
         for (int i = 0; i < n; i++) parent[i] = i;
 
@@ -598,19 +1034,23 @@ final class TableExtractor {
         }
 
         long work = 0;
-        java.util.Set<Integer> candidates = new java.util.HashSet<>();
-        for (int i = 0; i < n; i++) {
-            CellRect a = cells.get(i);
-            candidates.clear();
-            addBucket(byXEdge, snap(a.x0), candidates);
-            addBucket(byXEdge, snap(a.x1), candidates);
-            addBucket(byYEdge, snap(a.y0), candidates);
-            addBucket(byYEdge, snap(a.y1), candidates);
-            for (int j : candidates) {
-                if (j <= i) continue; // undirected pair -- evaluate once, from the smaller index
-                if (++work > MAX_GROUPING_WORK) throw new RulingOverflowException();
-                if (touches(a, cells.get(j))) union(parent, i, j);
+        try {
+            java.util.Set<Integer> candidates = new java.util.HashSet<>();
+            for (int i = 0; i < n; i++) {
+                CellRect a = cells.get(i);
+                candidates.clear();
+                addBucket(byXEdge, snap(a.x0), candidates);
+                addBucket(byXEdge, snap(a.x1), candidates);
+                addBucket(byYEdge, snap(a.y0), candidates);
+                addBucket(byYEdge, snap(a.y1), candidates);
+                for (int j : candidates) {
+                    if (j <= i) continue; // undirected pair -- evaluate once, from the smaller index
+                    if (++work > MAX_GROUPING_WORK) throw new RulingOverflowException();
+                    if (touches(a, cells.get(j))) union(parent, i, j);
+                }
             }
+        } finally {
+            charge[0] += work;
         }
         java.util.Map<Integer, List<CellRect>> comps = new java.util.LinkedHashMap<>();
         for (int i = 0; i < n; i++) comps.computeIfAbsent(find(parent, i), k -> new ArrayList<>()).add(cells.get(i));
@@ -776,7 +1216,30 @@ final class TableExtractor {
      * here, separate from the existing per-table cell-count cap.
      */
     static List<List<CellRect>> splitComponent(List<CellRect> comp) {
-        return splitComponent(comp, new long[]{0}, 0);
+        return splitComponent(comp, new long[1]);
+    }
+
+    /**
+     * As {@link #splitComponent(List)}, additionally ADDING this component's grid-placement work
+     * (the {@link #MAX_SPLIT_WORK} counter) to {@code charge[0]} for the document-level lattice
+     * budget ({@link #MAX_LATTICE_DOC_WORK}), including when the split throws. The budget stays PER
+     * COMPONENT exactly as before: this wrapper owns its own counter, {@code charge} only observes.
+     *
+     * <p>Deliberately a THIN WRAPPER around the 3-arg recursive form rather than an extra argument
+     * threaded into it: the recursive method's own frame must stay exactly the size it was. That
+     * recursion is stack-bounded by {@link #MAX_SPLIT_DEPTH} against a 128KB stack (see {@code
+     * TableGeometryTest#splitComponentDepthCapPreventsUnboundedRecursionAndStackOverflow}, which
+     * models this project's firecracker/gvisor deploy targets), and that margin is tight enough to
+     * be sensitive to how much the JIT inlines into the recursive frame -- so nothing here changes
+     * the shape of that frame or of its call site.
+     */
+    static List<List<CellRect>> splitComponent(List<CellRect> comp, long[] charge) {
+        long[] work = {0};
+        try {
+            return splitComponent(comp, work, 0);
+        } finally {
+            charge[0] += work[0];
+        }
     }
 
     /** {@code depth} is FIX 4's recursion-depth guard (see {@link #MAX_SPLIT_DEPTH}), separate
@@ -898,6 +1361,319 @@ final class TableExtractor {
         return t;
     }
 
+    // ------------------------------------------------- over-clumped lattice cell re-splitting
+
+    /**
+     * Chop over-clumped lattice cells by the table's OWN column alignment.
+     *
+     * <p>THE DEFECT (reported by the user from real output). In an UNDER-RULED band -- typically a
+     * TOTAL row whose interior vertical rulings do not extend down into it -- the ruling grid
+     * genuinely contains one WIDE cell where the page shows N narrow ones, so several
+     * column-aligned values get joined into a single cell. Verbatim, from a real fisheries-export
+     * PDF (a 15x14 table whose rows 1-13 each came out with every number in its own cell):
+     * <pre>
+     *   row14 col0 = "TOTAL 453,515 895,111"
+     *   row14 col3 = "456,431 718,382 487,183 886,211"
+     * </pre>
+     * The defect is isolated to bands where the ruling grid is incomplete, and the table's real
+     * column boundaries are therefore ALREADY KNOWN from the rows that ARE fully ruled. That is
+     * what makes this recoverable without inventing geometry: the boundaries come from this same
+     * table's own single-column cell edges, never from a heuristic over the page.
+     *
+     * <p>WHAT THIS IS NOT. It is not a second segmentation pass and it never changes {@code
+     * rowCount}/{@code colCount}, the table's bbox, or which cells exist outside the clumped band.
+     * It only ever REPLACES one spanning cell with per-column cells at column indices that already
+     * exist in this table, and only when the replacement is a pure re-partition of that cell's own
+     * text (see the integrity check below). {@code MAX_CELLS_PER_TABLE} is enforced on the result.
+     *
+     * <p>THE FIVE CONDITIONS a cell must meet ({@link #isClumpCandidate} plus the per-candidate
+     * tests below). Each exists to keep a genuine value intact:
+     * <ol>
+     *   <li>{@code colSpan >= 2} and at least two of the columns inside that span are RESOLVED
+     *       (some single-column cell elsewhere in the table pins their left/right edges). Without
+     *       two resolved columns there is nothing to split against.</li>
+     *   <li>The cell's text is a SINGLE visual line. A multi-line clump (an entire under-ruled
+     *       table BODY collapsed into one cell -- measured: 1 such cell on the scoring corpus,
+     *       {@code indictb1h_14.pdf} p1, holding 174 tokens over 29 lines) needs its ROWS split
+     *       too, which this pass deliberately does not do; splitting it by column alone would
+     *       leave 6 cells of still-wrong multi-line text, i.e. FABRICATED structure. Skipped.</li>
+     *   <li>Its words map to >= 2 DISTINCT columns. A spanning title whose glyphs all land in one
+     *       column is one logical value in one column and stays put.</li>
+     *   <li>A strict MAJORITY of its whitespace-separated tokens are NUMERIC -- the totals/data
+     *       signature. This is the guard that keeps a genuine spanning TEXT header ("Quarterly
+     *       Fisheries Export Summary", or "Fisheries Exports 2013" -- 1 numeric of 3) intact even
+     *       though its glyphs straddle several columns. Measured on the scoring corpus: of 113
+     *       cells meeting condition 1, this test rejects 33.</li>
+     *   <li>INTEGRITY: the words assigned to the cell must reconstruct that cell's own text
+     *       exactly (whitespace-insensitive), and their column assignment must be non-decreasing
+     *       in reading order. Text is then carved out of the ORIGINAL string by character offset,
+     *       so no character is ever invented, dropped, reordered or re-spaced. If the word scan and
+     *       {@link #joinText}'s glyph scan disagree about the cell's content for any reason
+     *       (differing space thresholds, an exotic font, overlapping draws), the cell is left
+     *       alone -- MISSING a split, never FABRICATING one.</li>
+     * </ol>
+     *
+     * <p>Word formation reuses {@link StreamTableExtractor#buildWords} and its numeric test
+     * ({@link StreamTableExtractor#isNumericToken}) rather than re-deriving either.
+     *
+     * <p>FRAMES. {@code buildWords} works in the glyph DIRECTION frame that {@code
+     * getXDirAdj()/getYDirAdj()} report (which is /Rotate-blind), while cell rects live in the
+     * page's VISUAL, /Rotate-applied frame. Each word's box is therefore mapped through {@link
+     * #applyPageRotation} -- exact for an axis-aligned box under a 0/90/180/270 rotation, since
+     * those map axes onto axes -- before any comparison with a cell, exactly as {@link
+     * #fillCellsFromPositions} maps glyph midpoints.
+     *
+     * <p>NEVER THROWS, and never costs the caller a table. Its own budget
+     * ({@link #MAX_CLUMP_SPLIT_WORK}) and {@code buildWords}' glyph/word caps both surface as
+     * {@link RulingOverflowException}; catching it HERE (rather than letting it reach {@link
+     * #renderKeptTables}' catch) is deliberate: this pass is a post-process on a table the
+     * extractor has ALREADY successfully built, so aborting it must leave that table exactly as it
+     * would have been without this code -- propagating would let a hostile page DELETE a table
+     * that ships today. The mutation of {@code t.cells} happens once, at the very end, after every
+     * check has passed, so a mid-pass abort cannot leave a partially split table either.
+     *
+     * @param work shared cumulative counter for the whole page (see {@link #MAX_CLUMP_SPLIT_WORK})
+     */
+    static void splitClumpedCells(TableHit t, List<TextPosition> positions, int rotation,
+                                  float unrotatedW, float unrotatedH, long[] work, long budget) {
+        try {
+            splitClumpedCellsChecked(t, positions, rotation, unrotatedW, unrotatedH, work, budget);
+        } catch (RulingOverflowException e) {
+            // budget or glyph/word cap hit -- leave the table exactly as it already is
+        } catch (RuntimeException e) {
+            // defense in depth on a brand-new hostile-input surface: an enhancement must never be
+            // the reason a successfully-extracted table is lost.
+            System.err.println("WARNING: clumped-cell split skipped on page " + (t == null ? -1 : t.page)
+                    + ": " + e);
+        }
+    }
+
+    private static void splitClumpedCellsChecked(TableHit t, List<TextPosition> positions, int rotation,
+                                                 float unrotatedW, float unrotatedH,
+                                                 long[] work, long budget) {
+        if (t == null || t.cells == null || t.cells.isEmpty() || t.colCount < 2) return;
+        if (positions == null || positions.isEmpty()) return;
+
+        // (1) The table's own column bands, from its single-column cells only. A column with no
+        // single-column cell anywhere in the table is UNRESOLVED (NaN) and never a split target.
+        float[] colL = new float[t.colCount];
+        float[] colR = new float[t.colCount];
+        java.util.Arrays.fill(colL, Float.NaN);
+        java.util.Arrays.fill(colR, Float.NaN);
+        for (CellHit c : t.cells) {
+            if (c.colSpan != 1 || c.col < 0 || c.col >= t.colCount || c.bbox == null) continue;
+            colL[c.col] = Float.isNaN(colL[c.col]) ? c.bbox[0] : Math.min(colL[c.col], c.bbox[0]);
+            colR[c.col] = Float.isNaN(colR[c.col]) ? c.bbox[2] : Math.max(colR[c.col], c.bbox[2]);
+        }
+        // Prefix count of resolved columns, so the per-cell span test below is O(1) rather than
+        // O(colSpan) -- otherwise a 10,000-cell table of wide spans costs O(cells x colCount).
+        int[] resolvedUpTo = new int[t.colCount + 1];
+        for (int j = 0; j < t.colCount; j++) {
+            resolvedUpTo[j + 1] = resolvedUpTo[j] + (Float.isNaN(colL[j]) ? 0 : 1);
+        }
+
+        // (2) Candidates, plus the (row,col) slots already taken by cells we are NOT touching.
+        List<CellHit> candidates = new ArrayList<>();
+        for (CellHit c : t.cells) {
+            if (!isClumpCandidate(c, t, resolvedUpTo)) continue;
+            candidates.add(c);
+            if (candidates.size() > MAX_CLUMP_CANDIDATES_PER_TABLE) return;
+        }
+        if (candidates.isEmpty()) return;
+        // IDENTITY sets, not equals-based ones: CellHit has no equals/hashCode, and two distinct
+        // cells of one table can carry identical field values (e.g. two empty cells), so an
+        // equals-based membership test would be both wrong and O(n) per probe.
+        Set<CellHit> candidateSet = Collections.newSetFromMap(new IdentityHashMap<>());
+        candidateSet.addAll(candidates);
+        Set<Long> occupied = new HashSet<>();
+        for (CellHit c : t.cells) {
+            if (candidateSet.contains(c)) continue;
+            for (int j = c.col; j < c.col + Math.max(1, c.colSpan); j++) {
+                occupied.add(((long) c.row << 32) | (j & 0xffffffffL));
+            }
+        }
+
+        // (3) Glyphs inside the union of the candidate bboxes, in document order (buildWords needs
+        // the original order to form words at all). One pass over the page's positions.
+        float ux0 = Float.MAX_VALUE, uy0 = Float.MAX_VALUE, ux1 = -Float.MAX_VALUE, uy1 = -Float.MAX_VALUE;
+        for (CellHit c : candidates) {
+            ux0 = Math.min(ux0, c.bbox[0]); uy0 = Math.min(uy0, c.bbox[1]);
+            ux1 = Math.max(ux1, c.bbox[2]); uy1 = Math.max(uy1, c.bbox[3]);
+        }
+        List<TextPosition> inBand = new ArrayList<>();
+        for (TextPosition tp : positions) {
+            if (++work[0] > budget) throw new RulingOverflowException();
+            float mx = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
+            float my = tp.getYDirAdj() - tp.getHeightDir() / 2;
+            float[] v = applyPageRotation(mx, my, rotation, unrotatedW, unrotatedH);
+            if (v[0] >= ux0 && v[0] <= ux1 && v[1] >= uy0 && v[1] <= uy1) inBand.add(tp);
+        }
+        if (inBand.isEmpty()) return;
+
+        // (4) Words, mapped into the visual frame the cell rects live in.
+        List<StreamTableExtractor.Word> words = StreamTableExtractor.buildWords(inBand);
+        if (words.isEmpty()) return;
+        float[][] wbox = new float[words.size()][];
+        for (int i = 0; i < words.size(); i++) {
+            StreamTableExtractor.Word w = words.get(i);
+            float[] a = applyPageRotation(w.x0, w.y0, rotation, unrotatedW, unrotatedH);
+            float[] b = applyPageRotation(w.x1, w.y1, rotation, unrotatedW, unrotatedH);
+            wbox[i] = new float[]{Math.min(a[0], b[0]), Math.min(a[1], b[1]),
+                                  Math.max(a[0], b[0]), Math.max(a[1], b[1])};
+        }
+
+        // (5) Per candidate: assign words, run every guard, and stage the replacement cells.
+        List<CellHit> replacements = new ArrayList<>();
+        Set<CellHit> consumed = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (CellHit c : candidates) {
+            List<Integer> mine = new ArrayList<>();
+            for (int i = 0; i < words.size(); i++) {
+                if (++work[0] > budget) throw new RulingOverflowException();
+                float cx = (wbox[i][0] + wbox[i][2]) * 0.5f;
+                float cy = (wbox[i][1] + wbox[i][3]) * 0.5f;
+                if (cx >= c.bbox[0] && cx <= c.bbox[2] && cy >= c.bbox[1] && cy <= c.bbox[3]) {
+                    mine.add(i);
+                }
+            }
+            if (mine.size() < 2) continue;
+            // reading order: one visual line by construction, so left-to-right settles it
+            final float[][] wb = wbox;
+            mine.sort(java.util.Comparator.comparingDouble(i -> wb[i][0]));
+
+            List<CellHit> split = splitOneClump(c, t, mine, words, wbox, colL, colR, occupied);
+            if (split == null) continue;
+            consumed.add(c);
+            replacements.addAll(split);
+            // Claim the slots this candidate just took, so a LATER candidate in the same row (the
+            // reported bug had two clumps in one row) can never be split onto a column another
+            // candidate already occupies -- renderViews would silently drop one of the two.
+            for (CellHit n : split) occupied.add(((long) n.row << 32) | (n.col & 0xffffffffL));
+        }
+        if (consumed.isEmpty()) return;
+
+        // (6) MAX_CELLS_PER_TABLE on the RESULT. Over the cap, change nothing.
+        long after = (long) t.cells.size() - consumed.size() + replacements.size();
+        if (after > MAX_CELLS_PER_TABLE) return;
+
+        List<CellHit> out = new ArrayList<>((int) after);
+        for (CellHit c : t.cells) if (!consumed.contains(c)) out.add(c);
+        out.addAll(replacements);
+        out.sort(java.util.Comparator.<CellHit>comparingInt(c -> c.row).thenComparingInt(c -> c.col));
+        t.cells = out;
+    }
+
+    /** Conditions 1 and 2 of {@link #splitClumpedCells}: geometry + single-line + >= 2 tokens. */
+    private static boolean isClumpCandidate(CellHit c, TableHit t, int[] resolvedUpTo) {
+        if (c.colSpan < 2 || c.rowSpan < 1 || c.bbox == null || c.text == null) return false;
+        if (c.col < 0 || c.col >= t.colCount) return false;
+        if (c.text.indexOf('\n') >= 0) return false;           // multi-line clump: not ours to split
+        String s = c.text.strip();
+        if (s.isEmpty()) return false;
+        boolean hasGap = false;
+        for (int i = 0; i < s.length(); i++) if (Character.isWhitespace(s.charAt(i))) { hasGap = true; break; }
+        if (!hasGap) return false;                             // one token: nothing to distribute
+        int hi = Math.min(t.colCount, c.col + c.colSpan);
+        return resolvedUpTo[hi] - resolvedUpTo[c.col] >= 2;
+    }
+
+    /**
+     * Conditions 3-5 of {@link #splitClumpedCells} for one candidate, returning the per-column
+     * replacement cells or {@code null} to leave the candidate untouched. Text for each emitted
+     * cell is carved out of {@code c.text} by character offset (never rebuilt from the words), so
+     * the emitted cells' concatenation is {@code c.text} with only the inter-column whitespace
+     * removed.
+     */
+    private static List<CellHit> splitOneClump(CellHit c, TableHit t, List<Integer> mine,
+                                               List<StreamTableExtractor.Word> words, float[][] wbox,
+                                               float[] colL, float[] colR, Set<Long> occupied) {
+        int lo = c.col, hi = Math.min(t.colCount, c.col + c.colSpan);
+
+        // INTEGRITY (condition 5a): the words must reconstruct this cell's text exactly, ignoring
+        // whitespace, AND we record each word's character span in the ORIGINAL text as we go.
+        String text = c.text;
+        int[] wordStart = new int[mine.size()];
+        int[] wordEnd = new int[mine.size()];
+        int p = 0;
+        for (int k = 0; k < mine.size(); k++) {
+            String wt = words.get(mine.get(k)).text;
+            while (p < text.length() && Character.isWhitespace(text.charAt(p))) p++;
+            if (p >= text.length()) return null;
+            wordStart[k] = p;
+            for (int q = 0; q < wt.length(); q++) {
+                char want = wt.charAt(q);
+                if (Character.isWhitespace(want)) continue;     // buildWords already trims, belt+braces
+                if (p >= text.length() || text.charAt(p) != want) return null;
+                p++;
+            }
+            wordEnd[k] = p;
+        }
+        while (p < text.length() && Character.isWhitespace(text.charAt(p))) p++;
+        if (p != text.length()) return null;                    // cell holds text no word accounted for
+
+        // Condition 3: >= 2 distinct columns, assignment non-decreasing in reading order.
+        int[] colOf = new int[mine.size()];
+        int prev = -1, distinct = 0;
+        for (int k = 0; k < mine.size(); k++) {
+            int i = mine.get(k);
+            float cx = (wbox[i][0] + wbox[i][2]) * 0.5f;
+            int j = nearestResolvedColumn(cx, colL, colR, lo, hi);
+            if (j < 0) return null;
+            if (j < prev) return null;                          // out-of-order: not a column layout
+            if (j > prev) distinct++;
+            colOf[k] = j;
+            prev = j;
+        }
+        if (distinct < 2) return null;                          // a spanning value inside one column
+
+        // Condition 4: strict numeric majority over the cell's own whitespace-separated tokens.
+        int numeric = 0, tokens = 0;
+        for (String tok : text.strip().split("\\s+")) {
+            if (tok.isEmpty()) continue;
+            tokens++;
+            if (StreamTableExtractor.isNumericToken(tok)) numeric++;
+        }
+        if (tokens < 2 || numeric * 2 <= tokens) return null;   // a text title stays one value
+
+        // Emit one cell per occupied column, text carved from the original string.
+        List<CellHit> out = new ArrayList<>();
+        int k = 0;
+        while (k < mine.size()) {
+            int j = colOf[k], end = k;
+            while (end + 1 < mine.size() && colOf[end + 1] == j) end++;
+            if (occupied.contains(((long) c.row << 32) | (j & 0xffffffffL))) return null;
+            CellHit n = new CellHit();
+            n.row = c.row;
+            n.col = j;
+            n.rowSpan = c.rowSpan;
+            n.colSpan = 1;
+            n.text = text.substring(wordStart[k], wordEnd[end]).strip();
+            n.bbox = new float[]{Math.max(c.bbox[0], colL[j]), c.bbox[1],
+                                 Math.min(c.bbox[2], colR[j]), c.bbox[3]};
+            if (n.text.isEmpty() || n.bbox[2] <= n.bbox[0]) return null;
+            out.add(n);
+            k = end + 1;
+        }
+        return out;
+    }
+
+    /**
+     * Column in {@code [lo, hi)} whose resolved band contains {@code x}, else the nearest resolved
+     * band by distance from {@code x} to the band interval (a value centred in a GUTTER between two
+     * of the table's own columns belongs to the nearer one). -1 when no column in range is
+     * resolved. Ties go to the lower column index, matching {@link #nearestIndex}.
+     */
+    private static int nearestResolvedColumn(float x, float[] colL, float[] colR, int lo, int hi) {
+        int best = -1;
+        float bestD = Float.MAX_VALUE;
+        for (int j = lo; j < hi; j++) {
+            if (Float.isNaN(colL[j])) continue;
+            float d = x < colL[j] ? colL[j] - x : (x > colR[j] ? x - colR[j] : 0f);
+            if (d < bestD) { bestD = d; best = j; }
+            if (d == 0f) break;
+        }
+        return best;
+    }
+
     /**
      * Index of the boundary closest to {@code v}. {@code boundaries} is always sorted ascending
      * (built from a TreeSet by every caller), so this binary-searches rather than scanning
@@ -936,8 +1712,28 @@ final class TableExtractor {
      * use, so rulings and text always share one frame.
      */
     static List<Ruling> collectRulings(PDPage page) throws IOException {
+        return collectRulings(page, new long[1]);
+    }
+
+    /**
+     * As {@link #collectRulings(PDPage)}, additionally ADDING this page's geometry-side work to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}):
+     * every path point the content stream offered (cumulative across the page, so a stream that
+     * free-runs {@code lineTo} is charged for it) plus the rulings retained. Charged even when the
+     * walk throws {@link RulingOverflowException} at {@link #MAX_RULINGS_PER_PAGE}.
+     *
+     * <p>WHAT THIS DOES NOT CHARGE, stated so the budget is not over-claimed: PDFBox's own
+     * content-stream TOKENIZING cost. That is proportional to stream bytes and is paid once per page
+     * by the CLI's glyph harvest before {@link #extract} is ever called (and again here), and it is
+     * not bounded by any counter in this class -- before or after this budget existed.
+     */
+    static List<Ruling> collectRulings(PDPage page, long[] charge) throws IOException {
         RulingCollector rc = new RulingCollector(page);
-        rc.processPage(page);
+        try {
+            rc.processPage(page);
+        } finally {
+            charge[0] += rc.pathOpsSeen * LATTICE_PATH_OP_CHARGE + rc.rulings.size();
+        }
         return rc.rulings;
     }
 
@@ -972,6 +1768,15 @@ final class TableExtractor {
         private List<float[]> current = new ArrayList<>();
         private int pointCount = 0;
         private boolean overflowed = false;
+        /**
+         * Path-construction operator dispatches seen across the WHOLE page, counted BEFORE the
+         * {@code overflowed} early-returns so a stream that free-runs {@code lineTo} past
+         * {@link #MAX_PATH_POINTS} is still charged for every operator pdfbox had to tokenize and
+         * dispatch. (Contrast {@link #pointCount}, which resets per path and bounds only the
+         * BUFFER.) This is the geometry-side work {@link #collectRulings(PDPage, long[])} charges
+         * against the document-level lattice budget, weighted by {@link #LATTICE_PATH_OP_CHARGE}.
+         */
+        long pathOpsSeen = 0;
 
         RulingCollector(PDPage page) {
             super(page);
@@ -1042,12 +1847,14 @@ final class TableExtractor {
         }
 
         @Override public void moveTo(float x, float y) {
+            pathOpsSeen++;
             if (overflowed) return;
             finalizeCurrentSubpath();
             addPoint(new float[]{x, y, 0f});
         }
 
         @Override public void lineTo(float x, float y) {
+            pathOpsSeen++;
             if (overflowed) return;
             addPoint(new float[]{x, y, 0f});
         }
@@ -1083,6 +1890,7 @@ final class TableExtractor {
          * collinear-control straight line authored via {@code c} is treated exactly like a lineTo.
          */
         @Override public void curveTo(float x1, float y1, float x2, float y2, float x3, float y3) {
+            pathOpsSeen++;
             if (overflowed) return;
             Point2D.Float p0 = getCurrentPoint();
             boolean straight = isEffectivelyStraight(p0.x, p0.y, x1, y1, x2, y2, x3, y3);
@@ -1110,6 +1918,7 @@ final class TableExtractor {
         }
 
         @Override public void appendRectangle(Point2D p0, Point2D p1, Point2D p2, Point2D p3) {
+            pathOpsSeen += 5;   // this operator buffers five points
             if (overflowed) return;
             finalizeCurrentSubpath();
             addPoint(new float[]{(float) p0.getX(), (float) p0.getY(), 0f});
@@ -1120,6 +1929,7 @@ final class TableExtractor {
         }
 
         @Override public void closePath() {
+            pathOpsSeen++;
             if (overflowed || current.isEmpty()) return;
             float[] first = current.get(0);
             addPoint(new float[]{first[0], first[1], 0f}); // closing edge is a straight line, not a curve
@@ -1500,8 +2310,9 @@ final class TableExtractor {
      * longer uses PDFTextStripterByArea at all (a confirmed correctness bug: a glyph inside two or
      * more overlapping/nested cell regions used to be silently dropped from all but one of them).
      */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result) throws IOException {
-        fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_TEXTFILL_WORK);
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result)
+            throws IOException {
+        return fillCellsByRegion(tables, page, result, MAX_REGION_GLYPHS, MAX_TEXTFILL_WORK);
     }
 
     /** Package-private overload taking an explicit glyph-collection budget (see {@link
@@ -1510,20 +2321,31 @@ final class TableExtractor {
      * float, long[], long)}'s test-only budget override, letting a test pin {@link
      * #MAX_REGION_GLYPHS} deterministically without needing a real multi-million-glyph PDF
      * fixture. */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result, long glyphBudget)
-            throws IOException {
-        fillCellsByRegion(tables, page, result, glyphBudget, MAX_TEXTFILL_WORK);
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
+                                                long glyphBudget) throws IOException {
+        return fillCellsByRegion(tables, page, result, glyphBudget, MAX_TEXTFILL_WORK);
     }
 
     /** Package-private overload taking BOTH explicit budgets -- lets a test pin the
      * position-collection cap AND the bucketing-work cap ({@link #fillCellsFromPositions}'s own
      * budget) deterministically without needing a real fixture large enough to trip either at the
      * production budget. */
-    static void fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
-                                  long glyphBudget, long workBudget) throws IOException {
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
+                                                long glyphBudget, long workBudget) throws IOException {
+        return fillCellsByRegion(tables, page, result, glyphBudget, workBudget, new long[1]);
+    }
+
+    /** As above, additionally ADDING this call's real work (glyphs retained by the streaming
+     *  collector plus the bucketing work it charged against {@code workBudget}) to {@code charge[0]}
+     *  for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}). Charged in a
+     *  {@code finally} so a call that trips either cap is still charged for the work it forced. */
+    static List<TextPosition> fillCellsByRegion(List<List<CellRect>> tables, PDPage page, Result result,
+                                                long glyphBudget, long workBudget, long[] charge)
+            throws IOException {
         long totalCells = 0;
         for (List<CellRect> comp : tables) totalCells += comp.size();
-        if (totalCells == 0) return; // nothing to fill -- avoid registering a bogus bbox below
+        // nothing to fill -- avoid registering a bogus bbox below
+        if (totalCells == 0) return Collections.emptyList();
 
         int rotation = page.getRotation();
         PDRectangle cropBox = page.getCropBox();
@@ -1543,13 +2365,25 @@ final class TableExtractor {
 
         PositionCollectingStripper stripper = new PositionCollectingStripper(
                 glyphBudget, rotation, unrotatedW, unrotatedH, bx0, by0, bx1, by1);
-        if (page.hasContents()) stripper.processPage(page);
-
         long[] work = {0};
-        List<TextPosition> positions = stripper.collected();
-        for (List<CellRect> comp : tables) {
-            fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, workBudget);
+        try {
+            if (page.hasContents()) stripper.processPage(page);
+        } finally {
+            charge[0] += stripper.collected().size();
         }
+
+        List<TextPosition> positions = stripper.collected();
+        try {
+            for (List<CellRect> comp : tables) {
+                fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work, workBudget);
+            }
+        } finally {
+            charge[0] += work[0];
+        }
+        // Returned (not just used) so extractLatticePage can hand the SAME glyphs to the
+        // over-clumped-cell split pass without a second content-stream walk. Callers that only
+        // want the fill are free to ignore it.
+        return positions;
     }
 
     // ---------------------------------------------------------------- entry point
@@ -1566,10 +2400,94 @@ final class TableExtractor {
      * InterruptedException/the interrupt flag must never be swallowed by the per-page
      * catch(Exception) below. FIX 1 and FIX 2 already bound the work a single page can do, so a
      * between-page check is sufficient -- no in-loop check is needed within one page.
+     *
+     * <p>NOT THE PRODUCT DEFAULT. This overload hardcodes the stream path OFF and always will: it is
+     * the tagged+lattice REFERENCE pipeline, used by callers that specifically want the ruled/tagged
+     * answer (and by the bake-off harness's {@code lattice+tagged} configuration, whose published
+     * 0.5114 macro F1 is only meaningful if this stays flag-off). The shipping default that CLI /
+     * REST / blastbox jobs get is {@link PdfTitanArumApp#STREAM_TABLES_DEFAULT}, which is now ON;
+     * production goes through the 4-arg overload with an explicit value. Do not "fix" this to follow
+     * the product default -- that would silently redefine what the flag-off baseline measures.
      */
     static Result extract(PDDocument doc, List<Integer> pagesToProcess,
                           Map<Integer, List<TextPosition>> positionsByPage) {
+        return extract(doc, pagesToProcess, positionsByPage, false);
+    }
+
+    /**
+     * As {@link #extract(PDDocument, List, Map)}, plus the borderless ("stream") whitespace path
+     * when {@code streamTables} is true.
+     *
+     * <p>STRICT SUPERSET WHEN OFF, and the 3-arg overload above pins that: with {@code streamTables}
+     * false this method is bit-identical to the tagged+lattice pipeline that shipped before the
+     * stream path existed -- no stream stage runs, {@link #arbitrate} is never called, and the
+     * emitted candidate list, its ordering and {@link Result#truncated} are all unchanged.
+     *
+     * <p>{@code streamTables} now defaults to TRUE for CLI / REST / blastbox jobs
+     * ({@link PdfTitanArumApp#STREAM_TABLES_DEFAULT}). Measured, document-pooled ICDAR-2013
+     * adjacency macro F1 over de-duplicated ground truth: the arbitrated pipeline scores 0.8199
+     * all-pages and 0.7999 under the shipping page default, against 0.5114 and 0.4938 for
+     * tagged+lattice alone; under 1:1 pairing (comparable to published work) the full pipeline is
+     * ~0.73, below Nurminen's 0.8374. The gain is corpus-composition dependent -- 0.0000 -> 0.7507 on
+     * the 22 borderless documents, ~+0.20 on icdar-EU, ~+0.055 on icdar-US, nothing at all on an
+     * all-ruled corpus. It raises the rate at which the full pipeline emits a table on a real-world
+     * prose PDF from 7/200 to 12/200 on the project's 200-PDF sample (76 -> 118 over the whole
+     * 1,599-PDF population), both over the pages the CLI default processes; hand-adjudication of the
+     * 44 added documents found 25 genuine tables, 10 arguable and 9 fabrications (4 since fixed).
+     * For a security-triage tool a table that is not there is still the worse failure, so the flag
+     * remains switchable off per job on every surface.
+     *
+     * <p>COMPOSITION OF BUDGETS (not multiplication). The stream stage runs inside the SAME per-page
+     * loop as lattice, so:
+     * <ul>
+     *   <li>every per-page budget is ADDITIVE per page -- lattice's ruling/cell/text-fill budgets
+     *       plus the stream path's own per-page caps ({@link StreamTableExtractor#MAX_STREAM_GLYPHS},
+     *       {@code MAX_STREAM_WORDS}, {@code MAX_STREAM_LINES}, {@code MAX_STREAM_PAGE_BLOCK_WORK},
+     *       {@code MAX_STREAM_TABLES_PER_PAGE}) -- turning on the flag at most roughly doubles a
+     *       page's worst case, it does not multiply the document's;</li>
+     *   <li>the between-page interruption check still bounds a multi-page hostile document, and it
+     *       is checked before BOTH stages -- and since {@link #MAX_LATTICE_DOC_WORK} exists, so does
+     *       a document-level bound on each stage independently ({@link #MAX_LATTICE_DOC_WORK} for
+     *       lattice, {@link #MAX_STREAM_PAGES_PER_DOC} for stream), which no longer relies on the
+     *       operator having passed a {@code --timeout} at all;</li>
+     *   <li>{@link #arbitrate} is called ONCE for the whole document against ONE
+     *       {@link #MAX_ARBITRATION_WORK} budget (never per page -- arbitration buckets by page
+     *       internally, so per-page cost is already page-local), so it adds a single bounded
+     *       document-level term rather than a per-page one;</li>
+     *   <li>{@link #MAX_TABLES_PER_PAGE} is COMPOSED by {@link #capTablesPerPage}: the ceiling on
+     *       tables emitted for one page does not rise because a path was added.</li>
+     * </ul>
+     *
+     * <p>Never throws, for the same reason and by the same means as the 3-arg form: the stream stage
+     * is wrapped per page, and arbitration's own budget trip degrades to the drawn-ruling answer.
+     */
+    static Result extract(PDDocument doc, List<Integer> pagesToProcess,
+                          Map<Integer, List<TextPosition>> positionsByPage, boolean streamTables) {
+        return extract(doc, pagesToProcess, positionsByPage, streamTables, MAX_LATTICE_DOC_WORK);
+    }
+
+    /**
+     * As above with an explicit document-level lattice work budget in place of {@link
+     * #MAX_LATTICE_DOC_WORK}. Package-private for tests only -- the same convention {@link
+     * #fillCellsFromPositions(List, List, int, float, float, long[], long)} and {@link
+     * #fillCellsByRegion(List, PDPage, Result, long, long)} already use, so the document-level cut
+     * can be pinned deterministically on a small fixture instead of by wall-clock scale. Production
+     * always calls the 4-arg form.
+     */
+    static Result extract(PDDocument doc, List<Integer> pagesToProcess,
+                          Map<Integer, List<TextPosition>> positionsByPage, boolean streamTables,
+                          long latticeDocWorkBudget) {
         Result result = new Result();
+        List<TableHit> streamHits = streamTables ? new ArrayList<>() : null;
+        int streamPagesRun = 0;
+        // Cumulative REAL lattice work across every page of this document, gated between pages
+        // against latticeDocWorkBudget (production: MAX_LATTICE_DOC_WORK).
+        long[] latticeWork = {0};
+        boolean latticeBudgetReported = false;
+        // Cumulative REAL stream work across every page of this document, gated between pages against
+        // MAX_STREAM_DOC_WORK -- the work-budget sibling of latticeWork above.
+        long[] streamWork = {0};
+        boolean streamBudgetReported = false;
         try {
             extractTagged(doc, new HashSet<>(pagesToProcess), result);
         } catch (StackOverflowError e) {
@@ -1625,48 +2543,289 @@ final class TableExtractor {
                 result.truncated = true;
                 break;
             }
-            try {
-                extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result);
-            } catch (RulingOverflowException e) {
+            if (latticeWork[0] >= latticeDocWorkBudget) {
+                // DOCUMENT-LEVEL LATTICE BOUND (see MAX_LATTICE_DOC_WORK). Cut the document TAIL in
+                // page order: every page already processed keeps its (complete) tables, this page and
+                // every later one contribute nothing, and truncated surfaces the loss as
+                // tablesTruncated in report.json. Deliberately checked BETWEEN pages, never inside
+                // one: the per-page budgets already bound a single page, and stopping mid-page is the
+                // one thing this class never does (it would emit a partially-filled table).
+                //
+                // This gates ONLY the lattice stage. The stream stage below has its own independent
+                // document-level budget (MAX_STREAM_PAGES_PER_DOC) and keeps running, and tagged
+                // extraction has already completed for the whole document above.
                 result.truncated = true;
-                System.err.println("WARNING: table extraction skipped on page " + pageNum + " (ruling cap)");
-            } catch (StackOverflowError e) {
-                // Symmetric with extractTagged's own catch(StackOverflowError) above: this per-page
-                // lattice path calls page.getRotation()/getCropBox() directly (and, via
-                // collectRulings/RulingCollector.processPage, again through pdfbox's own
-                // PDFStreamEngine.initPage), both of which resolve inherited page attributes via
-                // PDPageTree.getInheritableAttribute -- real pdfbox-internal recursion with a cycle
-                // guard but NO depth cap (see extractTagged's catch for the full writeup). A page
-                // whose /Parent is wired into a pathologically deep (but acyclic) chain overflows
-                // the stack here, an Error that the catch(RulingOverflowException)/catch(Exception)
-                // below can NEVER see (Error is not an Exception) -- previously escaping this whole
-                // per-page loop entirely and crashing extract() (and so the worker) outright on a
-                // single hostile page, instead of degrading just that one page. Isolate the failure
-                // to this page only (mirroring selectKeptTables'/splitComponent's own per-component
-                // StackOverflowError isolation): flag truncated and let every other page in
-                // pagesToProcess still extract normally.
-                result.truncated = true;
-                System.err.println("WARNING: table extraction overflowed the stack on page " + pageNum
-                        + " (page skipped): " + e);
-            } catch (Exception e) {
-                // PR re-review P2 (consistency): same fix as extractTagged's own catch(Exception)
-                // above -- this used to leave result.truncated FALSE, unlike every sibling
-                // hostile-input cap on this per-page loop (RulingOverflowException/StackOverflowError
-                // just above), so a page whose lattice extraction failed (e.g. an IOException on a
-                // malformed content stream) was indistinguishable from a clean page with genuinely no
-                // tables. Flag it; the loop still continues to the next page as before.
-                result.truncated = true;
-                System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
+                if (!latticeBudgetReported) {
+                    latticeBudgetReported = true;
+                    System.err.println("WARNING: drawn-ruling (lattice) table extraction stopped at page "
+                            + pageNum + " of " + pagesToProcess.size() + " (document work cap "
+                            + latticeDocWorkBudget + " reached; charged " + latticeWork[0] + ")");
+                }
+            } else {
+                try {
+                    extractLatticePage(doc, pageNum, positionsByPage.get(pageNum), result, latticeWork);
+                } catch (RulingOverflowException e) {
+                    result.truncated = true;
+                    System.err.println("WARNING: table extraction skipped on page " + pageNum + " (ruling cap)");
+                } catch (StackOverflowError e) {
+                    // Symmetric with extractTagged's own catch(StackOverflowError) above: this per-page
+                    // lattice path calls page.getRotation()/getCropBox() directly (and, via
+                    // collectRulings/RulingCollector.processPage, again through pdfbox's own
+                    // PDFStreamEngine.initPage), both of which resolve inherited page attributes via
+                    // PDPageTree.getInheritableAttribute -- real pdfbox-internal recursion with a cycle
+                    // guard but NO depth cap (see extractTagged's catch for the full writeup). A page
+                    // whose /Parent is wired into a pathologically deep (but acyclic) chain overflows
+                    // the stack here, an Error that the catch(RulingOverflowException)/catch(Exception)
+                    // below can NEVER see (Error is not an Exception) -- previously escaping this whole
+                    // per-page loop entirely and crashing extract() (and so the worker) outright on a
+                    // single hostile page, instead of degrading just that one page. Isolate the failure
+                    // to this page only (mirroring selectKeptTables'/splitComponent's own per-component
+                    // StackOverflowError isolation): flag truncated and let every other page in
+                    // pagesToProcess still extract normally.
+                    result.truncated = true;
+                    System.err.println("WARNING: table extraction overflowed the stack on page " + pageNum
+                            + " (page skipped): " + e);
+                } catch (Exception e) {
+                    // PR re-review P2 (consistency): same fix as extractTagged's own catch(Exception)
+                    // above -- this used to leave result.truncated FALSE, unlike every sibling
+                    // hostile-input cap on this per-page loop (RulingOverflowException/StackOverflowError
+                    // just above), so a page whose lattice extraction failed (e.g. an IOException on a
+                    // malformed content stream) was indistinguishable from a clean page with genuinely no
+                    // tables. Flag it; the loop still continues to the next page as before.
+                    result.truncated = true;
+                    System.err.println("WARNING: table extraction failed on page " + pageNum + ": " + e);
+                }
+            }
+            if (streamHits != null) {
+                if (streamWork[0] >= MAX_STREAM_DOC_WORK) {
+                    // DOCUMENT-LEVEL STREAM WORK BOUND (see MAX_STREAM_DOC_WORK). Same discipline as
+                    // the lattice bound just above: cut the document TAIL in page order, keep every
+                    // page already processed intact, never stop mid-page, and surface the loss as
+                    // tablesTruncated. This -- not MAX_STREAM_PAGES_PER_DOC, whose flat-per-page-cost
+                    // premise was measured wrong by ~500x -- is what bounds this stage.
+                    result.truncated = true;
+                    if (!streamBudgetReported) {
+                        streamBudgetReported = true;
+                        System.err.println("WARNING: borderless (stream) table extraction stopped at page "
+                                + pageNum + " of " + pagesToProcess.size() + " (document work cap "
+                                + MAX_STREAM_DOC_WORK + " reached; charged " + streamWork[0] + ")");
+                    }
+                } else if (streamPagesRun >= MAX_STREAM_PAGES_PER_DOC) {
+                    result.truncated = true;
+                } else if (extractStreamPage(doc, pageNum, positionsByPage.get(pageNum), streamHits, result,
+                                             streamWork)) {
+                    streamPagesRun++;
+                }
             }
         }
+        result.latticeWorkCharged = latticeWork[0];
+        result.streamWorkCharged = streamWork[0];
         result.tables.sort(java.util.Comparator
                 .<TableHit>comparingInt(t -> t.page)
                 .thenComparingDouble(t -> t.bbox == null ? 0 : t.bbox[1]));
+
+        if (streamHits != null && !streamHits.isEmpty()) {
+            List<TableHit> merged;
+            try {
+                // The 3-arg form: a candidate that LOSES a contested region is a fully-built table
+                // discarded on a quality judgement, and must be surfaced (arbitrationDisplaced + an
+                // advisory marker on the winner, always; result.truncated + a WARNING only when the
+                // discarded side is the ruled/lattice one, since only that direction drops content the
+                // flag-off pipeline would have emitted). See arbitrate's own javadoc.
+                merged = arbitrate(new ArrayList<>(result.tables), streamHits, result);
+            } catch (RulingOverflowException e) {
+                // Arbitration's work budget tripped. This is unreachable on any legitimate document
+                // (see MAX_ARBITRATION_WORK: it needs ~8900 pages ALL saturating both per-page
+                // candidate caps), and was never observed on the 77-unit scoring corpus or the
+                // 200-PDF prose sample. Degrade the conservative way for a triage tool: keep the
+                // drawn-ruling/tagged answer and emit NO stream candidate at all. NOTE that this is
+                // deliberately NOT the bake-off harness's fallback (which reverts to the old
+                // positional merge, i.e. still emits non-overlapping stream hits) -- on hostile
+                // input, missing a table beats fabricating one. Because the branch cannot be reached
+                // on the corpus, it cannot account for any difference between the harness's measured
+                // number and this pipeline's.
+                result.truncated = true;
+                System.err.println("WARNING: table path arbitration truncated (work cap); "
+                        + "borderless candidates dropped for this document");
+                merged = new ArrayList<>(result.tables);
+            }
+            merged = capTablesPerPage(merged, result);
+            merged.sort(java.util.Comparator
+                    .<TableHit>comparingInt(t -> t.page)
+                    .thenComparingDouble(t -> t.bbox == null ? 0 : t.bbox[1]));
+            result.tables.clear();
+            result.tables.addAll(merged);
+        }
         return result;
     }
 
-    private static void extractLatticePage(PDDocument doc, int pageNum,
-                                           List<TextPosition> positions, Result result) throws IOException {
+    /**
+     * Run the borderless ("stream") whitespace path for one page, appending its candidates to
+     * {@code out}. Isolated per page exactly like {@link #extractLatticePage}'s call site: one
+     * hostile page degrades to "no stream candidate for that page", never to a lost document.
+     *
+     * <p>{@code positions} may be null or empty ({@code --skip-text-urls} hands {@link #extract} an
+     * empty map). The stream path is glyph-only -- there is no region-strip fallback for it, because
+     * it has no drawn geometry to define a region with -- so it simply produces nothing, which is
+     * the correct answer rather than a fabricated one.
+     *
+     * <p>The glyph cap is checked HERE as well as inside {@link StreamTableExtractor#buildWords}:
+     * {@code extractPage} swallows its own {@link RulingOverflowException} and returns an empty
+     * list, so without this pre-check a glyph-bomb page would silently omit its tables with
+     * {@link Result#truncated} left false -- the one thing every other hostile-input cap in this
+     * class is careful to surface. The cap tested is the same constant, so no page's OUTPUT changes;
+     * only its reporting does.
+     *
+     * <p>FRAME. The page's own {@code /Rotate} + cropBox is handed to the stream path as a {@link
+     * StreamTableExtractor.PageFrame} so its reported bboxes land in the SAME visual, /Rotate-applied
+     * top-left frame the lattice path ({@link RulingCollector#addRuling}, {@link
+     * #fillCellsFromPositions}) and the tagged path ({@link #resolveCellText}, "FIX 1 (Codex P2)")
+     * already report in. Without it a {@code /Rotate 90} page emitted stream boxes in a different
+     * frame than the lattice boxes beside them in the same report.json, and {@link
+     * #contestsSameRegion} -- a bbox intersection ACROSS those two frames -- saw no contest, so both
+     * contradictory answers for one region survived arbitration.
+     *
+     * <p>THE PRE-CHECK IS NOT ENOUGH, and used to be all there was. It covers ONE of the THREE
+     * page-global caps {@code extractPage}'s own try wraps: {@code MAX_STREAM_GLYPHS} (300,000) is
+     * pre-checked, but {@code MAX_STREAM_WORDS} (60,000) and {@code MAX_STREAM_LINES} (8,000) are
+     * reachable FAR below the glyph cap and were still swallowed with {@code truncated} left false.
+     * MEASURED: a page carrying an ordinary 5x3 borderless numeric table extracts it correctly (1
+     * table); add 60,001 one-character filler tokens to the SAME page -- 60,071 glyphs, only 20% of
+     * the glyph cap, so this pre-check passes -- and the real table is silently dropped (0 tables,
+     * {@code truncated} false). Nor were the per-BLOCK cap trips reportable: {@code extractPage} took
+     * no {@code Result}, so there was structurally no channel at all. Both are closed by threading a
+     * {@link StreamTableExtractor.PageAccount} in and copying its verdict onto {@code result} below;
+     * see that class's doc for the full list of trips it now reports.
+     *
+     * @return true when the whitespace detector actually ran for this page, i.e. when the page
+     *         consumed a unit of the document-level {@link #MAX_STREAM_PAGES_PER_DOC} budget. A page
+     *         with no glyphs, or one refused by the glyph cap, does no detection work and is
+     *         therefore not charged -- a document of blank pages must not spend a real document's
+     *         budget.
+     */
+    private static boolean extractStreamPage(PDDocument doc, int pageNum, List<TextPosition> positions,
+                                             List<TableHit> out, Result result, long[] docWork) {
+        if (positions == null || positions.isEmpty()) return false;
+        if (positions.size() > StreamTableExtractor.MAX_STREAM_GLYPHS) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction skipped on page " + pageNum
+                    + " (glyph cap)");
+            return false;
+        }
+        StreamTableExtractor.PageAccount account = new StreamTableExtractor.PageAccount();
+        try {
+            out.addAll(StreamTableExtractor.extractPage(pageNum, positions, new BreuelGutterFinder(),
+                    pageFrameOf(doc, pageNum), StreamTableExtractor.PRODUCTION_BAR,
+                    StreamTableExtractor.PRODUCTION_BAR, null, account));
+        } catch (RulingOverflowException e) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction skipped on page " + pageNum
+                    + " (work cap)");
+        } catch (StackOverflowError e) {
+            // Symmetric with the lattice path's own catch: an Error is not an Exception and would
+            // otherwise escape this whole loop and kill the worker on a single hostile page.
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction overflowed the stack on page "
+                    + pageNum + " (page skipped): " + e);
+        } catch (Exception e) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction failed on page " + pageNum + ": " + e);
+        }
+        // The channel that did not exist before: every page-global and per-block cap trip inside
+        // extractPage now reaches Result.truncated (and so report.json's tablesTruncated) instead of
+        // degrading silently. Charged work is accumulated whether or not a cap tripped -- an aborted
+        // page still burned the CPU it burned, and forgiving it would hand a hostile document a free
+        // multiplier against MAX_STREAM_DOC_WORK.
+        docWork[0] += account.totalWork();
+        if (account.truncated) {
+            result.truncated = true;
+            System.err.println("WARNING: borderless table extraction hit a work/size cap on page "
+                    + pageNum + " (some borderless tables on this page may be missing)");
+        }
+        return true;
+    }
+
+    /**
+     * The page's own /Rotate + cropBox as a {@link StreamTableExtractor.PageFrame}. Never throws and
+     * never fails a page: an out-of-range page number, or any exception from pdfbox's inherited-
+     * attribute resolution (which {@code getRotation()}/{@code getCropBox()} both go through), yields
+     * the IDENTITY frame -- i.e. exactly the pre-fix behaviour -- rather than costing the page its
+     * tables. {@code /Rotate} is normalised the same way pdfbox itself does (a multiple of 90 in
+     * [0,360)); anything else is treated as 0, matching {@link #applyPageRotation}'s own default arm.
+     */
+    private static StreamTableExtractor.PageFrame pageFrameOf(PDDocument doc, int pageNum) {
+        try {
+            if (doc == null || pageNum < 1 || pageNum > doc.getNumberOfPages()) {
+                return StreamTableExtractor.PageFrame.IDENTITY;
+            }
+            PDPage page = doc.getPage(pageNum - 1);
+            int rotation = ((page.getRotation() % 360) + 360) % 360;
+            if (rotation == 0) return StreamTableExtractor.PageFrame.IDENTITY;
+            PDRectangle cropBox = page.getCropBox();
+            return new StreamTableExtractor.PageFrame(rotation, cropBox.getWidth(), cropBox.getHeight());
+        } catch (RuntimeException | StackOverflowError e) {
+            return StreamTableExtractor.PageFrame.IDENTITY;
+        }
+    }
+
+    /**
+     * COMPOSE {@link #MAX_TABLES_PER_PAGE} across extraction paths. Each path enforces the cap for
+     * itself (tagged and lattice at 50 in {@link #selectKeptTables} / {@code renderTaggedTables},
+     * stream at {@link StreamTableExtractor#MAX_STREAM_TABLES_PER_PAGE} = 20), so a naive union
+     * could emit more tables for one page than the documented ceiling merely because a path was
+     * added. This levies the ceiling on the MERGED list instead.
+     *
+     * <p>Overflow is always taken off the STREAM side. A drawn-ruling or tagged candidate is never
+     * dropped here, so with the stream stage off this method is a no-op pass-through and the shipping
+     * default's output is untouched; and with it on, the structure tree's own statement about the
+     * document (tagged) and the author's drawn geometry (lattice) still outrank a whitespace guess,
+     * consistent with {@link #arbitrate}'s own rule 1.
+     *
+     * <p>Returns {@code candidates} itself when nothing needs dropping (the overwhelmingly common
+     * case: the densest page measured across the scoring corpus carried 9 ruling + 4 stream
+     * candidates, and across 200 real-world prose PDFs 15 + 1). Sets {@link Result#truncated} when
+     * anything was dropped, like every other cap in this class.
+     */
+    static List<TableHit> capTablesPerPage(List<TableHit> candidates, Result result) {
+        Map<Integer, Integer> perPage = new HashMap<>();
+        boolean over = false;
+        for (TableHit t : candidates) {
+            int n = perPage.merge(t.page, 1, Integer::sum);
+            if (n > MAX_TABLES_PER_PAGE) { over = true; break; }
+        }
+        if (!over) return candidates;
+
+        List<TableHit> out = new ArrayList<>(candidates.size());
+        Map<Integer, Integer> kept = new HashMap<>();
+        // Pass 1: every non-stream candidate, in input order, unconditionally -- they are counted
+        // against the page's budget but never refused by it.
+        for (TableHit t : candidates) {
+            if ("stream".equals(t.extractionMethod)) continue;
+            out.add(t);
+            kept.merge(t.page, 1, Integer::sum);
+        }
+        // Pass 2: stream candidates, in input order, only while their page has room.
+        for (TableHit t : candidates) {
+            if (!"stream".equals(t.extractionMethod)) continue;
+            if (kept.getOrDefault(t.page, 0) >= MAX_TABLES_PER_PAGE) {
+                result.truncated = true;
+                continue;
+            }
+            out.add(t);
+            kept.merge(t.page, 1, Integer::sum);
+        }
+        return out;
+    }
+
+    /**
+     * ADDS every unit of real work this page charged to {@code charge[0]}, which {@link #extract}
+     * carries across the document and gates against {@link #MAX_LATTICE_DOC_WORK}. Charging is by
+     * {@code finally} at every stage, so a page that ABORTS on one of its own per-page caps is still
+     * charged for the work it forced before aborting -- the alternative (charging only pages that
+     * completed) would let a document of aborting pages ride for free, which is exactly the attack.
+     */
+    private static void extractLatticePage(PDDocument doc, int pageNum, List<TextPosition> positions,
+                                           Result result, long[] charge) throws IOException {
         if (pageNum < 1 || pageNum > doc.getNumberOfPages()) return;
         PDPage page = doc.getPage(pageNum - 1);
         int rotation = page.getRotation();
@@ -1674,12 +2833,12 @@ final class TableExtractor {
         float unrotatedW = cropBox.getWidth();
         float unrotatedH = cropBox.getHeight();
 
-        List<Ruling> rulings = normalize(collectRulings(page));
+        List<Ruling> rulings = normalize(collectRulings(page, charge), charge);
         if (rulings.isEmpty()) return;
         List<Ruling> horiz = new ArrayList<>();
         List<Ruling> vert = new ArrayList<>();
         for (Ruling r : rulings) (r.horizontal() ? horiz : vert).add(r);
-        List<CellRect> cells = findCells(horiz, vert);
+        List<CellRect> cells = findCells(horiz, vert, charge);
         if (cells.isEmpty()) return;
 
         // Decide which components actually become tables (geometry only - buildTable(...) here
@@ -1694,18 +2853,31 @@ final class TableExtractor {
         // MAX_CELLS_PER_TABLE / MAX_TABLES_PER_PAGE gates below, so each resulting sub-table is
         // gated on its own true size/count) detects that case and emits the maximal coherent
         // sub-grids instead of one bogus merged grid.
-        List<List<CellRect>> kept = selectKeptTables(groupIntoTables(cells), pageNum, result);
+        List<List<CellRect>> kept =
+                selectKeptTables(groupIntoTables(cells, charge), pageNum, result, charge);
 
+        // The glyph list the cell text was actually filled from -- reused (read-only) by the
+        // over-clumped-cell split pass in renderKeptTables so it can re-derive WORDS inside an
+        // under-ruled band without a second content-stream walk. On the region-fill path this is
+        // the (bbox-prefiltered) list fillCellsByRegion collected, a superset of any candidate
+        // cell's own glyphs, so the pass sees exactly the same text either way.
+        List<TextPosition> filledFrom = null;
         if (positions != null && !positions.isEmpty()) {
             long[] work = {0};
-            for (List<CellRect> comp : kept) {
-                fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work);
+            try {
+                for (List<CellRect> comp : kept) {
+                    fillCellsFromPositions(comp, positions, rotation, unrotatedW, unrotatedH, work);
+                }
+            } finally {
+                charge[0] += work[0];
             }
+            filledFrom = positions;
         } else if (!kept.isEmpty()) {
-            fillCellsByRegion(kept, page, result);
+            filledFrom = fillCellsByRegion(kept, page, result, MAX_REGION_GLYPHS,
+                    MAX_TEXTFILL_WORK, charge);
         }
 
-        renderKeptTables(pageNum, kept, result);
+        renderKeptTables(pageNum, kept, result, filledFrom, rotation, unrotatedW, unrotatedH, charge);
     }
 
     /**
@@ -1735,10 +2907,54 @@ final class TableExtractor {
      * source to guard against in this loop.
      */
     static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result) {
+        renderKeptTables(pageNum, kept, result, null, 0, 0f, 0f);
+    }
+
+    /**
+     * As {@link #renderKeptTables(int, List, Result)}, additionally running the over-clumped-cell
+     * split pass ({@link #splitClumpedCells}) on each built table. {@code positions} is the page's
+     * glyph list in the frame {@code getXDirAdj()/getYDirAdj()} report (i.e. what {@link
+     * #fillCellsFromPositions} was given, or what {@link #fillCellsByRegion} collected); pass
+     * {@code null} to skip the pass entirely. The split budget is shared across every table on the
+     * page via one {@code work} counter, so a hostile page cannot multiply it by table count.
+     */
+    static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result,
+                                 List<TextPosition> positions, int rotation,
+                                 float unrotatedW, float unrotatedH) {
+        renderKeptTables(pageNum, kept, result, positions, rotation, unrotatedW, unrotatedH, new long[1]);
+    }
+
+    /**
+     * As {@link #renderKeptTables(int, List, Result, List, int, float, float)}, additionally ADDING
+     * the over-clumped-cell split pass's real work (the {@link #MAX_CLUMP_SPLIT_WORK} counter,
+     * already shared across every table on the page) to {@code charge[0]} for the document-level
+     * lattice budget ({@link #MAX_LATTICE_DOC_WORK}). Observation only: the per-page clump budget is
+     * unchanged.
+     */
+    static void renderKeptTables(int pageNum, List<List<CellRect>> kept, Result result,
+                                 List<TextPosition> positions, int rotation,
+                                 float unrotatedW, float unrotatedH, long[] charge) {
+        long[] clumpWork = {0};
         for (List<CellRect> comp : kept) {
             try {
                 TableHit t = buildTable(pageNum, comp, "lattice");
+                splitClumpedCells(t, positions, rotation, unrotatedW, unrotatedH,
+                        clumpWork, MAX_CLUMP_SPLIT_WORK);
                 renderViews(t);
+                // PROSE FALSE POSITIVES (lever 4): a drawn grid whose text all anchors in ONE column
+                // is a boxed paragraph / banner-rule pair -- see MIN_LATTICE_TEXTFUL_COLUMNS.
+                // Checked here rather than in buildTable because buildTable also runs from
+                // selectKeptTables' geometry-only pass, BEFORE any cell text exists. Silent (no
+                // result.truncated): a degenerate-content decision, not a hostile-input cap.
+                //
+                // ORDER MATTERS, and it is deliberately AFTER renderViews: renderViews carries the
+                // defense-in-depth grid-product cap, whose trip MUST still set Result.truncated
+                // even for a component this content rule would also have dropped (checking content
+                // first silently swallowed that hostile-input signal -- caught by
+                // TableGeometryTest.renderKeptTablesIsolatesGridProductCapFromOthers). renderViews'
+                // own cost is already bounded by MAX_CELLS_PER_TABLE, so paying it for a table
+                // about to be dropped adds no unbounded work.
+                if (textContradictsColumnStructure(t)) continue;
                 // FINAL DECISION (this fix): never drop a lattice table because it overlaps a
                 // tagged one -- ALWAYS add it. Tagged extraction (see extract()) always runs to
                 // completion for every page BEFORE this per-page lattice loop starts, so every
@@ -1753,6 +2969,7 @@ final class TableExtractor {
                 System.err.println("WARNING: table render skipped on page " + pageNum + " (grid-product cap)");
             }
         }
+        charge[0] += clumpWork[0];
     }
 
     /**
@@ -1888,6 +3105,670 @@ final class TableExtractor {
         return iw * ih;
     }
 
+    // ------------------------------------------------------------- per-region path arbitration
+    //
+    // Two extraction paths can produce a candidate for the SAME region of a page: the drawn-ruling
+    // paths ("tagged"/"lattice") and the whitespace path ("stream"). The rule that used to decide
+    // this was purely positional -- drop the stream candidate whenever a ruling-derived candidate
+    // covered it -- which is not a decision at all: the ruling-derived answer won every contest by
+    // construction. #arbitrate below replaces that with a real selection over extraction-time
+    // signals only. It never sees, and can never see, ground truth.
+    //
+    // WHY THESE SIGNALS. A drawn grid is the better answer when the rulings really do form a grid
+    // over the region. Three measurable ways they fail to:
+    //   1. GRID OCCUPANCY. rowCount x colCount declares a grid; the cells say how many of those
+    //      slots a ruling intersection actually produced. Partially ruled regions (a few long lines
+    //      across a page, no interior verticals) declare a big grid and fill a fraction of it.
+    //   2. A MISSED COLUMN SEPARATOR. Stream resolves strictly more columns: the rulings merged two
+    //      columns that whitespace separates cleanly.
+    //   3. UNDER-SEGMENTED ROWS. Stream resolves several times more rows in the same region: the
+    //      rulings drew a handful of tall bands where there are many text rows.
+    // In all three the stream candidate must ALSO clear a gridness-confidence floor AND row- and
+    // column-coverage floors -- an unconfident whitespace guess never displaces drawn rulings, and a
+    // stream candidate that only read part of the region never takes the whole of it. All are the
+    // conservative direction: on hostile input, and on a table the rulings got right, the cost of
+    // keeping the drawn grid is bounded, while the cost of handing the region to a partial answer is
+    // silently losing content.
+    //
+    // A "tagged" candidate is NEVER arbitrated away: it comes from the document's own structure
+    // tree, i.e. the author's statement about their own table, which no geometric heuristic
+    // outranks. (The scoring corpus contains zero tagged tables, so this is a safety rule chosen on
+    // principle, not a measured one -- stated plainly rather than implied.)
+    //
+    // FOUR CORRECTNESS FIXES to the way the signals above are COMPUTED (all found by adversarial
+    // review with runnable probes against this function; none of them re-tunes a threshold):
+    //
+    //   F2 OCCUPANCY WAS SPAN-BLIND. buildTable emits ONE CellHit per MERGED cell carrying
+    //      rowSpan/colSpan, so `cells.size() / (rowCount*colCount)` under-counts a fully covered grid
+    //      the moment it has a merged title/header/TOTAL row. This class's own fixture
+    //      TableTestPdfs.mergedHeader -- a COMPLETE ruled 2x2 asserted correct by
+    //      TableLatticeTest#mergedHeaderProducesColSpan2 -- scored 3/4 = 0.750, below the 0.80 floor,
+    //      and so lost to any 2-row stream guess at confidence >= 0.65. Coverage is now
+    //      sum(rowSpan*colSpan) clamped to the declared slot count, which is 1.000 for that fixture.
+    //
+    //   F4 OCCUPANCY WAS POOLED ACROSS THE COMPONENT. declaredSlots/actualCells used to be SUMMED
+    //      over every ruled member and one pooled ratio decided the whole component. declaredSlots is
+    //      quadratic in a junk fragment's declared shape, so a single bad fragment dominated the
+    //      denominator and condemned every correct table transitively chained to it through the
+    //      contest graph (demonstrated: a 5-node chain in which two PERFECT tables were dropped for a
+    //      pooled 0.417). The occupancy clause is now decided PER CANDIDATE and fires only when EVERY
+    //      ruled member of the component is itself partially ruled -- a correct table can no longer be
+    //      condemned by a neighbour's occupancy.
+    //
+    //   F3 THE RULED SIDE MIXED max WITH THE STREAM SIDE'S TOTALS. ruledRows was Math.max over the
+    //      ruled members, so when the rulings split one region into K fragments -- exactly the case
+    //      the component traversal exists to handle -- both the row-coverage floor and the
+    //      under-segmentation ratio compared the stream side's whole-region row count against ONE
+    //      fragment's, and fired mechanically as K grew (demonstrated: three disjoint PERFECT 5x3
+    //      tables deleted by one 15x3 stream candidate, 15/5 = 3.0 >= 2.5). ruledRows is now the row
+    //      count of the component's UNION (see #ruledRowsOfComponent): summed across bands that are
+    //      disjoint in y, max within a band. A blind sum was tried first and is WRONG -- it treats two
+    //      side-by-side halves of one table as twice the rows, which cost eu-022 0.0215 adjacency F1
+    //      before the band grouping was added. ruledCols stays a max: a row-wise split preserves the
+    //      column structure, and summing columns would silently disable clause 5 (the
+    //      missed-column-separator signal) for any fragmented ruled side.
+    //
+    //   F5 THERE WAS NO COLUMN-COVERAGE FLOOR. The content-loss guard's own doc says content loss is
+    //      the threat, but only the ROW half was implemented -- so a 20x8 partially-ruled table lost
+    //      to a 20x2 stream candidate, concatenating six columns of data into two cells per row.
+    //      Content loss is measured in CELLS, not rows; the floor is now symmetric.
+    //
+    // Two further defensive rules, neither reachable from today's builders (both paths reject a
+    // candidate below 2x2), stated because this is a package-private API that tests and harnesses
+    // call directly: a candidate whose bbox is non-finite or whose declared shape is degenerate takes
+    // part in NO contest, and a stream side with no non-degenerate member NEVER wins one.
+    //
+    // CALIBRATION. The four thresholds below were chosen by a grid search over the 77-unit ICDAR
+    // scoring corpus and validated LEAVE-ONE-DOCUMENT-OUT (each document scored only with parameters
+    // fitted on the other 76, so no document's own ground truth can influence the parameters it is
+    // judged by).
+    //
+    // RE-RUN ON THE CORRECTED INSTRUMENT (ec93b10 -- the search that first chose these values was run
+    // on a benchmark glyph feed that differed from production's). Same four-parameter family, a WIDER
+    // grid than the original (1080 points: occupancy x confidence x row-ratio x row-floor), scored
+    // under the primary protocol at BOTH page scopes, with the searched family pinned to production's
+    // own arbitrate() by an exact per-document parity control:
+    //
+    //                              all pages   shipping `--pages default`
+    //   positional rule replaced      0.7393                     0.7184
+    //   THESE PARAMETERS, in-sample   0.8118                     0.7927
+    //   leave-one-document-out        0.8010                     0.7819
+    //   ground-truth oracle ceiling   0.8315                     0.8100
+    //   fraction of the ceiling       78.7%                      81.1%
+    //
+    // These values are the in-sample argmax at BOTH scopes and are tied for best in 76 of the 77
+    // leave-one-out folds, so the optimum is a plateau rather than a spike. The only grid point tied
+    // with them differs in the row-coverage floor alone (0.65 rather than 0.75) and is POINTWISE
+    // IDENTICAL on all 77 documents -- no corpus region falls between those two floors, so the corpus
+    // cannot separate them and the more conservative 0.75 is kept. Leave-one-out is unchanged to four
+    // decimals whichever of the two is preferred. No parameter moved on the corrected instrument.
+    // See ArbRuleHarness / ArbOracleHarness / Lever5RecalHarness.
+
+    /** Gridness confidence a stream candidate must reach before it can displace drawn rulings. */
+    static final double ARB_MIN_STREAM_CONFIDENCE = 0.65;
+
+    /** Below this fraction of its declared rowCount x colCount slots COVERED, a drawn grid counts as
+     *  only partially ruled and loses to a confident stream candidate. Coverage is
+     *  {@code sum(rowSpan*colSpan)} over the candidate's cells, clamped to the declared slot count --
+     *  NOT {@code cells.size()}, which under-counts every merged cell (fix F2 above). Evaluated PER
+     *  CANDIDATE, and the clause fires only when every ruled member of the component is below it
+     *  (fix F4 above). */
+    static final double ARB_MIN_GRID_OCCUPANCY = 0.80;
+
+    /** How many times more rows stream must resolve in the same region before the rulings count as
+     *  under-segmenting it. Deliberately well above ordinary header/total-row disagreement. */
+    static final double ARB_ROW_UNDERSEGMENTATION_RATIO = 2.5;
+
+    /**
+     * CONTENT-LOSS GUARD. Fraction of the ruled row count a stream candidate must itself reach before
+     * it is allowed to take the region at all. A stream candidate that read 5 rows of a 20-row region
+     * may look better on every other signal, but handing it the region drops 15 rows of content --
+     * the outcome this threat model treats as worst. This guard is checked before every clause that
+     * can hand the region to stream, so no amount of confidence or occupancy evidence can override it.
+     */
+    static final double ARB_MIN_ROW_COVERAGE = 0.75;
+
+    /**
+     * CONTENT-LOSS GUARD, COLUMN HALF (fix F5 above). Fraction of the ruled column count a stream
+     * candidate must itself reach before it can take the region. The row floor alone left the guard
+     * half-implemented: content loss is measured in CELLS, and a stream candidate that resolved 2 of
+     * a region's 8 columns loses six columns' worth of every row it did read -- measurably worse than
+     * the row-only failure the floor above was added for (demonstrated: a 20-row x 8-column
+     * partially-ruled table, 80 cells, taken by a 20x2 stream candidate).
+     *
+     * <p>DELIBERATELY THE SAME VALUE as {@link #ARB_MIN_ROW_COVERAGE}, and NOT separately calibrated:
+     * the corpus grid search that fitted the other four thresholds never contained this parameter, so
+     * choosing anything else here would be a number invented to fit a score. Stated plainly rather
+     * than implied -- if the corrected behaviour needs re-calibration, that is a separate, measured
+     * follow-up, not a knob turned here.
+     */
+    static final double ARB_MIN_COL_COVERAGE = 0.75;
+
+    /**
+     * Coverage fraction at which two candidates are treated as answers to the SAME region: either
+     * one's area is more than this much inside the other's. Symmetric, unlike the positional rule
+     * this replaces -- a small ruling fragment sitting inside a large stream table contests it just
+     * as much as the other way round, and treating that as "no contest" left both emitted.
+     */
+    static final float ARB_CONTEST_COVERAGE = 0.5f;
+
+    /**
+     * Work budget for arbitration, charged one unit per candidate-pair coverage test and per
+     * traversal step, and levied BEFORE the per-page adjacency matrix is allocated.
+     *
+     * <p>SIZED FROM MEASUREMENTS, not guessed (see {@code ArbDosProbe}):
+     * <ul>
+     *   <li>Candidates are already capped upstream at {@link #MAX_TABLES_PER_PAGE} (50) ruling plus
+     *       {@link StreamTableExtractor#MAX_STREAM_TABLES_PER_PAGE} (20) stream per page, and
+     *       arbitration buckets by page, so ONE page costs at most 50*20 pair tests plus
+     *       (50+20)*50 traversal steps = ~4.5e3 units -- regardless of how long the document is.</li>
+     *   <li>Real documents are nowhere near those caps: across the 77-unit scoring corpus the
+     *       densest page carried 9 ruling and 4 stream candidates, and across 200 real-world prose
+     *       PDFs, 15 ruling and 1 stream. Whole-document arbitrate() cost measured at 1.9us mean /
+     *       55us max, against 6.1ms p50 for the stream path that produced the candidates.</li>
+     *   <li>Measured throughput is 160-310M charged units/s, so this budget bounds arbitration's
+     *       worst case at roughly 130-250ms -- and reaching it needs ~8900 pages ALL saturating both
+     *       per-page caps, a document whose extraction alone would already have cost tens of
+     *       seconds. Arbitration can therefore never be the cheapest way to attack the pipeline.</li>
+     * </ul>
+     * The budget exists so a hostile caller handing in an unbounded candidate list aborts (measured:
+     * 2.4ms for 20000+20000 candidates on one page) instead of running quadratic work or allocating a
+     * quadratic matrix.
+     */
+    static final long MAX_ARBITRATION_WORK = 40_000_000L;
+
+    /**
+     * Convenience overload for callers that have no {@link Result} to report into -- the bake-off /
+     * calibration harnesses and the unit tests, which score or assert on the returned list only.
+     * Behaves EXACTLY as {@link #arbitrate(List, List, Result)}: same decisions, same output, same
+     * advisory per-hit markers. The only difference is that the loss report (the {@code truncated}
+     * flag and the displaced-candidate count) goes into a throwaway {@link Result} nobody reads.
+     */
+    static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream) {
+        return arbitrate(ruled, stream, new Result());
+    }
+
+    /**
+     * Select, per contested region, between the drawn-ruling candidates and the whitespace-path
+     * candidates. Returns the surviving candidates: every {@code ruled} candidate that won or was
+     * never contested, in input order, followed by every surviving {@code stream} candidate in input
+     * order. Neither input LIST is mutated or reordered.
+     *
+     * <p>REPORTING THE LOSS. Arbitration is the only path in this class that discards a fully-built,
+     * successfully-extracted table on a QUALITY judgement rather than on a cap or an error, and it
+     * used to do so invisibly: a region whose correct table was arbitrated away was byte-identical in
+     * report.json to a region that never had a table. Every discarded candidate now
+     * <ul>
+     *   <li>increments {@link Result#arbitrationDisplaced}, and</li>
+     *   <li>leaves an ADVISORY marker on the WINNER ({@link TableHit#displacedRuledCandidate} /
+     *       {@link TableHit#displacedStreamCandidate}) so a consumer can see which hit replaced
+     *       what -- the same "flag, never suppress silently" pattern as
+     *       {@link TableHit#likelyDuplicateOfTagged}.</li>
+     * </ul>
+     * regardless of which side won, so a contest is never invisible to a consumer reading
+     * report.json's {@code tables} array. {@code result.truncated} (surfaced by {@code
+     * PdfTitanArumApp} as {@code tablesTruncated}) is set ONLY when the discarded side is the
+     * ruled/lattice one -- i.e. only when a STREAM candidate won the region and a drawn-ruling
+     * candidate the flag-off pipeline would have emitted is missing from this output. When the
+     * ruled/tagged side wins (the common case) the discarded stream candidate never appeared in the
+     * flag-off output either, so this document's {@code tables} are byte-identical to what {@code
+     * --stream-tables} off would have produced for that region, and {@code truncated} -- which every
+     * OTHER path in this class uses to mean "content may be missing" -- must not fire on a page where
+     * nothing is. (History: the first fix here set {@code truncated} on EITHER direction, which meant
+     * arbitration's own normal, healthy operation -- the ruled/tagged answer winning, which it does on
+     * the large majority of contests -- reported the same signal as a genuine cap trip. Measured: 44
+     * of the 77-document ICDAR/tabula scoring corpus reported {@code tablesTruncated} under that rule,
+     * of which only 19 actually lost a ruled/lattice candidate; the other 25 were the ruled/tagged
+     * side winning every contest on the document, output unchanged from flag-off, flagged anyway.)
+     * One message is emitted per affected PAGE (not per region: a hostile document sitting at both
+     * per-page candidate caps has up to 50 components per page, and the sibling drop paths log
+     * per-page too) -- a WARNING when the page lost real content, an INFO line (deliberately not a
+     * WARNING, and deliberately not reflected in {@code truncated}) when it did not.
+     *
+     * <p>Surviving candidate OBJECTS may therefore have those two advisory fields set; nothing else
+     * about them is touched.
+     *
+     * <p>Both inputs may be empty; a candidate with no {@code bbox}, a non-finite bbox, or a
+     * degenerate declared shape cannot be shown to contest anything and therefore always survives.
+     * Throws {@link RulingOverflowException} if the candidate lists are large enough to exceed
+     * {@link #MAX_ARBITRATION_WORK} -- see that field for why no legitimate document can.
+     */
+    static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream, Result result) {
+        return arbitrate(ruled, stream, result, MAX_ARBITRATION_WORK);
+    }
+
+    /**
+     * As above with an explicit work budget in place of {@link #MAX_ARBITRATION_WORK}.
+     * Package-private for tests only -- the same convention {@link #extract(PDDocument, List, Map,
+     * boolean, long)} already uses ("so the document-level cut can be pinned deterministically on a
+     * small fixture instead of by wall-clock scale"). Production always calls the 2-arg or 3-arg
+     * ({@link Result}) forms above.
+     *
+     * <p>Needed because WHERE this method charges is as load-bearing as HOW MUCH: the guard on the
+     * adjacency matrix must refuse before allocating, and at the production budget the smallest
+     * fixture that distinguishes "refused at the guard" from "allocated, then refused in the
+     * component traversal" needs twenty million candidates. With an injectable budget the same
+     * distinction is a sixty-candidate fixture.
+     */
+    static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream, long workBudget) {
+        return arbitrate(ruled, stream, new Result(), workBudget);
+    }
+
+    private static List<TableHit> arbitrate(List<TableHit> ruled, List<TableHit> stream, Result result,
+                                             long workBudget) {
+        if (ruled == null || ruled.isEmpty()) {
+            return stream == null ? new ArrayList<>() : new ArrayList<>(stream);
+        }
+        if (stream == null || stream.isEmpty()) return new ArrayList<>(ruled);
+
+        int nr = ruled.size(), ns = stream.size();
+        long[] work = {0};
+        charge(work, (long) nr + ns, workBudget);
+
+        // Bucket BOTH sides by page. Candidates on different pages can never contest each other, so
+        // every contest graph is page-local and both the pair scan AND the component traversal below
+        // cost O(Lp * Sp) for that page alone -- never O(total candidates). Without the bucketing the
+        // traversal charges the document-wide candidate count per visited node, which is quadratic
+        // across a long document and (measured) trips the budget on a legitimate 200-page document
+        // sitting at the per-page candidate caps.
+        Map<Integer, List<Integer>> ruledByPage = new HashMap<>();
+        Map<Integer, List<Integer>> streamByPage = new HashMap<>();
+        boolean[] keepRuled = new boolean[nr];
+        boolean[] keepStream = new boolean[ns];
+        for (int i = 0; i < nr; i++) {
+            keepRuled[i] = true;                                   // survives unless a contest is lost
+            if (ruled.get(i).bbox != null) {
+                ruledByPage.computeIfAbsent(ruled.get(i).page, k -> new ArrayList<>()).add(i);
+            }
+        }
+        for (int j = 0; j < ns; j++) {
+            keepStream[j] = true;
+            if (stream.get(j).bbox != null) {
+                streamByPage.computeIfAbsent(stream.get(j).page, k -> new ArrayList<>()).add(j);
+            }
+        }
+
+        for (Map.Entry<Integer, List<Integer>> e : ruledByPage.entrySet()) {
+            List<Integer> rIdx = e.getValue();
+            List<Integer> sIdx = streamByPage.get(e.getKey());
+            if (sIdx == null || sIdx.isEmpty()) continue;
+            int lp = rIdx.size(), sp = sIdx.size();
+            // Tracked SEPARATELY, not as one pageDisplaced total: only content-losing displacement
+            // (a ruled/lattice candidate discarded because a stream candidate won the region) may set
+            // Result.truncated. A ruled/tagged win that discards a stream candidate loses nothing the
+            // flag-off pipeline would have shown, so it must not. See the two branches below.
+            int pageDisplacedContentLoss = 0;
+            int pageDisplacedHealthy = 0;
+
+            // Contest graph for this page, in page-local indices. The budget is charged BEFORE the
+            // adjacency matrix is allocated: charging afterwards would let a hostile candidate list
+            // materialise an lp*sp byte matrix (gigabytes) and only then be refused.
+            //
+            // `+ lp + sp` prices what `lp * sp` alone does not: the lp separate row OBJECTS of a
+            // boolean[lp][sp] (~16 bytes of header each) plus the two marker arrays. With sp == 1 the
+            // product term is only lp, so at the 40,000,000 budget an lp of 40,000,000 passed the
+            // guard and then allocated ~640MB of row headers. Not reachable through extract() (the
+            // per-page caps hold lp near 100), but this method is package-private and its own doc
+            // advertises the guard against "a hostile caller handing in an unbounded candidate list",
+            // so the guard has to actually price every allocation it gates.
+            charge(work, (long) lp * sp + lp + sp, workBudget);
+            boolean[][] adj = new boolean[lp][sp];
+            boolean[] rContested = new boolean[lp];
+            boolean[] sContested = new boolean[sp];
+            for (int a = 0; a < lp; a++) {
+                TableHit r = ruled.get(rIdx.get(a));
+                for (int b = 0; b < sp; b++) {
+                    if (!contestsSameRegion(r, stream.get(sIdx.get(b)))) continue;
+                    adj[a][b] = true;
+                    rContested[a] = true;
+                    sContested[b] = true;
+                }
+            }
+
+            // Connected components of the contest graph. A component is one contested region: it may
+            // hold several ruling fragments (rulings split what stream reads as one table) and
+            // several stream hits (stream split what the rulings read as one table). The decision is
+            // made for the component as a whole -- dropping only part of a losing side would
+            // double-report the same content.
+            boolean[] seenR = new boolean[lp], seenS = new boolean[sp];
+            for (int start = 0; start < lp; start++) {
+                if (!rContested[start] || seenR[start]) continue;
+                List<Integer> compR = new ArrayList<>(), compS = new ArrayList<>();
+                ArrayDeque<Integer> qr = new ArrayDeque<>(), qs = new ArrayDeque<>();
+                qr.add(start); seenR[start] = true;
+                while (!qr.isEmpty() || !qs.isEmpty()) {
+                    if (!qr.isEmpty()) {
+                        int a = qr.poll();
+                        compR.add(rIdx.get(a));
+                        charge(work, sp, workBudget);
+                        for (int b = 0; b < sp; b++) if (adj[a][b] && !seenS[b]) { seenS[b] = true; qs.add(b); }
+                    } else {
+                        int b = qs.poll();
+                        compS.add(sIdx.get(b));
+                        charge(work, lp, workBudget);
+                        for (int a = 0; a < lp; a++) if (adj[a][b] && !seenR[a]) { seenR[a] = true; qr.add(a); }
+                    }
+                }
+                RegionOutcome outcome = decideRegion(ruled, compR, stream, compS);
+                if (outcome == RegionOutcome.STREAM_WINS) {
+                    // A tagged candidate is NEVER arbitrated away. decideRegion clause 2 already
+                    // refuses STREAM_WINS for any component holding one, so this skip is unreachable
+                    // today -- it is kept as a STRUCTURAL guarantee of that invariant, so a future
+                    // change to clause 2 can never turn into a silently dropped tagged table here.
+                    int dropped = 0;
+                    for (int i : compR) {
+                        if ("tagged".equals(ruled.get(i).extractionMethod)) continue;
+                        if (keepRuled[i]) dropped++;
+                        keepRuled[i] = false;
+                    }
+                    if (dropped > 0) {
+                        // CONTENT LOSS: a drawn-ruling/lattice candidate that the flag-off pipeline
+                        // would have emitted is gone from the output, replaced by the stream answer.
+                        // This is the one arbitration outcome that makes report.json differ from what
+                        // --stream-tables off would have produced, so it is the one that sets
+                        // Result.truncated -- see the block comment above this method for why the
+                        // OTHER branch (ruled/tagged keeps the region) must not.
+                        pageDisplacedContentLoss += dropped;
+                        for (int j : compS) stream.get(j).displacedRuledCandidate = Boolean.TRUE;
+                    }
+                } else {
+                    int dropped = 0;
+                    for (int j : compS) {
+                        if (keepStream[j]) dropped++;
+                        keepStream[j] = false;
+                    }
+                    if (dropped > 0) {
+                        // NO CONTENT LOSS: the ruled/tagged candidate keeps the region, exactly as the
+                        // flag-off pipeline would have emitted it -- the discarded stream candidate
+                        // never appears in the flag-off output at all, so nothing the user would
+                        // otherwise have seen is missing. Counted (arbitrationDisplaced) and flagged on
+                        // the winner (displacedStreamCandidate) so the contest is still visible to a
+                        // consumer or test, but must NOT set Result.truncated: that field means
+                        // "content may be missing," and here it is not.
+                        pageDisplacedHealthy += dropped;
+                        for (int i : compR) ruled.get(i).displacedStreamCandidate = Boolean.TRUE;
+                    }
+                }
+            }
+            int pageDisplaced = pageDisplacedContentLoss + pageDisplacedHealthy;
+            if (pageDisplaced > 0) {
+                result.arbitrationDisplaced += pageDisplaced;
+                if (pageDisplacedContentLoss > 0) {
+                    // Only a genuine content-losing displacement (a stream candidate displacing a
+                    // ruled/lattice one) surfaces as Result.truncated -- see this method's own javadoc
+                    // ("REPORTING THE LOSS") for why the healthy-win case below must stay off it.
+                    result.truncated = true;
+                    System.err.println("WARNING: table path arbitration discarded " + pageDisplacedContentLoss
+                            + " drawn-ruling candidate(s) on page " + e.getKey()
+                            + " in favor of a more confident borderless candidate (content the "
+                            + "flag-off pipeline would have emitted is missing from this output)");
+                }
+                if (pageDisplacedHealthy > 0) {
+                    // Informational only -- deliberately NOT a "WARNING" and deliberately NOT reflected
+                    // in Result.truncated: the ruled/tagged answer kept the region, so this document's
+                    // output is byte-identical to what --stream-tables off would have produced here.
+                    System.err.println("INFO: table path arbitration kept the drawn-ruling/tagged answer "
+                            + "over " + pageDisplacedHealthy + " borderless candidate(s) on page "
+                            + e.getKey() + " (no content lost; output matches the flag-off pipeline)");
+                }
+            }
+        }
+
+        List<TableHit> out = new ArrayList<>(nr + ns);
+        for (int i = 0; i < nr; i++) if (keepRuled[i]) out.add(ruled.get(i));
+        for (int j = 0; j < ns; j++) if (keepStream[j]) out.add(stream.get(j));
+        return out;
+    }
+
+    private static void charge(long[] work, long amount, long budget) {
+        work[0] += amount;
+        if (work[0] > budget) throw new RulingOverflowException();
+    }
+
+    /**
+     * True when the two candidates are answers to the same region: either one's area lies more than
+     * {@link #ARB_CONTEST_COVERAGE} inside the other's. Same page only.
+     *
+     * <p>A candidate that is not {@link #arbitrable} -- no bbox, a non-finite bbox, a zero-area bbox,
+     * or a degenerate declared shape -- contests NOTHING and therefore always survives, the same
+     * documented treatment a null bbox already had. Today's builders reject any candidate below 2x2
+     * on both paths, so this is a defensive invariant on a package-private API rather than a live
+     * path; before it was stated, a {@code 10 rows x 0 cols} ruled candidate produced occupancy 0.0
+     * and lost its region to any confident stream guess, and a NaN bbox silently fell through every
+     * comparison to the same "no contest" answer by accident rather than by rule.
+     */
+    private static boolean contestsSameRegion(TableHit a, TableHit b) {
+        if (a.page != b.page) return false;
+        if (!arbitrable(a) || !arbitrable(b)) return false;
+        float inter = bboxIntersectionArea(a.bbox, b.bbox);
+        if (inter <= 0f) return false;
+        float aArea = bboxArea(a.bbox), bArea = bboxArea(b.bbox);
+        if (aArea > 0f && inter / aArea > ARB_CONTEST_COVERAGE) return true;
+        return bArea > 0f && inter / bArea > ARB_CONTEST_COVERAGE;
+    }
+
+    /**
+     * Whether a candidate has enough well-formed geometry and shape to take part in a contest at all:
+     * a finite, positive-area bbox and a declared grid of at least one row and one column. Used only
+     * by {@link #contestsSameRegion} -- a non-arbitrable candidate is never dropped, it is simply
+     * never contested.
+     */
+    private static boolean arbitrable(TableHit t) {
+        if (t.bbox == null || t.bbox.length < 4) return false;
+        for (float v : t.bbox) if (!Float.isFinite(v)) return false;
+        if (!(t.bbox[2] > t.bbox[0]) || !(t.bbox[3] > t.bbox[1])) return false;
+        return t.rowCount > 0 && t.colCount > 0;
+    }
+
+    /** What arbitration decided for one contested region. */
+    private enum RegionOutcome {
+        /** The drawn-ruling side keeps the region; every stream candidate in it is discarded. */
+        RULED_WINS,
+        /** The stream side takes the region; every LATTICE candidate in it is discarded (a tagged
+         *  candidate is never arbitrated away and survives regardless -- see decideRegion clause 2,
+         *  which already refuses this outcome for any component holding one). */
+        STREAM_WINS
+    }
+
+    /**
+     * THE DECISION. Signals only -- see the block comment above {@link #ARB_MIN_STREAM_CONFIDENCE}
+     * for why each one is evidence that the rulings do not form a grid over this region, and for the
+     * four computation fixes (F2-F5) this function carries.
+     */
+    private static RegionOutcome decideRegion(List<TableHit> ruled, List<Integer> compR,
+                                              List<TableHit> stream, List<Integer> compS) {
+        if (compS.isEmpty()) return RegionOutcome.RULED_WINS;
+
+        // 0. DEGENERATE STREAM SIDE. A candidate with no rows, no columns or no cells carries no
+        //    content, so it can never be evidence that the rulings are wrong -- and must never be
+        //    handed a region. (Defensive: StreamTableExtractor rejects anything below 2x2.)
+        boolean anyRealStream = false;
+        for (int j : compS) {
+            TableHit s = stream.get(j);
+            if (s.rowCount > 0 && s.colCount > 0 && s.cells != null && !s.cells.isEmpty()) {
+                anyRealStream = true;
+                break;
+            }
+        }
+        if (!anyRealStream) return RegionOutcome.RULED_WINS;
+
+        // 1. Confidence floor. A stream candidate with no confidence at all is no evidence.
+        //    Read the UNROUNDED confidence: report.json rounds to 3 decimals, and comparing
+        //    that rounded value here made this calibrated 0.65 floor an effective 0.6495 (F12a).
+        double confSum = 0;
+        for (int j : compS) {
+            TableHit s = stream.get(j);
+            Double c = s.confidenceUnrounded != null ? s.confidenceUnrounded : s.confidence;
+            if (c == null || !Double.isFinite(c)) return RegionOutcome.RULED_WINS;
+            confSum += c;
+        }
+        if (confSum / compS.size() < ARB_MIN_STREAM_CONFIDENCE) return RegionOutcome.RULED_WINS;
+
+        int streamRows = 0, streamCols = 0;
+        for (int j : compS) {
+            TableHit s = stream.get(j);
+            streamRows = Math.max(streamRows, s.rowCount);
+            streamCols = Math.max(streamCols, s.colCount);
+        }
+
+        // 2. THE STRUCTURE TREE IS AUTHORITATIVE: a tagged candidate is never arbitrated away, and it
+        //    vetoes the stream side for the whole component.
+        //
+        //    F6 (REVIEWED, DELIBERATELY NOT RELAXED -- and the evidence is in this repo). The review
+        //    that produced fixes F2-F5 also asked for this component-wide veto to be scoped or made
+        //    advisory, on the grounds that HTML-to-PDF converters emit LAYOUT <table>s, that
+        //    MIN_TAGGED_RANK=2 admits any 2x2 wrapper, and that a 2x2 wrapper whose glyph-union bbox
+        //    spans the page therefore deletes a real 30x5 borderless table nested inside it. That
+        //    demonstration reproduces exactly as described. It is nevertheless NOT actionable at this
+        //    level, because the fixture
+        //    TableTestPdfs#taggedHollowMiddleTwoDenseBlocksPlusDistinctRuledTableInGap presents
+        //    arbitration with the SAME SHAPES and requires the OPPOSITE outcome (measured):
+        //
+        //      demonstration : tagged 2x2, page-spanning bbox; stream 30x5 conf 0.85 -> must SURVIVE
+        //      repo fixture  : tagged 2x2, bbox [60,86,149,691]; stream 10x4 conf 0.725 x2
+        //                      -> must LOSE (they are two prose paragraphs re-read as grids;
+        //                         TableStreamWiringTest#aTaggedTableIsNeverLostWhenTheStreamStageIsEnabled
+        //                         asserts zero stream hits survive that page)
+        //
+        //    Both are a 2x2 tagged grid whose cells hold multi-line text, contested by a stream
+        //    candidate with several times more rows and more columns. Every scoping signal available
+        //    here -- row ratio (5.0 vs 15.0), column comparison (4>=2 vs 5>=2), per-cell footprint
+        //    containment (the stream hit sits inside ONE tagged cell in BOTH cases) -- either fires on
+        //    both or on neither. Separating them would mean choosing a threshold between 5 and 15,
+        //    i.e. a number invented to make one case pass and the other fail, on a rule the corpus
+        //    cannot measure at all (it contains zero tagged tables). What IS fixed instead is the
+        //    VISIBILITY of the drop: a stream candidate lost to this veto now sets Result.truncated,
+        //    increments Result.arbitrationDisplaced, flags the tagged winner
+        //    displacedStreamCandidate, and logs a WARNING naming the page. A real relaxation needs a
+        //    LAYOUT-TABLE discriminator on the tagged path itself (is the declared grid commensurate
+        //    with its own cells' glyph rows?) plus a corpus that contains tagged tables to measure it
+        //    on -- a separate, measured change, not a threshold turned here.
+        for (int i : compR) if ("tagged".equals(ruled.get(i).extractionMethod)) return RegionOutcome.RULED_WINS;
+
+        // Ruled-side shape, COMPONENT-WIDE (fix F3). ruledRows used to be Math.max over the members,
+        // so a region the rulings split into K stacked fragments was compared against ONE fragment's
+        // row count and both the floor below and clause 6 fired mechanically as K grew. It is now the
+        // row count of the component's UNION -- see #ruledRowsOfComponent, which sums across bands
+        // that are disjoint in y and takes the max within a band, so stacked fragments add (correct:
+        // splitComponent divides a ruled region by ROWS) while SIDE-BY-SIDE fragments do not
+        // (measured: eu-022's two 15x2 halves sit at x 58-210 and 210-318 over the SAME 15 rows, and
+        // a blind sum called that 30 rows and cost that document 0.0215 adjacency F1). Columns stay a
+        // MAX: a row-wise split preserves the column structure, and summing them would silently
+        // disable clause 5 (the missed-column-separator signal) for any fragmented ruled side.
+        long ruledRows = ruledRowsOfComponent(ruled, compR);
+        int ruledCols = 0;
+        for (int i : compR) ruledCols = Math.max(ruledCols, ruled.get(i).colCount);
+
+        // 3. CONTENT-LOSS GUARD, checked before any evidence in stream's favour: a stream candidate
+        //    that resolved materially fewer rows -- or materially fewer COLUMNS (fix F5) -- than the
+        //    rulings did is reading only part of the region, and must never be handed the whole of it.
+        //    Content loss is measured in CELLS, so both halves are needed: losing 6 of 8 columns
+        //    concatenates six fields into one cell on EVERY row stream did read.
+        if (ruledRows > 0 && streamRows < ARB_MIN_ROW_COVERAGE * ruledRows) return RegionOutcome.RULED_WINS;
+        if (ruledCols > 0 && streamCols < ARB_MIN_COL_COVERAGE * ruledCols) return RegionOutcome.RULED_WINS;
+
+        // 4. Partially ruled grid: most of the declared grid is not covered by a cell. PER CANDIDATE
+        //    (fix F4) -- pooling declaredSlots/actualCells across the component let one junk fragment,
+        //    whose declared slot count is quadratic in its declared shape, dominate the denominator
+        //    and condemn every correct table chained to it. Coverage counts SPANS (fix F2): buildTable
+        //    emits one CellHit per merged cell, so a complete grid with a merged header row covers
+        //    every slot while carrying fewer cells than slots.
+        boolean everyRuledMemberIsPartiallyRuled = true;
+        for (int i : compR) {
+            if (gridCoverage(ruled.get(i)) >= ARB_MIN_GRID_OCCUPANCY) {
+                everyRuledMemberIsPartiallyRuled = false;
+                break;
+            }
+        }
+        if (everyRuledMemberIsPartiallyRuled) return RegionOutcome.STREAM_WINS;
+
+        // 5. A column separator the rulings missed. No cap on stream's row count here -- guard 3
+        //    already refuses a stream candidate that under-covers the region, which is the failure
+        //    this clause needed protecting from.
+        if (streamCols > ruledCols) return RegionOutcome.STREAM_WINS;
+
+        // 6. Under-segmented rows: several times more text rows than ruled bands.
+        return ruledRows > 0
+                && (double) streamRows / ruledRows >= ARB_ROW_UNDERSEGMENTATION_RATIO
+                ? RegionOutcome.STREAM_WINS : RegionOutcome.RULED_WINS;
+    }
+
+    /**
+     * How many ruled ROWS a contested region's ruling-derived side describes in total: the row count
+     * of the UNION of its members, not of any one of them (fix F3).
+     *
+     * <p>Members are grouped into BANDS that are disjoint along y. Within a band the count is a MAX --
+     * fragments that share the same vertical extent are answers to the same rows, side by side (two
+     * halves of one table split by a missing centre ruling; eu-022's two 15x2 halves over the same 15
+     * rows). Across bands the counts ADD -- {@link #splitComponent} divides a ruled region by ROWS, so
+     * stacked fragments really do describe successive row groups, and comparing the stream side's
+     * whole-region row count against just the tallest fragment is what made the row-coverage floor and
+     * the under-segmentation ratio fire purely as a function of how many pieces the rulings came in.
+     *
+     * <p>Bounded work: the member count is capped by {@link #MAX_TABLES_PER_PAGE} (50), so the sort is
+     * over at most 50 entries per component.
+     */
+    private static long ruledRowsOfComponent(List<TableHit> ruled, List<Integer> compR) {
+        int n = compR.size();
+        if (n == 0) return 0;
+        if (n == 1) return Math.max(0, ruled.get(compR.get(0)).rowCount);
+        // [y0, y1, rowCount] per member; a member with no usable bbox forms its own band.
+        float[][] spans = new float[n][3];
+        for (int k = 0; k < n; k++) {
+            TableHit r = ruled.get(compR.get(k));
+            boolean usable = r.bbox != null && r.bbox.length >= 4
+                    && Float.isFinite(r.bbox[1]) && Float.isFinite(r.bbox[3]);
+            spans[k][0] = usable ? r.bbox[1] : Float.NEGATIVE_INFINITY;
+            spans[k][1] = usable ? Math.max(r.bbox[1], r.bbox[3]) : Float.NEGATIVE_INFINITY;
+            spans[k][2] = Math.max(0, r.rowCount);
+        }
+        java.util.Arrays.sort(spans, (a, b) -> Float.compare(a[0], b[0]));
+        long total = 0;
+        float bandEnd = Float.NEGATIVE_INFINITY;
+        float bandMax = 0;
+        boolean open = false;
+        for (float[] s : spans) {
+            if (open && s[0] < bandEnd) {                 // overlaps the open band: same rows
+                bandEnd = Math.max(bandEnd, s[1]);
+                bandMax = Math.max(bandMax, s[2]);
+            } else {
+                if (open) total += (long) bandMax;
+                bandEnd = s[1];
+                bandMax = s[2];
+                open = true;
+            }
+        }
+        if (open) total += (long) bandMax;
+        return total;
+    }
+
+    /**
+     * Fraction of a candidate's declared {@code rowCount x colCount} slots that its cells actually
+     * COVER, in [0,1]. Counts {@code rowSpan*colSpan} per cell -- {@link #buildTable} emits exactly
+     * one {@link CellHit} per merged cell, so {@code cells.size()} under-counts a complete grid with
+     * any merged header/title/TOTAL row (fix F2). The sum is clamped to the declared slot count so a
+     * candidate with over-declared spans can never score above 1.0.
+     *
+     * <p>A candidate that declares no slots at all returns 1.0, i.e. "no evidence of a partial
+     * ruling": the occupancy clause exists to detect a grid that was declared and not filled, and a
+     * grid that was never declared is not evidence for the stream side. Returning 0.0 (as the pooled
+     * arithmetic used to) made a {@code rows x 0} candidate lose its region on absent evidence, which
+     * is the wrong direction for this threat model.
+     */
+    private static double gridCoverage(TableHit t) {
+        long slots = (long) Math.max(0, t.rowCount) * Math.max(0, t.colCount);
+        if (slots <= 0) return 1.0;
+        long covered = 0;
+        if (t.cells != null) {
+            for (CellHit c : t.cells) {
+                covered += (long) Math.max(1, c.rowSpan) * Math.max(1, c.colSpan);
+                if (covered >= slots) return 1.0;
+            }
+        }
+        return (double) covered / slots;
+    }
+
+
     /**
      * Decides which grouped components (from {@link #groupIntoTables}) actually become kept
      * tables: runs {@link #splitComponent} per component, then gates the resulting sub-tables
@@ -1910,6 +3791,18 @@ final class TableExtractor {
      * the tagged path.
      */
     static List<List<CellRect>> selectKeptTables(List<List<CellRect>> components, int pageNum, Result result) {
+        return selectKeptTables(components, pageNum, result, new long[1]);
+    }
+
+    /**
+     * As {@link #selectKeptTables(List, int, Result)}, additionally ADDING this call's real work to
+     * {@code charge[0]} for the document-level lattice budget ({@link #MAX_LATTICE_DOC_WORK}): the
+     * per-component {@link #splitComponent} grid-placement work (the {@link #MAX_SPLIT_WORK}
+     * counter), charged per component even when that component's split throws. The budget itself
+     * stays PER COMPONENT exactly as before -- {@code charge} only observes, it never gates.
+     */
+    static List<List<CellRect>> selectKeptTables(List<List<CellRect>> components, int pageNum,
+                                                 Result result, long[] charge) {
         List<List<CellRect>> kept = new ArrayList<>();
         int tablesOnPage = 0;
         pageLoop:
@@ -1920,7 +3813,7 @@ final class TableExtractor {
             }
             List<List<CellRect>> subComponents;
             try {
-                subComponents = splitComponent(comp);
+                subComponents = splitComponent(comp, charge);
             } catch (RulingOverflowException e) {
                 result.truncated = true;
                 System.err.println("WARNING: table split skipped on page " + pageNum + " (split-work cap)");
@@ -2340,6 +4233,13 @@ final class TableExtractor {
             result.truncated = true;
             return null;
         }
+
+        // PROSE FALSE POSITIVES (lever 4): a tagged "table" of rank below 2x2 is an HTML layout
+        // wrapper, not a table -- see MIN_TAGGED_RANK for the measurement and for why this costs
+        // nothing on the reference corpus. SILENT reject (no result.truncated): this is a
+        // degenerate-shape decision like the rows.isEmpty()/all-text-empty/colCount==0 rejects
+        // above, not a hostile-input cap, and the lattice path covers the same page unconditionally.
+        if (rows.size() < MIN_TAGGED_RANK || colCount < MIN_TAGGED_RANK) return null;
 
         TableHit t = new TableHit();
         t.page = pageNum;

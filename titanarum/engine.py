@@ -74,6 +74,28 @@ _DEFAULT_JOB: dict[str, Any] = {
     "skip_images": False,
     "skip_phones": False,
     "skip_tables": False,
+    # Borderless ("stream") table extraction: ON by default. Tagged/lattice extraction rests on
+    # something the PDF itself asserts (a /Table structure element, or lines actually drawn); the
+    # stream path infers a table from whitespace alone, which is why it was opt-in until measured.
+    #
+    # Quality (ICDAR-2013, adjacency-relation macro F1, de-duplicated GT): the arbitrated pipeline
+    # scores 0.8199 all-pages / 0.7999 shipping-page-scope POOLED vs 0.5114 / 0.4938 for
+    # tagged+lattice alone; ~0.73 under 1:1 pairing, i.e. between TABFIND (0.6962) and Nitro
+    # (0.7535) and below Nurminen (0.8374). The gain depends entirely on corpus composition: on the
+    # 22 genuinely borderless documents the ruled path scores 0.0000 and this scores 0.7507, on
+    # icdar-EU it is ~+0.20, on icdar-US ~+0.055, on an all-ruled corpus it is worth nothing.
+    # Ground-truth cell text recovered exactly: 26.0% -> 86.8%; content lost 67.7% -> 11.5%.
+    #
+    # Cost: on a 200-PDF real-world prose sample under the shipping page selection, documents
+    # emitting at least one table go 7/200 -> 12/200 (76 -> 118 over the whole 1,599-PDF
+    # population). Hand-adjudicating the 44 added documents: 25 genuine tables, 10 arguable, 9
+    # fabrications (4 since fixed) -- so ~0.3% real added fabrication, not the 2.5% the raw rate
+    # suggests. Marginal speed p50 0.077 ms / p95 4.7 ms; DoS stays bounded by the worker's
+    # MAX_STREAM_* budgets, which set truncated=true rather than emitting partial output.
+    #
+    # Turn it off per job with TITANARUM_STREAM_TABLES=0 (or "false"/"no"/"off"), or by writing
+    # "stream_tables": false into job.json directly.
+    "stream_tables": True,
     "skip_page_export": False,
     "skip_text_urls": False,
     "no_skip_blanks": False,
@@ -125,6 +147,7 @@ def _env_param_overrides() -> dict[str, Any]:
         ("TITANARUM_SKIP_IMAGES", "skip_images"),
         ("TITANARUM_SKIP_PHONES", "skip_phones"),
         ("TITANARUM_SKIP_TABLES", "skip_tables"),
+        ("TITANARUM_STREAM_TABLES", "stream_tables"),
         ("TITANARUM_SKIP_PAGE_EXPORT", "skip_page_export"),
         ("TITANARUM_SKIP_TEXT_URLS", "skip_text_urls"),
         ("TITANARUM_NO_SKIP_BLANKS", "no_skip_blanks"),

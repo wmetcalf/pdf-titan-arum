@@ -28,15 +28,22 @@ services:
       # WORKERS: 4        # override worker thread count
       # TIMEOUT: 60       # per-job timeout in seconds
       # OCR_LANG: eng     # tesseract language(s), e.g. eng+deu+fra
+      # Fleet-wide default for borderless ("stream") table extraction. `environment:` here is an
+      # explicit map, so exporting this in your shell does NOT reach the container -- set it here.
+      # Accepts 0/false/no/off to turn it off for every job (REST and the web UI); an explicit
+      # per-job value still wins.
+      # TITANARUM_STREAM_TABLES_DEFAULT: "false"
       # --- AI analysis (optional) ---
-      # Local model (e.g. llama.cpp / vLLM on the host):
+      # AI analysis is OFF unless OPENAI_BASE_URL is set: ServerCommand branches on it being
+      # non-blank, and a set-but-unreachable endpoint makes startup block on detectModel and then
+      # fail an AI call per job. Leave commented unless you actually have an endpoint.
+      # Local model (llama.cpp / vLLM / Ollama-compatible):
       # OPENAI_BASE_URL: http://host.docker.internal:8001/v1
       # OPENAI_API_KEY: none
-      # OPENAI_MODEL: ""   # auto-detected from /v1/models if blank
       # OpenAI:
       # OPENAI_BASE_URL: https://api.openai.com/v1
       # OPENAI_API_KEY: sk-...
-      # OPENAI_MODEL: gpt-5-nano
+      # OPENAI_MODEL: ""   # auto-detected from /v1/models if blank
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

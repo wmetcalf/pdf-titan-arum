@@ -543,7 +543,7 @@
   {% for t in report.tables %}
   {% if loop.index < 20 %}
   <div style="margin-bottom:16px">
-    <div style="color:#888; font-size:11px; margin-bottom:4px">Table &mdash; page {{ t.page }}, {{ t.rowCount }}&times;{{ t.colCount }}, {{ t.extractionMethod }}</div>
+    <div style="color:#888; font-size:11px; margin-bottom:4px">Table &mdash; page {{ t.page }}, {{ t.rowCount }}&times;{{ t.colCount }}, {{ t.extractionMethod }}{% if t.confidence is not null %} <span style="background:#333; color:#aaa; padding:1px 6px; border-radius:3px; font-size:10px" title="stream-path gridness confidence">conf {{ t.confidence | numberformat("0.00") }}</span>{% endif %}</div>
     <table>
       <tbody>
       {% for row in t.rows %}

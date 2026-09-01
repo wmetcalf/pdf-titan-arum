@@ -84,8 +84,14 @@ function fmtNum(v, digits) {
 // UPPERCASE env-shaped (the dispatcher drops anything not ^[A-Z][A-Z0-9_]*$
 // before the allowlist); they must also be in
 // BLASTBOX_ENGINE_TITANARUM_PARAM_KEYS (default: TITANARUM_SKIP_SCREENSHOTS,
-// TITANARUM_SKIP_IMAGES, TITANARUM_DPI, TITANARUM_PAGES). Params outside the
-// operator's allowlist are silently dropped by the dispatcher, not rejected.
+// TITANARUM_SKIP_IMAGES, TITANARUM_DPI, TITANARUM_PAGES, TITANARUM_STREAM_TABLES,
+// TITANARUM_SKIP_TABLES). Params outside the operator's allowlist are
+// silently dropped by the dispatcher, not rejected. This form does not expose
+// stream_tables/skip_tables toggles today; they can still be set via a raw
+// `params` field or a blastbox job.json. Note that stream_tables now defaults
+// ON, so a job submitted from this form runs borderless extraction; to disable
+// it, send TITANARUM_STREAM_TABLES=0 as a raw param (an EMPTY value means "no
+// opinion" and leaves the default in place).
 function appendJobParams(fd) {
   const skipShots  = document.getElementById('toggle-skip-screenshots').checked;
   const skipImages = document.getElementById('toggle-skip-images').checked;
@@ -704,6 +710,9 @@ function buildTablesSection(report) {
     html += '<div class="table-block">';
     html += '<div class="table-block-hdr">';
     html += '<span>Table — page '+esc(t.page != null ? t.page : '?')+', '+esc(t.rowCount)+'×'+esc(t.colCount)+', '+esc(t.extractionMethod||'')+'</span>';
+    if (t.confidence != null) {
+      html += '<span class="badge badge-neutral" title="stream-path gridness confidence">conf '+esc(fmtNum(t.confidence, 2))+'</span>';
+    }
     if (t.likelyDuplicateOfTagged) {
       html += '<span class="badge dup-badge" title="This lattice table’s cell footprint is substantially covered by an already-emitted tagged table on the same page">possible duplicate of tagged table</span>';
     }

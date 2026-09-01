@@ -149,6 +149,109 @@ public class PdfTitanArumApp implements Callable<Integer> {
     private static final int MAX_NAME_TREE_DEPTH      = 50;
     private static final int MAX_DEREF_HOPS           = 50;
 
+    /**
+     * THE canonical shipping default for borderless ("stream") table extraction -- ON.
+     *
+     * <p>WHY A NAMED CONSTANT. This one flag is declared independently on four surfaces that must all
+     * agree, in three languages, and nothing derives any of them from any other:
+     * <ol>
+     *   <li>the CLI's {@code @Option} on {@link #streamTables} (picocli, {@code --stream-tables});</li>
+     *   <li>the FIELD INITIALIZER on {@link #streamTables}, which is the default every programmatic
+     *       caller gets -- {@code new PdfTitanArumApp()} never runs picocli, so the annotation above
+     *       is invisible to the REST server and to any embedder;</li>
+     *   <li>{@link JobDescriptor#streamTables()}'s absent-key default, i.e. what a blastbox
+     *       {@code job.json} that omits {@code stream_tables} means (see {@link #runWorker});</li>
+     *   <li>{@code titanarum/engine.py}'s {@code _DEFAULT_JOB["stream_tables"]}, the value the
+     *       blastbox dispatcher actually writes into {@code job.json}.</li>
+     * </ol>
+     * Items 1-3 read this constant, so they cannot drift. Item 4 is a different language and cannot;
+     * {@code StreamTablesDefaultCoherenceTest} parses it and fails if it disagrees with this field.
+     * Flipping any ONE of these in isolation is the failure this constant plus that test exist to
+     * prevent -- it had already happened once here (the REST surface silently could not express the
+     * flag at all).
+     *
+     * <p>NOT ON THIS LIST, DELIBERATELY: the {@code jobs.stream_tables} column DEFAULT in
+     * {@code src/main/resources/db/migration} (V8, {@code DEFAULT FALSE}). Every INSERT this codebase
+     * itself issues -- {@code JobRepository.insert}, always fed by {@code ApiRoutes}' own read of this
+     * constant (or of its env override, see {@link #resolveRestStreamTablesDefault}) -- supplies the
+     * column explicitly, so the column default is never consulted by any binary that knows this flag
+     * exists at all. It only fires for an INSERT issued by a binary built BEFORE V8, mid rolling-deploy
+     * against an already-migrated database; that binary has no {@code setStreamTables} to call and
+     * always runs the ruled-only pipeline, so the column default must stay FALSE regardless of what
+     * this constant is -- matching it here would let an old binary's stored row claim {@code true}
+     * while it actually executed the old, stream-less pipeline. (An earlier version of this branch had
+     * a V9 migration that moved the column default to TRUE for exactly that reason-sounding-plausible
+     * but wrong argument; it was removed before release once that hazard was caught in review -- see
+     * {@code StreamTablesDefaultCoherenceTest#databaseColumnDefaultStaysFalseForRollingDeploySafety}.)
+     *
+     * <p>ALSO NOT ON THIS LIST: {@link #resolveRestStreamTablesDefault}, the {@code
+     * TITANARUM_STREAM_TABLES_DEFAULT} env var that lets an operator flip the REST surface's default
+     * fleet-wide without shipping a new binary. It is not a competing declaration of the default's
+     * VALUE -- unset, blank, or unrecognised it falls straight through to this constant -- so there is
+     * nothing for it to drift from; it is a per-deployment override, the REST analogue of the
+     * blastbox-side {@code TITANARUM_STREAM_TABLES} env var.
+     *
+     * <p>See {@link #streamTables} for the measured quality and cost behind choosing ON.
+     */
+    public static final boolean STREAM_TABLES_DEFAULT = true;
+
+    /**
+     * {@link #STREAM_TABLES_DEFAULT} as picocli needs it -- an annotation value must be a
+     * compile-time String constant, so this is the one place the boolean is spelled twice.
+     * {@code StreamTablesDefaultCoherenceTest} pins the two equal.
+     */
+    static final String STREAM_TABLES_DEFAULT_VALUE = "true";
+
+    /**
+     * Resolves a job-supplied borderless-table choice against the shipping default: {@code null}
+     * means the key was ABSENT from job.json (so: the default), and any non-null value is the
+     * caller's explicit instruction and always wins. One named place, so the absent-vs-explicit rule
+     * cannot be re-decided differently by a second caller.
+     */
+    static boolean resolveStreamTables(Boolean fromJob) {
+        return fromJob != null ? fromJob : STREAM_TABLES_DEFAULT;
+    }
+
+    /**
+     * Name of the environment variable that lets an operator flip the REST surface's
+     * {@code stream_tables} default for the whole fleet without a redeploy: {@code ApiRoutes} reads it
+     * once per submission (see {@link #resolveRestStreamTablesDefault}) to resolve a form request that
+     * omits the {@code streamTables} field. Restarting the server process (not shipping new code) is
+     * still required, because a running JVM cannot observe a changed OS environment variable.
+     *
+     * <p>This exists because the {@code jobs.stream_tables} column DEFAULT -- the other candidate for
+     * a "no redeploy" fleet-wide switch -- is inert for REST submissions: {@code JobRepository.insert}
+     * always supplies the column explicitly, so no INSERT issued by a binary that knows about this
+     * flag ever falls through to the column default (see {@link #STREAM_TABLES_DEFAULT}'s javadoc).
+     */
+    public static final String STREAM_TABLES_REST_DEFAULT_ENV = "TITANARUM_STREAM_TABLES_DEFAULT";
+
+    /**
+     * Resolves the REST surface's {@code stream_tables} default from {@code raw} -- the value of
+     * {@link #STREAM_TABLES_REST_DEFAULT_ENV}, or {@code null} if the caller's environment lookup
+     * found nothing. Mirrors the truthy/falsy vocabulary {@code engine.py}'s {@code _flag} helper uses
+     * for the blastbox-side {@code TITANARUM_STREAM_TABLES} env var, so an operator does not have to
+     * learn a second syntax for the two fleets: absent or blank means "no opinion" and falls through to
+     * {@link #STREAM_TABLES_DEFAULT}, matching {@code boolFormDefault}'s own "an unrecognised value
+     * must not silently pick a side" rule for the same reason -- for a default-ON detection stage,
+     * guessing wrong the quiet way (off) is the worse failure.
+     *
+     * <p>Pure function taking the already-looked-up string rather than calling
+     * {@code System.getenv} itself, so tests can exercise every input without mutating real process
+     * environment (which the JVM cannot do for itself once started, and Java has no public API to
+     * fake for a test).
+     */
+    public static boolean resolveRestStreamTablesDefault(String raw) {
+        if (raw == null) return STREAM_TABLES_DEFAULT;
+        String v = raw.trim();
+        if (v.isEmpty()) return STREAM_TABLES_DEFAULT;
+        if (v.equalsIgnoreCase("true") || v.equals("1")
+                || v.equalsIgnoreCase("on") || v.equalsIgnoreCase("yes")) return true;
+        if (v.equalsIgnoreCase("false") || v.equals("0")
+                || v.equalsIgnoreCase("off") || v.equalsIgnoreCase("no")) return false;
+        return STREAM_TABLES_DEFAULT;
+    }
+
     // I1 (warm-plan.md): per-document QR-scan / image-extraction budgets. scanQrCodes()
     // forks a ZXingReader subprocess per call and is invoked once per screenshot, per
     // resource image, and per drawn image with no document-level cap; a QR-flood PDF
@@ -234,6 +337,65 @@ private boolean skipQrScan;
     @Option(names = {"--skip-tables"}, defaultValue = "false", description = "Skip table extraction")
     private boolean skipTables;
 
+    /**
+     * Borderless ("stream") table extraction: ON by default. Turn it off with
+     * {@code --stream-tables=false}.
+     *
+     * <p>Tagged (structure-tree) and lattice (drawn-ruling) extraction rest on something the
+     * document itself asserts -- a {@code /Table} structure element, or lines actually drawn on the
+     * page. The stream path infers a table from whitespace alone, which is why it was opt-in until
+     * the numbers below were measured.
+     *
+     * <p>QUALITY, ICDAR 2013 (156 tables / 25,317 relations, adjacency-relation macro F1 over
+     * de-duplicated ground truth). Document-POOLED, the harness's end-to-end protocol: the
+     * arbitrated three-path pipeline scores <b>0.8199</b> all-pages and 0.7999 over the pages this
+     * CLI selects by default, against <b>0.5114</b> for tagged+lattice alone. Under 1:1 pairing --
+     * the protocol comparable to published work, and the one that can actually see table
+     * segmentation quality -- the full pipeline is <b>~0.73</b>, which sits between TABFIND (0.6962)
+     * and Nitro (0.7535) and below Nurminen (0.8374, the best pure heuristic), OmniPage (0.8420) and
+     * FineReader (0.8772). The gain is CORPUS-COMPOSITION DEPENDENT and that is the honest headline:
+     * on the 22 genuinely borderless documents the ruled/tagged path scores <b>0.0000</b> and this
+     * scores <b>0.7507</b>; on icdar-EU it is worth about +0.20, on icdar-US about +0.055, and on a
+     * corpus whose tables are all ruled it is worth exactly nothing. Content recovery is the
+     * clearest signal: ground-truth cell text recovered exactly rises 26.0% -> 86.8% and content
+     * lost falls 67.7% -> 11.5%.
+     *
+     * <p>COST. On a 200-PDF real-world prose sample, under this CLI's default page selection, the
+     * share of documents where the pipeline emits at least one table rises 7/200 -> 12/200 (over the
+     * whole 1,599-PDF population, 76 -> 118). Those 44 added documents were hand-adjudicated: 25 are
+     * GENUINE tables the ruled path was missing, 10 are arguable, and 9 were fabrications of which 4
+     * have since been fixed -- so the true added-fabrication rate is about 0.3%, not the 2.5% the raw
+     * rate implies. Speed is not the constraint: marginal cost p50 0.077 ms, p95 4.7 ms, worst real
+     * document +16.7 ms, end-to-end p50 260.8 -> 261.2 ms. A hostile page stays bounded by the
+     * MAX_STREAM_* work budgets (worst case ~405 ms/page, ~1.9 s/document, always with
+     * {@code truncated=true}).
+     *
+     * <p>WHY ON ANYWAY, given a fabricated table is the expensive error for hostile-PDF triage: the
+     * per-document ledger is 39 documents improved against 3 regressed (85:1 by relation weight
+     * all-pages, 115:1 shipping, never below 84:1), and all three regressions were adjudicated as
+     * metric artifacts whose flag-ON output contains strictly MORE ground-truth content. On 1,599
+     * real-world PDFs, 42 documents gain a table, 1 has a table replaced by a superset of itself, and
+     * 0 lose one.
+     *
+     * <p>Orthogonal to {@code --skip-tables}, which disables ALL table extraction and wins.
+     *
+     * <p>DEFAULT DECLARED ONCE: {@link #STREAM_TABLES_DEFAULT}. The {@code arity="0..1"} +
+     * {@code fallbackValue} shape is load-bearing, not decoration -- picocli sets a plain boolean
+     * flag to the OPPOSITE of its {@code defaultValue} when the flag appears, so a bare
+     * {@code @Option(defaultValue="true")} would silently turn {@code --stream-tables} into an OFF
+     * switch and break every existing caller. With an explicit {@code fallbackValue},
+     * {@code --stream-tables} still means ON, and {@code --stream-tables=false} is the off switch.
+     */
+    @Option(names = {"--stream-tables"}, arity = "0..1", fallbackValue = "true",
+            defaultValue = STREAM_TABLES_DEFAULT_VALUE, paramLabel = "<true|false>",
+            description = "Also extract borderless (whitespace-only) tables. ON by default; "
+                    + "disable with --stream-tables=false. Large recall win on borderless tables "
+                    + "(ICDAR-2013 macro F1 0.5114 -> 0.8199 pooled; 0.0000 -> 0.7507 on the "
+                    + "borderless subset) at a small precision cost on prose (7/200 -> 12/200 "
+                    + "real-world documents emit any table, of which adjudication says ~1 is a "
+                    + "genuine fabrication).")
+    private boolean streamTables = STREAM_TABLES_DEFAULT;
+
     @Option(names = {"--skip-page-export"}, defaultValue = "false", description = "Skip per-page PDF export")
     private boolean skipPageExport;
 
@@ -268,6 +430,7 @@ private boolean skipQrScan;
     public void setSkipImages(boolean v)      { this.skipImages = v; }
     public void setSkipPhones(boolean v)      { this.skipPhones = v; }
     public void setSkipTables(boolean v)      { this.skipTables = v; }
+    public void setStreamTables(boolean v)    { this.streamTables = v; }
     public void setSkipPageExport(boolean v)  { this.skipPageExport = v; }
     public void setSkipTextUrls(boolean v)    { this.skipTextUrls = v; }
     public void setNoSkipBlanks(boolean v) { this.noSkipBlanks = v; }
@@ -797,7 +960,8 @@ private boolean skipQrScan;
                     posByPage.put(ptd.page(),
                             dedupeConsecutiveTextPositionRefs(ptd.stripper().positionsForRange(0, Integer.MAX_VALUE)));
                 }
-                TableExtractor.Result tablesResult = TableExtractor.extract(document, pagesToProcess, posByPage);
+                TableExtractor.Result tablesResult =
+                        TableExtractor.extract(document, pagesToProcess, posByPage, streamTables);
                 report.tables.addAll(tablesResult.tables);
                 if (tablesResult.truncated) report.tablesTruncated = Boolean.TRUE;
                 checkInterrupted();
@@ -5288,6 +5452,20 @@ for (int pageNum : pagesToProcess) {
             @JsonProperty("skip_images") boolean skipImages,
             @JsonProperty("skip_phones") boolean skipPhones,
             @JsonProperty("skip_tables") boolean skipTables,
+            /**
+             * Borderless ("stream") table extraction; see {@code --stream-tables}.
+             *
+             * <p>BOXED ON PURPOSE. As a primitive {@code boolean} this component could not tell
+             * "the caller asked for OFF" from "the key is not in the file": Jackson leaves an absent
+             * primitive at {@code false}, so an absent key silently meant OFF no matter what the
+             * shipping default was. That was fine while the default WAS off and became a bug the
+             * moment it wasn't -- a {@code job.json} from an older dispatcher (or any hand-written
+             * one) would have pinned the flag off while every other surface ran it on.
+             * {@link #runWorker} resolves {@code null} to {@link #STREAM_TABLES_DEFAULT}, so absent
+             * means "the shipping default" and only an explicit {@code "stream_tables": false}
+             * means off.
+             */
+            @JsonProperty("stream_tables") Boolean streamTables,
             @JsonProperty("skip_page_export") boolean skipPageExport,
             @JsonProperty("skip_text_urls") boolean skipTextUrls,
             @JsonProperty("no_skip_blanks") boolean noSkipBlanks,
@@ -5362,6 +5540,11 @@ for (int pageNum : pagesToProcess) {
         setSkipImages(job.skipImages());
         setSkipPhones(job.skipPhones());
         setSkipTables(job.skipTables());
+        // Absent stream_tables means "the shipping default", NOT false -- see JobDescriptor.
+        // ROLLING DEPLOY: an old dispatcher's job.json that predates the key lands on
+        // STREAM_TABLES_DEFAULT here, i.e. it behaves like every other surface on this binary
+        // rather than silently keeping the pre-flip behaviour.
+        setStreamTables(resolveStreamTables(job.streamTables()));
         setSkipPageExport(job.skipPageExport());
         setSkipTextUrls(job.skipTextUrls());
         setNoSkipBlanks(job.noSkipBlanks());

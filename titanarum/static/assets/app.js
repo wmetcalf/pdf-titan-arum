@@ -100,7 +100,12 @@ function appendJobParams(fd) {
 // ── blastbox.host ⇄ UI adapter ────────────────────────────────
 // job.status/timestamps come back epoch-shaped; normalizeJob maps them onto
 // the shape the rest of this file speaks (iso timestamps, ms durations).
-const _BB_STATE = { done: 'succeeded', failed: 'failed', rejected: 'failed',
+// Keys here are blastbox JobStatus values (host/jobs/base.py): queued, running,
+// done, failed, expired. There is no "rejected" status -- a stale mapping for one
+// used to sit here, which is misleading twice over: it implies a filter for jobs
+// that cannot exist, while "expired", which very much does exist, was missing and
+// fell through to the raw value.
+const _BB_STATE = { done: 'succeeded', failed: 'failed', expired: 'expired',
                     queued: 'queued', running: 'running' };
 const _UI_TO_BB_STATE = { queued: 'queued', running: 'running',
                           succeeded: 'done', failed: 'failed' };
@@ -876,7 +881,10 @@ function renderJobDetail(id, job) {
   if (job.state === 'succeeded') {
     html += '<a href="/v1/jobs/' + id + '/result" download><button class="dl">⬇ result.zip (pw: infected)</button></a>';
   }
-  const isTerminal = job.state === 'succeeded' || job.state === 'failed';
+  // "expired" is terminal too. While it was missing here an expired job got no
+  // Delete button, so it could never be cleared from the UI.
+  const isTerminal = job.state === 'succeeded' || job.state === 'failed'
+    || job.state === 'expired';
   if (isTerminal) {
     html += '<button class="danger" data-act="delete-job" data-arg="' + esc(id) + '">Delete</button>';
   }

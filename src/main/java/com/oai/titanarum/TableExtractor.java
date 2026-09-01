@@ -2146,14 +2146,29 @@ final class TableExtractor {
     static void fillCellsFromPositions(List<CellRect> cells, List<TextPosition> positions,
                                         int rotation, float unrotatedW, float unrotatedH,
                                         long[] work, long budget) {
+        // Each glyph's rotated midpoint depends only on the glyph, never on the cell, so
+        // computing it inside the per-cell loop repeated identical float math (and an
+        // applyPageRotation array allocation) cells-many times per glyph. Hoist it: one pass
+        // over the glyphs, then pure comparisons per cell. Same buckets, same budget
+        // semantics -- the work counter still charges every (cell, glyph) comparison, so the
+        // MAX_TEXTFILL_WORK product bound is unchanged.
+        final int n = positions.size();
+        final float[] mx = new float[n];
+        final float[] my = new float[n];
+        for (int i = 0; i < n; i++) {
+            if (++work[0] > budget) throw new RulingOverflowException();
+            TextPosition tp = positions.get(i);
+            float ux = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
+            float uy = tp.getYDirAdj() - tp.getHeightDir() / 2;
+            float[] v = applyPageRotation(ux, uy, rotation, unrotatedW, unrotatedH);
+            mx[i] = v[0];
+            my[i] = v[1];
+        }
         for (CellRect c : cells) {
             List<TextPosition> in = new ArrayList<>();
-            for (TextPosition tp : positions) {
+            for (int i = 0; i < n; i++) {
                 if (++work[0] > budget) throw new RulingOverflowException();
-                float ux = tp.getXDirAdj() + tp.getWidthDirAdj() / 2;
-                float uy = tp.getYDirAdj() - tp.getHeightDir() / 2;
-                float[] v = applyPageRotation(ux, uy, rotation, unrotatedW, unrotatedH);
-                if (v[0] >= c.x0 && v[0] <= c.x1 && v[1] >= c.y0 && v[1] <= c.y1) in.add(tp);
+                if (mx[i] >= c.x0 && mx[i] <= c.x1 && my[i] >= c.y0 && my[i] <= c.y1) in.add(positions.get(i));
             }
             c.text = joinText(in);
         }

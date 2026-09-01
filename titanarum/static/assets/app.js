@@ -177,6 +177,13 @@ document.addEventListener('error', (ev) => {
 function toggleRawJson(btn) {
   const pre = document.getElementById('raw-json-view');
   if (!pre) return;
+  // Fill on first open (see renderJobDetail): textContent, not innerHTML, so no escaping pass and
+  // no injection surface.
+  if (pre.dataset.filled !== '1') {
+    try { pre.textContent = JSON.stringify(_rawReportForDetail, null, 2); }
+    catch { pre.textContent = ''; }
+    pre.dataset.filled = '1';
+  }
   const show = pre.style.display === 'none';
   pre.style.display = show ? 'block' : 'none';
   btn.textContent = show ? '{ } hide JSON' : '{ } raw JSON';
@@ -823,7 +830,12 @@ async function showJobDetailView(id) {
   }
 }
 
+// Holds the report for the currently rendered detail view so the raw-JSON panel can be
+// serialized on first open rather than on every render.
+let _rawReportForDetail = null;
+
 function renderJobDetail(id, job) {
+  _rawReportForDetail = job ? job.report : null;
   _lastJobDetail = { id, job };
   const stateEl = document.getElementById('detail-state');
   if (stateEl) stateEl.innerHTML = stateCell(job.state);
@@ -843,7 +855,7 @@ function renderJobDetail(id, job) {
   html += '</div>';
 
   if (job.report) {
-    html += '<pre id="raw-json-view" style="display:none;max-height:420px;overflow:auto;background:#0d0d0d;color:#cfcfcf;padding:0.75rem;border-radius:4px;font:0.72rem/1.45 \'Courier New\',monospace;white-space:pre;margin-bottom:0.75rem">' + esc(JSON.stringify(job.report, null, 2)) + '</pre>';
+    html += '<pre id="raw-json-view" data-filled="0" style="display:none;max-height:420px;overflow:auto;background:#0d0d0d;color:#cfcfcf;padding:0.75rem;border-radius:4px;font:0.72rem/1.45 \'Courier New\',monospace;white-space:pre;margin-bottom:0.75rem"></pre>';
   }
 
   if (job.state === 'failed') {

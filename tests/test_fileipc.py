@@ -141,3 +141,13 @@ def test_env_param_overrides_allowlist(monkeypatch):
     assert over["dpi"] == 200.0
     assert over["ocr_lang"] == "eng+deu"
     assert "skip_images" not in over  # unset keys are not injected
+
+
+def test_skip_tables_env_override(monkeypatch):
+    monkeypatch.setenv("TITANARUM_SKIP_TABLES", "1")
+    over = eng._env_param_overrides()
+    assert over["skip_tables"] is True
+
+
+def test_skip_tables_default_off():
+    assert eng._DEFAULT_JOB["skip_tables"] is False

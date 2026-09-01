@@ -529,6 +529,38 @@
 </div>
 {% endif %}
 
+{% if report is not null and report.tablesTruncated and report.tables is empty %}
+<div class="section">
+  <p style="color:#f90; font-size:11px">&#9888; table extraction hit safety caps; no tables could be emitted</p>
+</div>
+{% endif %}
+{% if report.tables is not empty %}
+<div class="section">
+  <h2>Tables ({{ report.tables | length }})</h2>
+  {% if report.tablesTruncated %}
+  <p style="color:#f90; font-size:11px">&#9888; extraction hit safety caps; list may be incomplete</p>
+  {% endif %}
+  {% for t in report.tables %}
+  {% if loop.index < 20 %}
+  <div style="margin-bottom:16px">
+    <div style="color:#888; font-size:11px; margin-bottom:4px">Table &mdash; page {{ t.page }}, {{ t.rowCount }}&times;{{ t.colCount }}, {{ t.extractionMethod }}</div>
+    <table>
+      <tbody>
+      {% for row in t.rows %}
+      <tr>
+        {% for cell in row %}
+        <td>{{ cell }}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
 {% if reportJson %}
 <details class="section">
   <summary style="cursor:pointer; font-weight:bold">Raw JSON</summary>

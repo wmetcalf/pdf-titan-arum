@@ -295,6 +295,60 @@ public class OpenAiAnalyzer {
             }
         }
 
+        // Tables — table-borne payloads (fake wire/routing/fee grids) must be visible to the AI.
+        // Bounded: a hostile PDF can carry up to 50 tables/page across many pages, so we cap both
+        // the number of tables emitted and the total chars spent on them.
+        if (report.tables != null && !report.tables.isEmpty()) {
+            final int maxTables = 5;
+            final int perTableCharCap = 800;
+            final int totalCharBudget = 4000;
+            sb.append("\n=== TABLES (").append(report.tables.size()).append(") ===\n");
+            int emitted = 0;
+            int budgetUsed = 0;
+            boolean omitted = false;
+            for (var t : report.tables) {
+                if (emitted >= maxTables || budgetUsed >= totalCharBudget) {
+                    omitted = true;
+                    break;
+                }
+                sb.append("  [table on page ").append(t.page).append(", method ").append(t.extractionMethod)
+                  .append(", ").append(t.rowCount).append("x").append(t.colCount).append("]\n");
+                if (t.markdown != null) {
+                    int remaining = totalCharBudget - budgetUsed;
+                    int cap = Math.min(perTableCharCap, remaining);
+                    int cutLen = Math.min(cap, t.markdown.length());
+                    // Don't cut between a surrogate pair — a lone high surrogate becomes '?'
+                    // once the HTTP body is UTF-8 encoded, silently corrupting a boundary glyph.
+                    if (cutLen > 0 && cutLen < t.markdown.length()
+                            && Character.isHighSurrogate(t.markdown.charAt(cutLen - 1))) {
+                        cutLen--;
+                    }
+                    boolean truncated = t.markdown.length() > cutLen;
+                    String snippet = t.markdown.substring(0, cutLen);
+                    sb.append(snippet);
+                    if (truncated) sb.append("…[truncated]");
+                    sb.append("\n");
+                    budgetUsed += snippet.length();
+                }
+                emitted++;
+            }
+            if (omitted || emitted < report.tables.size()) {
+                sb.append("  ... and ").append(report.tables.size() - emitted).append(" more tables (omitted for length)\n");
+            }
+        }
+        // PR re-review P2: the tablesTruncated warning must surface even when EVERY table was
+        // rejected by TableExtractor's own safety caps (report.tables empty/null but
+        // tablesTruncated == true) -- previously this warning lived INSIDE the
+        // "tables non-empty" guard above, so that case emitted no "=== TABLES ===" section AND no
+        // truncation indication at all, letting the AI classify a document as if its tables had
+        // been fully scanned when they were in fact entirely dropped. Guarded on tablesTruncated
+        // alone (independent of report.tables) so it fires exactly once in every case: once here
+        // when tables is empty, and once here (no longer duplicated inside the block above) when
+        // tables is non-empty.
+        if (Boolean.TRUE.equals(report.tablesTruncated)) {
+            sb.append("  (table extraction hit safety caps; list may be incomplete)\n");
+        }
+
         // JavaScript
         if (report.javascript != null && !report.javascript.isEmpty()) {
             sb.append("\n=== JAVASCRIPT (").append(report.javascript.size()).append(" scripts) ===\n");

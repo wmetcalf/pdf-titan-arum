@@ -231,6 +231,9 @@ private boolean skipQrScan;
     @Option(names = {"--skip-phones"}, defaultValue = "false", description = "Skip phone number extraction")
     private boolean skipPhones;
 
+    @Option(names = {"--skip-tables"}, defaultValue = "false", description = "Skip table extraction")
+    private boolean skipTables;
+
     @Option(names = {"--skip-page-export"}, defaultValue = "false", description = "Skip per-page PDF export")
     private boolean skipPageExport;
 
@@ -264,6 +267,7 @@ private boolean skipQrScan;
     public void setSkipScreenshots(boolean v) { this.skipScreenshots = v; }
     public void setSkipImages(boolean v)      { this.skipImages = v; }
     public void setSkipPhones(boolean v)      { this.skipPhones = v; }
+    public void setSkipTables(boolean v)      { this.skipTables = v; }
     public void setSkipPageExport(boolean v)  { this.skipPageExport = v; }
     public void setSkipTextUrls(boolean v)    { this.skipTextUrls = v; }
     public void setNoSkipBlanks(boolean v) { this.noSkipBlanks = v; }
@@ -785,6 +789,19 @@ private boolean skipQrScan;
                 pt.page = ptd.page();
                 pt.text = ptd.stripper().getCollectedText().stripTrailing();
                 report.pageTexts.add(pt);
+            }
+
+            if (!skipTables) {
+                java.util.Map<Integer, java.util.List<TextPosition>> posByPage = new java.util.HashMap<>();
+                for (PageTextData ptd : pageTextData) {
+                    posByPage.put(ptd.page(),
+                            dedupeConsecutiveTextPositionRefs(ptd.stripper().positionsForRange(0, Integer.MAX_VALUE)));
+                }
+                TableExtractor.Result tablesResult = TableExtractor.extract(document, pagesToProcess, posByPage);
+                report.tables.addAll(tablesResult.tables);
+                if (tablesResult.truncated) report.tablesTruncated = Boolean.TRUE;
+                checkInterrupted();
+                profTick(_pt, "tables");
             }
 
             if (!skipPageExport) {
@@ -4974,6 +4991,31 @@ for (int pageNum : pagesToProcess) {
         return -1;
     }
 
+    /**
+     * FIX 3 (Codex P2, table extraction): {@link PositionAwareTextStripper#indexToPosition} pushes
+     * the SAME {@code TextPosition} reference once per UTF-16 code unit of a multi-code-unit glyph
+     * (a ligature like "fi"/"fl"/"ffi", or a surrogate pair) -- that per-char mapping is relied on
+     * by other consumers (URL/phone detection's {@code positionsForRange(beginIndex, endIndex)}
+     * calls) and must NOT change. But {@link TableExtractor#extract} only ever needs one reference
+     * per glyph, and feeding it N duplicate references per multi-code-unit glyph both wastes its
+     * fillCellsFromPositions work budget (charged per (cell, position) pair over the WHOLE
+     * position list) and -- defense in depth alongside {@link TableExtractor#joinText}'s own
+     * identity-based dedup -- would otherwise double/triple that glyph's text if a future caller
+     * ever bypassed joinText. Collapses CONSECUTIVE identical references (identity {@code ==},
+     * never value/equals, so two distinct glyphs sharing a character are both kept) in the list
+     * built specifically for the table path; {@code positionsForRange}'s own per-char return value
+     * for every other caller is untouched.
+     */
+    private static java.util.List<TextPosition> dedupeConsecutiveTextPositionRefs(java.util.List<TextPosition> positions) {
+        java.util.List<TextPosition> out = new java.util.ArrayList<>(positions.size());
+        TextPosition prevRef = null;
+        for (TextPosition tp : positions) {
+            if (tp != prevRef) out.add(tp);
+            prevRef = tp;
+        }
+        return out;
+    }
+
     private static class PositionAwareTextStripper extends PDFTextStripper {
         private final StringBuilder text = new StringBuilder();
         private final List<TextPosition> indexToPosition = new ArrayList<>();
@@ -5245,6 +5287,7 @@ for (int pageNum : pagesToProcess) {
             @JsonProperty("skip_screenshots") boolean skipScreenshots,
             @JsonProperty("skip_images") boolean skipImages,
             @JsonProperty("skip_phones") boolean skipPhones,
+            @JsonProperty("skip_tables") boolean skipTables,
             @JsonProperty("skip_page_export") boolean skipPageExport,
             @JsonProperty("skip_text_urls") boolean skipTextUrls,
             @JsonProperty("no_skip_blanks") boolean noSkipBlanks,
@@ -5318,6 +5361,7 @@ for (int pageNum : pagesToProcess) {
         setSkipScreenshots(job.skipScreenshots());
         setSkipImages(job.skipImages());
         setSkipPhones(job.skipPhones());
+        setSkipTables(job.skipTables());
         setSkipPageExport(job.skipPageExport());
         setSkipTextUrls(job.skipTextUrls());
         setNoSkipBlanks(job.noSkipBlanks());
@@ -5447,6 +5491,8 @@ for (int pageNum : pagesToProcess) {
         public List<ImageArtifact> renderedImages = new ArrayList<>();
         public List<ImageArtifact> resourceImages = new ArrayList<>();
         public List<PageText> pageTexts = new ArrayList<>();
+        public List<TableExtractor.TableHit> tables = new ArrayList<>();
+        public Boolean tablesTruncated;   // only serialized when true (NON_NULL)
         public int revisionCount;
         @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
         public List<RevisionArtifact> revisions;

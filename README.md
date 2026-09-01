@@ -27,7 +27,7 @@
 
 ## Requirements
 
-- Java 17+
+- Java 25
 - Maven 3.9+
 - For server mode: PostgreSQL 14+, Docker (optional)
 - For QR/barcode scanning: the zxing-cpp `ZXingReader` binary on `PATH` (or set `TITANARUM_ZXING_BIN` to its path). Any release works — titanarum auto-detects `-json` (≥ 2.3) and falls back to the 2.2.x plaintext format. Optional — if the binary is absent, titanarum prints a one-time warning and skips QR scanning; all other analysis is unaffected. Pass `--skip-qr` to opt out entirely. (The Docker images below bundle it, so QR works there out of the box.)
@@ -92,6 +92,7 @@ java -jar target/pdf-titan-arum-1.3.0.jar \
   [--skip-screenshots]            # skip screenshot rendering, URL crops, QR scan
   [--skip-images]                 # skip drawn and resource image extraction
   [--skip-phones]                 # skip phone number extraction
+  [--skip-tables]                 # skip table extraction (tables: [] in report.json)
   [--skip-page-export]            # skip per-page PDF export
   [--skip-text-urls]              # skip PDFTextStripper; only annotation URLs extracted (~370ms faster)
   [--no-skip-blanks]              # disable blank-page replacement; process original selection including blanks
@@ -406,7 +407,7 @@ keys are dropped before the allowlist). They map onto the same knobs as the CLI 
 |---|---|---|
 | `TITANARUM_DPI` | render DPI (clamped to 1–600) | 150 |
 | `TITANARUM_PAGES` | page spec (`1-4,z`, `all`) | first 4 + last |
-| `TITANARUM_SKIP_QR` · `_SCREENSHOTS` · `_IMAGES` · `_PHONES` · `_PAGE_EXPORT` · `_TEXT_URLS` | disable a stage | off |
+| `TITANARUM_SKIP_QR` · `_SCREENSHOTS` · `_IMAGES` · `_PHONES` · `_TABLES` · `_PAGE_EXPORT` · `_TEXT_URLS` | disable a stage | off |
 | `TITANARUM_OCR_SCREENSHOTS` · `_OCR_URL_CROPS` · `_OCR_LANG` | OCR toggles + language | off / `eng` |
 | `TITANARUM_NO_SKIP_BLANKS` · `_ADD_LINK_ANNOTATIONS` | blank-page + link-annotation behavior | off |
 | `TITANARUM_PASSWORD` | password for encrypted PDFs (cleared after the worker reads it) | — |
@@ -660,6 +661,8 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 | `resourceImages`  | array  | `ImageArtifact[]` (XObject resource images)          |
 | `pagePdfs`        | array  | `PagePdfArtifact[]`                                  |
 | `pageTexts`       | array  | Per-page extracted text (first N processed pages)    |
+| `tables`          | array  | `TableHit[]` — extracted tables (tagged-structure and ruled/lattice detection); empty if none or `--skip-tables` |
+| `tablesTruncated` | bool   | `true` if table extraction hit an internal safety cap (omitted otherwise) |
 | `ocgLayers`       | array  | `OcgLayer[]` — optional content groups / hidden layers |
 | `formFields`      | array  | `FormFieldHit[]` — suspicious AcroForm fields (hidden, base64 payloads, Name value encoding) |
 | `jsIndicators`    | array  | `JsIndicatorHit[]` — suspicious JS APIs, obfuscation, structural exploit patterns, CVE composite detections |
@@ -677,8 +680,7 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 
 | Library              | Version  | Purpose                                  |
 |----------------------|----------|------------------------------------------|
-| Apache PDFBox        | 3.0.6    | PDF parsing and rendering                |
-| ZXing                | 3.5.4    | QR / barcode detection                   |
+| Apache PDFBox        | 3.0.8    | PDF parsing and rendering                |
 | libphonenumber       | 9.0.25   | Phone number extraction and normalisation |
 | Guava                | 33.5.0   | Public suffix list for domain checks     |
 | Jackson              | 2.19.0   | JSON serialisation                       |
@@ -689,5 +691,5 @@ The two hashes are complementary signals: a phishing kit may reuse the same colo
 | Pebble               | 3.2.4    | HTML templates (server mode)             |
 | HikariCP             | 5.1.0    | Connection pool (server mode)            |
 | Flyway               | 10.15.0  | DB schema migrations (server mode)       |
-| PostgreSQL JDBC      | 42.7.3   | Database driver (server mode)            |
+| PostgreSQL JDBC      | 42.7.7   | Database driver (server mode)            |
 | zip4j                | 2.11.5   | AES-256 encrypted ZIP downloads (server mode) |

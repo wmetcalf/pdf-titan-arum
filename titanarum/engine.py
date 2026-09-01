@@ -73,6 +73,7 @@ _DEFAULT_JOB: dict[str, Any] = {
     "skip_screenshots": False,
     "skip_images": False,
     "skip_phones": False,
+    "skip_tables": False,
     "skip_page_export": False,
     "skip_text_urls": False,
     "no_skip_blanks": False,
@@ -123,6 +124,7 @@ def _env_param_overrides() -> dict[str, Any]:
         ("TITANARUM_SKIP_SCREENSHOTS", "skip_screenshots"),
         ("TITANARUM_SKIP_IMAGES", "skip_images"),
         ("TITANARUM_SKIP_PHONES", "skip_phones"),
+        ("TITANARUM_SKIP_TABLES", "skip_tables"),
         ("TITANARUM_SKIP_PAGE_EXPORT", "skip_page_export"),
         ("TITANARUM_SKIP_TEXT_URLS", "skip_text_urls"),
         ("TITANARUM_NO_SKIP_BLANKS", "no_skip_blanks"),
@@ -412,7 +414,7 @@ def _summary_fields(report: dict) -> dict[str, Any]:
     # counts of high-signal arrays (cheap triage)
     for arr in ("urls", "javascript", "launchActions", "actions", "embeddedFiles",
                 "jsIndicators", "structuralAnomalies", "streamLengthAnomalies",
-                "metadataSpoofingIndicators", "formFields"):
+                "metadataSpoofingIndicators", "formFields", "tables"):
         n = len(report.get(arr, []) or [])
         if n:
             fields[f"n_{_snake(arr)}"] = n

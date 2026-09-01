@@ -12,4 +12,5 @@ exec java -jar /app/app.jar server \
   --db-user "$DB_USER" \
   --db-password "$DB_PASSWORD" \
   --artifact-root /data/artifacts \
-  ${WORKERS:+--workers "$WORKERS"}
+  ${WORKERS:+--workers "$WORKERS"} \
+  ${TIMEOUT:+--timeout "$TIMEOUT"}

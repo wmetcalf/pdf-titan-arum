@@ -11,7 +11,7 @@
         <server.test.exclude>**/LocalArtifactStoreTest.java</server.test.exclude>
         <jackson.version>2.19.0</jackson.version>
         <picocli.version>4.7.7</picocli.version>
-        <pdfbox.version>3.0.6</pdfbox.version>
+        <pdfbox.version>3.0.8</pdfbox.version>
         <javalin.version>6.7.0</javalin.version>
         <hikari.version>5.1.0</hikari.version>
         <flyway.version>10.15.0</flyway.version>

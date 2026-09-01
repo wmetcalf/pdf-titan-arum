@@ -16,6 +16,7 @@ public class JobRepository {
 
     public UUID insert(String filename, String fileHash,
                        boolean skipScreenshots, boolean skipImages, boolean skipPhones,
+                       boolean skipTables,
                        boolean skipPageExport, boolean skipTextUrls, boolean skipQr,
                        boolean ocrScreenshots, boolean ocrUrlCrops,
                        String password,
@@ -24,12 +25,12 @@ public class JobRepository {
                        String ocrLang, Integer timeoutSeconds) throws SQLException {
         String sql = """
             INSERT INTO jobs (filename, file_hash,
-                skip_screenshots, skip_images, skip_phones,
+                skip_screenshots, skip_images, skip_phones, skip_tables,
                 skip_page_export, skip_text_urls, skip_qr,
                 ocr_screenshots, ocr_url_crops, password,
                 dpi, pages_spec, add_link_annotations, no_skip_blanks,
                 ocr_lang, timeout_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
             """;
         try (Connection c = ds.getConnection();
              PreparedStatement ps = c.prepareStatement(sql)) {
@@ -38,18 +39,19 @@ public class JobRepository {
             ps.setBoolean(3, skipScreenshots);
             ps.setBoolean(4, skipImages);
             ps.setBoolean(5, skipPhones);
-            ps.setBoolean(6, skipPageExport);
-            ps.setBoolean(7, skipTextUrls);
-            ps.setBoolean(8, skipQr);
-            ps.setBoolean(9, ocrScreenshots);
-            ps.setBoolean(10, ocrUrlCrops);
-            ps.setString(11, (password != null && !password.isEmpty()) ? password : null);
-            if (dpi != null) ps.setFloat(12, dpi); else ps.setNull(12, java.sql.Types.REAL);
-            ps.setString(13, (pagesSpec != null && !pagesSpec.isBlank()) ? pagesSpec : null);
-            ps.setBoolean(14, addLinkAnnotations);
-            ps.setBoolean(15, noSkipBlanks);
-            ps.setString(16, (ocrLang != null && !ocrLang.isBlank()) ? ocrLang : null);
-            if (timeoutSeconds != null) ps.setInt(17, timeoutSeconds); else ps.setNull(17, java.sql.Types.INTEGER);
+            ps.setBoolean(6, skipTables);
+            ps.setBoolean(7, skipPageExport);
+            ps.setBoolean(8, skipTextUrls);
+            ps.setBoolean(9, skipQr);
+            ps.setBoolean(10, ocrScreenshots);
+            ps.setBoolean(11, ocrUrlCrops);
+            ps.setString(12, (password != null && !password.isEmpty()) ? password : null);
+            if (dpi != null) ps.setFloat(13, dpi); else ps.setNull(13, java.sql.Types.REAL);
+            ps.setString(14, (pagesSpec != null && !pagesSpec.isBlank()) ? pagesSpec : null);
+            ps.setBoolean(15, addLinkAnnotations);
+            ps.setBoolean(16, noSkipBlanks);
+            ps.setString(17, (ocrLang != null && !ocrLang.isBlank()) ? ocrLang : null);
+            if (timeoutSeconds != null) ps.setInt(18, timeoutSeconds); else ps.setNull(18, java.sql.Types.INTEGER);
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
                 return (UUID) rs.getObject(1);
@@ -201,6 +203,7 @@ public class JobRepository {
             rs.getBoolean("skip_screenshots"),
             rs.getBoolean("skip_images"),
             rs.getBoolean("skip_phones"),
+            rs.getBoolean("skip_tables"),
             rs.getBoolean("skip_page_export"),
             rs.getBoolean("skip_text_urls"),
             rs.getBoolean("skip_qr"),

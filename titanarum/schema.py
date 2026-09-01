@@ -85,6 +85,8 @@ _SCHEMA: dict[str, Any] = {
         "renderedImages": _arr({"type": "object"}),
         "resourceImages": _arr({"type": "object"}),
         "pageTexts": _arr({"type": "object"}),
+        "tables": _arr({"type": "object"}),
+        "tablesTruncated": _BOOL,
         "pageStats": _arr({"type": "object"}),
         "revisions": _arr({"type": "object"}),
         "formFields": _arr({"type": "object"}),

@@ -20,6 +20,10 @@ host = ["blastbox[host]>=0.1.15,<0.2"]
 dev = [
     "blastbox[host]>=0.1.15,<0.2",
     "pytest>=8.0.0,<9.0",
+    # starlette's TestClient needs an HTTP client and does not depend on one itself;
+    # current starlette wants httpx2 specifically. Nothing else in the tree declares
+    # it, so a clean install (CI) collected tests fine and then failed at import.
+    "httpx2>=2.0,<3.0",
     "ruff>=0.3.0,<1.0",
     "mypy>=1.9.0,<2.0",
 ]

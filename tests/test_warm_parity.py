@@ -214,7 +214,8 @@ def test_cold_vs_warm_parity(pdf_name: str, jar: Path, aot_cache: Path,
     # The fixed warm scratch (which staged the input under in/) is reaped on a successful warm
     # run, so the staged input must NOT linger in the shared scratch afterward.
     assert not (warm_scratch / "in" / pdf.name).is_file(), (
-        "staged warm input must be reaped after a successful warm run, not left in the shared scratch"
+        "staged warm input must be reaped after a successful warm run, "
+        "not left in the shared scratch"
     )
 
     # ---- parity gate 1: report.json byte-identical after normalization -----

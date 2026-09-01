@@ -598,7 +598,9 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
         # _clip: timedOutAfterMs is a root-typed but UNBOUNDED integer, so a hostile report can
         # blow this past Warning.message's 2000-char cap and crash construction (like parse_error).
         warns.append(Warning(code="timed_out",
-                             message=_clip(f"partial results after {report.get('timedOutAfterMs')} ms", 2000)))
+                             message=_clip(
+                               f"partial results after {report.get('timedOutAfterMs')} ms",
+                               2000)))
 
     def _emit(items, make):
         for it in items or []:

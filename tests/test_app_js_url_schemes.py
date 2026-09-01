@@ -67,7 +67,10 @@ def _render(urls: list[str]) -> list[str]:
         "function safeUrl(",
         "function extLink(",
     )
-    harness += "\nconsole.log(JSON.stringify(%s.map(function (u) { return extLink(u); })));\n" % json.dumps(urls)
+    harness += (
+        f"\nconsole.log(JSON.stringify({json.dumps(urls)}"
+        ".map(function (u) { return extLink(u); })));\n"
+    )
     proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])

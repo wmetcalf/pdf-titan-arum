@@ -276,7 +276,8 @@ def test_reconstruct_survives_abs_path_with_leading_dotdot(tmp_path):
     f = report_dir / "screenshots" / "page-0001.png"
     f.write_bytes(b"\x89PNG\r\n")
     hostile = _report(screenshots=[{"path": "/.." + str(f)}])
-    arts = eng._reconstruct_artifacts_from_report(outdir, report_dir, hostile, set())  # must NOT raise
+    # must NOT raise
+    arts = eng._reconstruct_artifacts_from_report(outdir, report_dir, hostile, set())
     assert any(a.path.endswith("titan/screenshots/page-0001.png") for a in arts)
 
 

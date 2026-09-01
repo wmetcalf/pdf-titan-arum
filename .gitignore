@@ -51,3 +51,6 @@ corpus/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# setuptools editable-install metadata (pip install -e .)
+*.egg-info/

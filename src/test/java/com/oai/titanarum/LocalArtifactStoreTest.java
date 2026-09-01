@@ -8,7 +8,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.UUID;
-import java.util.zip.ZipInputStream;
+import net.lingala.zip4j.io.inputstream.ZipInputStream;
+import net.lingala.zip4j.model.LocalFileHeader;
 import static org.junit.jupiter.api.Assertions.*;
 
 class LocalArtifactStoreTest {
@@ -46,12 +47,27 @@ class LocalArtifactStoreTest {
         store.zipJob(root, baos);
         assertTrue(baos.size() > 0);
 
+        // zipJob writes AES-encrypted entries (password "infected", the standard
+        // convention for shipping malware artifacts). java.util.zip cannot read those --
+        // it throws "encrypted ZIP entry not supported" -- so read it the way a consumer
+        // actually does, with zip4j and the password. Reading the CONTENT back, not just
+        // the entry names, is what proves the archive is decryptable rather than merely
+        // well-formed.
         var entries = new ArrayList<String>();
-        try (var zis = new ZipInputStream(new java.io.ByteArrayInputStream(baos.toByteArray()))) {
-            java.util.zip.ZipEntry e;
-            while ((e = zis.getNextEntry()) != null) entries.add(e.getName());
+        String reportBody = null;
+        try (var zis = new ZipInputStream(
+                new java.io.ByteArrayInputStream(baos.toByteArray()), "infected".toCharArray())) {
+            LocalFileHeader e;
+            while ((e = zis.getNextEntry()) != null) {
+                entries.add(e.getFileName());
+                if (e.getFileName().equals("report.json")) {
+                    reportBody = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                }
+            }
         }
         assertTrue(entries.contains("report.json"));
         assertTrue(entries.stream().anyMatch(n -> n.contains("page-0001.png")));
+        assertEquals("{\"test\":1}", reportBody,
+                "the encrypted entry must decrypt back to exactly what was written");
     }
 }

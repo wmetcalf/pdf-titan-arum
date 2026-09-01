@@ -33,8 +33,15 @@ jobs:
           distribution: temurin
           cache: maven
 
-      - name: mvn test
-        run: mvn -B --no-transfer-progress test
+      # -Pserver is deliberate. The DEFAULT profile does not compile
+      # src/main/java-server and excludes **/Server*Test.java plus
+      # LocalArtifactStoreTest, so a default-profile run leaves the server
+      # sources and 4 test classes entirely unbuilt. Running the default profile
+      # here would have shipped a CI that never compiled a chunk of the tree --
+      # and in fact LocalArtifactStoreTest was already broken and invisible.
+      # 517 tests under -Pserver vs 487 under the default.
+      - name: mvn test (server profile)
+        run: mvn -B --no-transfer-progress -Pserver test
 
       # A green `mvn` exit code is not by itself proof the tests ran: a surefire
       # misconfiguration can pass with zero tests executed. Assert a real count.
@@ -51,8 +58,8 @@ jobs:
               t += int(r.get("tests", 0)); f += int(r.get("failures", 0))
               e += int(r.get("errors", 0)); s += int(r.get("skipped", 0))
           print(f"tests={t} failures={f} errors={e} skipped={s} classes={len(reports)}")
-          if t < 100:
-              sys.exit(f"expected the full suite, only {t} tests ran")
+          if t < 400:
+              sys.exit(f"expected the full suite (~517 under -Pserver), only {t} ran")
           if f or e:
               sys.exit(f"{f} failure(s), {e} error(s)")
           PY
@@ -98,3 +105,34 @@ jobs:
       # covers the JVM side. Deselecting them here is deliberate, not an omission.
       - name: pytest
         run: pytest tests/ -m "not jvm and not docker"
+
+  integration:
+    name: Python -> JVM integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # The `jvm` marker covers the Python adapter driving the REAL jar. The java
+      # job runs JUnit only and cannot reach that boundary; the python job
+      # deselects it. Without this job nothing exercises it at all. The jar
+      # fixture builds via `mvn -DskipTests package` when target/ is empty.
+      - name: pytest -m jvm
+        run: pytest tests/ -m "jvm"

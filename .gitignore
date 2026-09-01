@@ -47,6 +47,7 @@ AGENTS.md
 .superpowers/
 corpus/
 
-# Python bytecode
+# Python build artifacts
 __pycache__/
 *.py[cod]
+.pytest_cache/

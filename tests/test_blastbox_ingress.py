@@ -102,8 +102,8 @@ def test_report_404_for_unknown_job(tmp_path):
     assert resp.status_code == 404
 
 
-def test_spa_deeplink_serves_index_when_ui_packaged():
-    client, _ = _make_client_static()
+def test_spa_deeplink_serves_index_when_ui_packaged(tmp_path):
+    client, _ = _make_client_static(tmp_path)
     resp = client.get("/jobs/00000000-0000-0000-0000-000000000000")
     if (_STATIC_DIR / "index.html").is_file():
         assert resp.status_code == 200
@@ -112,11 +112,11 @@ def test_spa_deeplink_serves_index_when_ui_packaged():
         assert resp.status_code == 404
 
 
-def _make_client_static() -> tuple[TestClient, InMemoryJobStore]:
+def _make_client_static(tmp_path: Path) -> tuple[TestClient, InMemoryJobStore]:
     store = InMemoryJobStore()
     app = build_app(
         job_store=store,
-        job_root=Path("/tmp/titanarum-ingress-test-jobs"),
+        job_root=tmp_path / "jobs",
         allowed_engines={"titanarum"},
         extension=make_extension(),
     )

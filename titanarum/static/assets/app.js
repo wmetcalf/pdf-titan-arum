@@ -38,6 +38,32 @@ function duration(job) {
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+// esc() neutralises HTML metacharacters, but a URL scheme needs none of them:
+// "javascript:alert(1)" passes through esc() unchanged and executes on click.
+// Every URL in this viewer comes from an analyzed (i.e. hostile) document, so a
+// link target is only emitted when its scheme is inert. Browsers ignore control
+// characters and whitespace while parsing a scheme ("java\tscript:"), so strip
+// those before testing.
+const SAFE_URL_SCHEME = /^(?:https?|mailto|ftp):/;
+function safeUrl(u) {
+  const raw = String(u == null ? '' : u).trim();
+  const probe = raw.replace(/[\u0000-\u0020]/g, '').toLowerCase();
+  if (SAFE_URL_SCHEME.test(probe)) return raw;
+  // Scheme-less values (relative paths, bare "#") carry no scheme to abuse.
+  if (probe && !/^[a-z][a-z0-9+.-]*:/.test(probe)) return raw;
+  return '';
+}
+// Renders a link when the URL is safe, and inert text (still fully visible, so
+// an analyst never loses the IOC) when it is not.
+function extLink(url, label, extraAttr) {
+  const shown = esc(label == null ? (url == null ? '' : url) : label);
+  const href = safeUrl(url);
+  if (!href) {
+    return '<span class="blocked-url" title="link suppressed: unsafe URL scheme">' + shown + '</span>';
+  }
+  return '<a href="' + esc(href) + '" target="_blank" rel="noopener"'
+    + (extraAttr || '') + '>' + shown + '</a>';
+}
 function fmt_bytes(n) {
   if (!n) return '0 B';
   const units = ['B','KB','MB','GB'];
@@ -80,7 +106,12 @@ function appendJobParams(fd) {
 // ── blastbox.host ⇄ UI adapter ────────────────────────────────
 // job.status/timestamps come back epoch-shaped; normalizeJob maps them onto
 // the shape the rest of this file speaks (iso timestamps, ms durations).
-const _BB_STATE = { done: 'succeeded', failed: 'failed', rejected: 'failed',
+// Keys here are blastbox JobStatus values (host/jobs/base.py): queued, running,
+// done, failed, expired. There is no "rejected" status -- a stale mapping for one
+// used to sit here, which is misleading twice over: it implies a filter for jobs
+// that cannot exist, while "expired", which very much does exist, was missing and
+// fell through to the raw value.
+const _BB_STATE = { done: 'succeeded', failed: 'failed', expired: 'expired',
                     queued: 'queued', running: 'running' };
 const _UI_TO_BB_STATE = { queued: 'queued', running: 'running',
                           succeeded: 'done', failed: 'failed' };
@@ -183,6 +214,13 @@ document.addEventListener('error', (ev) => {
 function toggleRawJson(btn) {
   const pre = document.getElementById('raw-json-view');
   if (!pre) return;
+  // Fill on first open (see renderJobDetail): textContent, not innerHTML, so no escaping pass and
+  // no injection surface.
+  if (pre.dataset.filled !== '1') {
+    try { pre.textContent = JSON.stringify(_rawReportForDetail, null, 2); }
+    catch { pre.textContent = ''; }
+    pre.dataset.filled = '1';
+  }
   const show = pre.style.display === 'none';
   pre.style.display = show ? 'block' : 'none';
   btn.textContent = show ? '{ } hide JSON' : '{ } raw JSON';
@@ -191,18 +229,23 @@ function toggleRawJson(btn) {
 // All text display uses esc() before innerHTML injection or textContent
 // assignment. Never use innerHTML with raw document text — malware (JS/XFA/
 // form-field) payloads must render as inert text, not execute in the browser.
+// Full extracted text lives here rather than in a data-full attribute: these
+// payloads reach hundreds of KB, and one copy per block in the DOM (escaped,
+// so often larger still) bloats the document for text most blocks never expand.
+const _fullTextByUid = new Map();
+
 function toggleText(btn) {
   const uid = btn.getAttribute('data-uid');
   const el = document.getElementById(uid);
   if (!el) return;
   if (el.classList.contains('expanded')) {
     el.classList.remove('expanded');
-    const full = btn.getAttribute('data-full');
+    const full = _fullTextByUid.get(uid) || '';
     el.textContent = full.slice(0, 500) + '\n…';
     btn.textContent = '▼ show more (' + full.length.toLocaleString() + ' chars)';
   } else {
     el.classList.add('expanded');
-    el.textContent = btn.getAttribute('data-full'); // safe: textContent, not innerHTML
+    el.textContent = _fullTextByUid.get(uid) || ''; // safe: textContent, not innerHTML
     btn.textContent = '▲ show less';
   }
 }
@@ -213,7 +256,8 @@ function textBlock(text, opts) {
   const uid = 'tb-'+(Math.random().toString(36).slice(2));
   let out = '<div class="text-preview" id="'+uid+'">'+esc(text.slice(0, opts.cap || 3000))+'</div>';
   if (text.length > 500) {
-    out += '<span class="text-toggle" data-act="toggle-text" data-uid="'+uid+'" data-full="'+esc(text)+'">▼ show full ('+text.length.toLocaleString()+' chars)</span>';
+    _fullTextByUid.set(uid, text);
+    out += '<span class="text-toggle" data-act="toggle-text" data-uid="'+uid+'">▼ show full ('+text.length.toLocaleString()+' chars)</span>';
   }
   return out;
 }
@@ -346,7 +390,7 @@ function buildFormFieldsSection(report, jobId) {
     let artCol = '';
     if (ff.decodedArtifact) {
       const url = artUrl(ff.decodedArtifact);
-      artCol = url ? '<a href="'+esc(url)+'" target="_blank" rel="noopener">'+esc(ff.decodedArtifact)+'</a>' : esc(ff.decodedArtifact);
+      artCol = url ? extLink(url, ff.decodedArtifact) : esc(ff.decodedArtifact);
       if (ff.decodedSha256) artCol += '<br><code style="font-size:0.68rem;color:#888">'+esc(ff.decodedSha256)+'</code>';
     }
     rows += '<tr style="'+bg+'"><td style="font-family:monospace;color:#f0c040">'+esc(ff.name||'')+'</td>'
@@ -506,7 +550,7 @@ function buildUrlsSection(report) {
     rows += '<tr '+dimmed+'><td>'+cropCol+'</td>'
       + '<td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
       + (u.fromRevision != null ? '<span style="color:#f90" title="Only present in revision '+esc(u.fromRevision)+'">⚠</span> ' : '')
-      + '<a href="'+esc(u.url||'#')+'" target="_blank" rel="noopener" title="'+esc(u.url||'')+'"'+(u.fromRevision!=null?' style="color:#cc9900"':'')+'>'+esc(u.url||'')+'</a></td>'
+      + extLink(u.url||'', u.url||'', ' title="'+esc(u.url||'')+'"'+(u.fromRevision!=null?' style="color:#cc9900"':''))+'</td>'
       + '<td>'+esc(u.source||'')+(u.fromRevision!=null?'<br><span class="badge badge-warn">rev '+esc(u.fromRevision)+'/'+esc(report.revisionCount)+' removed</span>':'')+'</td>'
       + '<td>'+esc(u.page != null ? u.page : '')+'</td><td>'+(pct(u.pageCoverageRatio)||'')+'</td>'
       + '<td>'+flagsCol+'</td></tr>';
@@ -557,12 +601,12 @@ function buildActionsSection(report) {
   let rows = '';
   for (const a of items) {
     let target = '';
-    if (a.submitUrl) target += '<a href="'+esc(a.submitUrl)+'" target="_blank" rel="noopener">'+esc(a.submitUrl)+'</a>';
+    if (a.submitUrl) target += extLink(a.submitUrl);
     if (a.importFile) target += esc(a.importFile);
     if (a.remoteFile) target += esc(a.remoteFile);
     if (a.target) {
       target += (a.type === 'URI' || a.type === 'Rendition')
-        ? '<a href="'+esc(a.target)+'" target="_blank" rel="noopener">'+esc(a.target)+'</a>'
+        ? extLink(a.target)
         : esc(a.target);
     }
     let details = '';
@@ -593,7 +637,6 @@ function buildLaunchActionsSection(report) {
 
 function buildImageGallerySection(title, items) {
   if (!items || !items.length) return '';
-  const visible = items.filter(img => !img.hashes || !isRealHash(img.hashes.phash) ? true : true);
   let html = '<div class="shot-grid">';
   for (const img of items) {
     const h = img.hashes || {};
@@ -832,7 +875,12 @@ async function showJobDetailView(id) {
   }
 }
 
+// Holds the report for the currently rendered detail view so the raw-JSON panel can be
+// serialized on first open rather than on every render.
+let _rawReportForDetail = null;
+
 function renderJobDetail(id, job) {
+  _rawReportForDetail = job ? job.report : null;
   _lastJobDetail = { id, job };
   const stateEl = document.getElementById('detail-state');
   if (stateEl) stateEl.innerHTML = stateCell(job.state);
@@ -842,7 +890,10 @@ function renderJobDetail(id, job) {
   if (job.state === 'succeeded') {
     html += '<a href="/v1/jobs/' + id + '/result" download><button class="dl">⬇ result.zip (pw: infected)</button></a>';
   }
-  const isTerminal = job.state === 'succeeded' || job.state === 'failed';
+  // "expired" is terminal too. While it was missing here an expired job got no
+  // Delete button, so it could never be cleared from the UI.
+  const isTerminal = job.state === 'succeeded' || job.state === 'failed'
+    || job.state === 'expired';
   if (isTerminal) {
     html += '<button class="danger" data-act="delete-job" data-arg="' + esc(id) + '">Delete</button>';
   }
@@ -852,7 +903,7 @@ function renderJobDetail(id, job) {
   html += '</div>';
 
   if (job.report) {
-    html += '<pre id="raw-json-view" style="display:none;max-height:420px;overflow:auto;background:#0d0d0d;color:#cfcfcf;padding:0.75rem;border-radius:4px;font:0.72rem/1.45 \'Courier New\',monospace;white-space:pre;margin-bottom:0.75rem">' + esc(JSON.stringify(job.report, null, 2)) + '</pre>';
+    html += '<pre id="raw-json-view" data-filled="0" style="display:none;max-height:420px;overflow:auto;background:#0d0d0d;color:#cfcfcf;padding:0.75rem;border-radius:4px;font:0.72rem/1.45 \'Courier New\',monospace;white-space:pre;margin-bottom:0.75rem"></pre>';
   }
 
   if (job.state === 'failed') {

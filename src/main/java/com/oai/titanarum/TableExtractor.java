@@ -2146,12 +2146,14 @@ final class TableExtractor {
     static void fillCellsFromPositions(List<CellRect> cells, List<TextPosition> positions,
                                         int rotation, float unrotatedW, float unrotatedH,
                                         long[] work, long budget) {
-        // Each glyph's rotated midpoint depends only on the glyph, never on the cell, so
-        // computing it inside the per-cell loop repeated identical float math (and an
-        // applyPageRotation array allocation) cells-many times per glyph. Hoist it: one pass
-        // over the glyphs, then pure comparisons per cell. Same buckets, same budget
-        // semantics -- the work counter still charges every (cell, glyph) comparison, so the
-        // MAX_TEXTFILL_WORK product bound is unchanged.
+        // A glyph's rotated midpoint depends only on the glyph and the page rotation, NOT on the
+        // cell -- but it used to be computed inside the per-cell loop, so each position paid four
+        // PDFBox accessor calls (each re-deriving from the text matrix) plus a float[] allocation
+        // once PER CELL. MEASURED at 2.49us per (cell, glyph) pair, which meant the 20,000,000-pair
+        // MAX_TEXTFILL_WORK budget took ~50s to trip: the budget bounded the pair COUNT but not the
+        // CPU it exists to bound, which is the DoS this cap was added for.
+        // Hoisted to O(positions) instead of O(cells x positions). The precompute is charged against
+        // the same budget so the bound covers all the work, not just the comparison phase.
         final int n = positions.size();
         final float[] mx = new float[n];
         final float[] my = new float[n];

@@ -49,6 +49,7 @@ tbody tr.job-row:hover { background: #333; }
 .state-running  { background: #8a5c00; color: #ffc857; }
 .state-succeeded{ background: #1a4a1a; color: #4caf50; }
 .state-failed   { background: #4a1a1a; color: #ef5350; }
+.state-expired  { background: #3a3226; color: #bfa980; }
 .no-jobs { color: #666; font-size: 0.85rem; padding: 0.75rem 0; }
 
 /* Generic small badges (list highlights + detail sections) */

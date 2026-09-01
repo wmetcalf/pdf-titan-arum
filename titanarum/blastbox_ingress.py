@@ -61,6 +61,14 @@ def get_report(job_id: str, request: Request) -> FileResponse:
     return resp
 
 
+def _serve_ui_enabled() -> bool:
+    """Single source of truth for the UI toggle, shared by the SPA deep-link route and
+    make_extension() so the two can never disagree about whether the UI is served."""
+    return os.environ.get("TITANARUM_SERVE_UI", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
 @router.get("/jobs/{job_id}")
 def spa_deeplink(job_id: str) -> FileResponse:
     """Serve the SPA shell for client-routed deep-links (``/jobs/<id>``) so a hard
@@ -68,6 +76,13 @@ def spa_deeplink(job_id: str) -> FileResponse:
     on ``window.location.pathname``. Distinct from ``/v1/jobs/{id}`` (the JSON API);
     the StaticUI seam only registers ``GET /`` + ``/assets``, so without this a
     refresh on a detail URL 404s. 404 when the UI isn't packaged (TITANARUM_SERVE_UI=0)."""
+    # The docstring below promised a 404 when the UI is disabled, but this only checked that the
+    # file EXISTS -- and it ships in the wheel regardless of the env var. So with
+    # TITANARUM_SERVE_UI=0 the StaticUI seam correctly stopped serving GET / and /assets while this
+    # route kept handing out the SPA shell on any /jobs/<id> deep link. Gate on the same flag
+    # make_extension() uses, so "UI off" means off on every entry point.
+    if not _serve_ui_enabled():
+        raise HTTPException(status_code=404)
     index = _STATIC_DIR / "index.html"
     if not index.is_file():
         raise HTTPException(status_code=404)
@@ -81,11 +96,7 @@ def make_extension() -> IngressExtension:
     (unless ``TITANARUM_SERVE_UI=0``) its packaged web UI, mounted on the shared
     blastbox ingress by ``build_app``.
     """
-    serve_ui = os.environ.get("TITANARUM_SERVE_UI", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-    }
+    serve_ui = _serve_ui_enabled()
     static_ui = (
         StaticUI(directory=str(_STATIC_DIR))
         if serve_ui and (_STATIC_DIR / "index.html").is_file()

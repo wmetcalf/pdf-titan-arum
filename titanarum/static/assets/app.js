@@ -38,6 +38,32 @@ function duration(job) {
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+// esc() neutralises HTML metacharacters, but a URL scheme needs none of them:
+// "javascript:alert(1)" passes through esc() unchanged and executes on click.
+// Every URL in this viewer comes from an analyzed (i.e. hostile) document, so a
+// link target is only emitted when its scheme is inert. Browsers ignore control
+// characters and whitespace while parsing a scheme ("java\tscript:"), so strip
+// those before testing.
+const SAFE_URL_SCHEME = /^(?:https?|mailto|ftp):/;
+function safeUrl(u) {
+  const raw = String(u == null ? '' : u).trim();
+  const probe = raw.replace(/[\u0000-\u0020]/g, '').toLowerCase();
+  if (SAFE_URL_SCHEME.test(probe)) return raw;
+  // Scheme-less values (relative paths, bare "#") carry no scheme to abuse.
+  if (probe && !/^[a-z][a-z0-9+.-]*:/.test(probe)) return raw;
+  return '';
+}
+// Renders a link when the URL is safe, and inert text (still fully visible, so
+// an analyst never loses the IOC) when it is not.
+function extLink(url, label, extraAttr) {
+  const shown = esc(label == null ? (url == null ? '' : url) : label);
+  const href = safeUrl(url);
+  if (!href) {
+    return '<span class="blocked-url" title="link suppressed: unsafe URL scheme">' + shown + '</span>';
+  }
+  return '<a href="' + esc(href) + '" target="_blank" rel="noopener"'
+    + (extraAttr || '') + '>' + shown + '</a>';
+}
 function fmt_bytes(n) {
   if (!n) return '0 B';
   const units = ['B','KB','MB','GB'];
@@ -192,18 +218,23 @@ function toggleRawJson(btn) {
 // All text display uses esc() before innerHTML injection or textContent
 // assignment. Never use innerHTML with raw document text — malware (JS/XFA/
 // form-field) payloads must render as inert text, not execute in the browser.
+// Full extracted text lives here rather than in a data-full attribute: these
+// payloads reach hundreds of KB, and one copy per block in the DOM (escaped,
+// so often larger still) bloats the document for text most blocks never expand.
+const _fullTextByUid = new Map();
+
 function toggleText(btn) {
   const uid = btn.getAttribute('data-uid');
   const el = document.getElementById(uid);
   if (!el) return;
   if (el.classList.contains('expanded')) {
     el.classList.remove('expanded');
-    const full = btn.getAttribute('data-full');
+    const full = _fullTextByUid.get(uid) || '';
     el.textContent = full.slice(0, 500) + '\n…';
     btn.textContent = '▼ show more (' + full.length.toLocaleString() + ' chars)';
   } else {
     el.classList.add('expanded');
-    el.textContent = btn.getAttribute('data-full'); // safe: textContent, not innerHTML
+    el.textContent = _fullTextByUid.get(uid) || ''; // safe: textContent, not innerHTML
     btn.textContent = '▲ show less';
   }
 }
@@ -214,7 +245,8 @@ function textBlock(text, opts) {
   const uid = 'tb-'+(Math.random().toString(36).slice(2));
   let out = '<div class="text-preview" id="'+uid+'">'+esc(text.slice(0, opts.cap || 3000))+'</div>';
   if (text.length > 500) {
-    out += '<span class="text-toggle" data-act="toggle-text" data-uid="'+uid+'" data-full="'+esc(text)+'">▼ show full ('+text.length.toLocaleString()+' chars)</span>';
+    _fullTextByUid.set(uid, text);
+    out += '<span class="text-toggle" data-act="toggle-text" data-uid="'+uid+'">▼ show full ('+text.length.toLocaleString()+' chars)</span>';
   }
   return out;
 }
@@ -347,7 +379,7 @@ function buildFormFieldsSection(report, jobId) {
     let artCol = '';
     if (ff.decodedArtifact) {
       const url = artUrl(ff.decodedArtifact);
-      artCol = url ? '<a href="'+esc(url)+'" target="_blank" rel="noopener">'+esc(ff.decodedArtifact)+'</a>' : esc(ff.decodedArtifact);
+      artCol = url ? extLink(url, ff.decodedArtifact) : esc(ff.decodedArtifact);
       if (ff.decodedSha256) artCol += '<br><code style="font-size:0.68rem;color:#888">'+esc(ff.decodedSha256)+'</code>';
     }
     rows += '<tr style="'+bg+'"><td style="font-family:monospace;color:#f0c040">'+esc(ff.name||'')+'</td>'
@@ -507,7 +539,7 @@ function buildUrlsSection(report) {
     rows += '<tr '+dimmed+'><td>'+cropCol+'</td>'
       + '<td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
       + (u.fromRevision != null ? '<span style="color:#f90" title="Only present in revision '+esc(u.fromRevision)+'">⚠</span> ' : '')
-      + '<a href="'+esc(u.url||'#')+'" target="_blank" rel="noopener" title="'+esc(u.url||'')+'"'+(u.fromRevision!=null?' style="color:#cc9900"':'')+'>'+esc(u.url||'')+'</a></td>'
+      + extLink(u.url||'', u.url||'', ' title="'+esc(u.url||'')+'"'+(u.fromRevision!=null?' style="color:#cc9900"':''))+'</td>'
       + '<td>'+esc(u.source||'')+(u.fromRevision!=null?'<br><span class="badge badge-warn">rev '+esc(u.fromRevision)+'/'+esc(report.revisionCount)+' removed</span>':'')+'</td>'
       + '<td>'+esc(u.page != null ? u.page : '')+'</td><td>'+(pct(u.pageCoverageRatio)||'')+'</td>'
       + '<td>'+flagsCol+'</td></tr>';
@@ -558,12 +590,12 @@ function buildActionsSection(report) {
   let rows = '';
   for (const a of items) {
     let target = '';
-    if (a.submitUrl) target += '<a href="'+esc(a.submitUrl)+'" target="_blank" rel="noopener">'+esc(a.submitUrl)+'</a>';
+    if (a.submitUrl) target += extLink(a.submitUrl);
     if (a.importFile) target += esc(a.importFile);
     if (a.remoteFile) target += esc(a.remoteFile);
     if (a.target) {
       target += (a.type === 'URI' || a.type === 'Rendition')
-        ? '<a href="'+esc(a.target)+'" target="_blank" rel="noopener">'+esc(a.target)+'</a>'
+        ? extLink(a.target)
         : esc(a.target);
     }
     let details = '';
@@ -594,7 +626,6 @@ function buildLaunchActionsSection(report) {
 
 function buildImageGallerySection(title, items) {
   if (!items || !items.length) return '';
-  const visible = items.filter(img => !img.hashes || !isRealHash(img.hashes.phash) ? true : true);
   let html = '<div class="shot-grid">';
   for (const img of items) {
     const h = img.hashes || {};

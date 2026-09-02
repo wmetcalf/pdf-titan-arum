@@ -1,0 +1,26 @@
+# Node pool autosizer participation. Reversible: drop this -f to roll back.
+# Puts the 3 dispatchers on ${TITANARUM_IMAGE} and mounts the shared node-view dir.
+# This line used to hardcode titanarum:024. That silently pinned all three dispatchers to
+# blastbox 0.1.24 while the api followed .env and moved on — the stack ran mixed images and
+# a blastbox version skew for weeks, invisible unless you diffed per container.
+# Track ${TITANARUM_IMAGE} so one .env edit moves the whole stack.
+# NODE_ENGINES + per-engine RAM_MIB are the fleet-wide
+# consistent config every co-located dispatcher (redtusk/clippyshot too) must match.
+x-autosizer: &autosizer
+  image: ${TITANARUM_IMAGE:-titanarum:bb0127}
+  environment:
+    - BLASTBOX_NODE_RESOURCE_MANAGEMENT=1
+    - BLASTBOX_NODE_BALANCING=1
+    - BLASTBOX_NODE_ENGINES=redtusk,clippyshot,titanarum
+    - BLASTBOX_NODE_ENGINE_REDTUSK_RAM_MIB=2048
+    - BLASTBOX_NODE_ENGINE_CLIPPYSHOT_RAM_MIB=3072
+    - BLASTBOX_NODE_ENGINE_TITANARUM_RAM_MIB=2560
+    - BLASTBOX_NODE_SHARE_DIR=/var/lib/blastbox/node
+    - BLASTBOX_NODE_RAM_HEADROOM=0.8
+    - BLASTBOX_NODE_VCPU_OVERSUBSCRIPTION=2.0
+  volumes:
+    - /var/lib/blastbox/node:/var/lib/blastbox/node
+services:
+  dispatcher:         { <<: *autosizer }
+  dispatcher-fc:      { <<: *autosizer }
+  dispatcher-gvisor:  { <<: *autosizer }

@@ -128,7 +128,14 @@ services:
     volumes:
       # job_root (host-consistent, same path as the cold dispatcher) — read the
       # staged input.
-      - "${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}/jobs:${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}/jobs"
+      # Mount the DATA ROOT, not just jobs/. This service runs read_only:true, so with
+      # only jobs/ bound the LocalBlobStore at <data>/blobs sat on the read-only rootfs
+      # and EVERY blob write failed with EROFS -- the tier could not store a result at
+      # all. The cold dispatcher already mounts the root, and the header of this file
+      # says this service must match it exactly; this is that. Found because the
+      # blastbox 0.1.27 startup canary refuses to serve when it cannot write a blob,
+      # which turned a silent tier into a crash-loop with the cause in the log.
+      - "${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}:${TITANARUM_DATA_DIR:-/home/coz/titanarum-bb-data}"
       # FC assets (firecracker binary + vmlinux kernel + titanarum-rootfs.ext4),
       # read-only.
       - "${TITANARUM_FC_DIR:-/home/coz/titanarum-bb-fc}:/var/lib/blastbox-fc:ro"

@@ -150,10 +150,21 @@ stamp_flags() {  # <dockerfile> <base> [base-arg] [source-repo]
 # --build-arg -- an override that appears to work and does nothing.
 
 echo ">> worker base (jar + AOT)  -> titanarum-base:$TAG"
+# The builder stages' OUTPUT ships (the fat jar, ZXingReader), so their bases
+# are pinned to digests too. They are not stamped -- an image records one base --
+# but an unpinned builder makes the same source produce different bytes.
+JDK_BUILD_BASE="${JDK_BUILD_BASE:-eclipse-temurin:25-jdk}"
+ZXING_BUILD_BASE="${ZXING_BUILD_BASE:-debian:12-slim}"
 docker pull -q "$WORKER_BASE" >/dev/null
+docker pull -q "$JDK_BUILD_BASE" >/dev/null
+docker pull -q "$ZXING_BUILD_BASE" >/dev/null
+jdk_digest="$(docker image inspect "$JDK_BUILD_BASE" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo "$JDK_BUILD_BASE")"
+zxing_digest="$(docker image inspect "$ZXING_BUILD_BASE" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo "$ZXING_BUILD_BASE")"
 stamp_flags deploy/docker/Dockerfile.titanarum-base "$WORKER_BASE"
 docker build -f deploy/docker/Dockerfile.titanarum-base \
   "${flags[@]}" \
+  --build-arg "JDK_BUILD_IMAGE=$jdk_digest" \
+  --build-arg "ZXING_BUILD_IMAGE=$zxing_digest" \
   -t "titanarum-base:$TAG" .
 
 echo ">> cold worker              -> titanarum-cold-worker:$TAG"

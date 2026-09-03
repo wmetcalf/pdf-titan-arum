@@ -1,13 +1,20 @@
 # Base: JDK 25 + the pdf-titan-arum fat jar + fonts + a -json-capable ZXingReader.
 
-# The RUNTIME base is an ARG so a build can be pinned to a digest. Only the final
-# stage becomes the image, so this is the one that must be parameterized; the
-# builder stages' bases never reach the shipped layers. It must be declared HERE,
-# before the first FROM -- docker honours an ARG inside a FROM only in that
-# scope. scripts/build_images.sh passes the resolved reference.
+# Every base is an ARG so a build can be pinned. All are declared HERE, before
+# the first FROM -- docker honours an ARG inside a FROM only in that scope.
+#
+# The BUILDER bases matter as much as the runtime one, which is easy to get
+# wrong: their layers are not shipped, but their OUTPUT is. The fat jar and
+# ZXingReader are built in those stages and COPYed into the final image, so a
+# moved `eclipse-temurin:25-jdk` or `debian:12-slim` changes what ships even
+# though the runtime base is identical. Only BASE_IMAGE is recorded in the
+# stamp (an image records one base), so these two are pinned but not stamped --
+# a real limit, stated rather than papered over.
 ARG BASE_IMAGE=eclipse-temurin:25-jre
+ARG JDK_BUILD_IMAGE=eclipse-temurin:25-jdk
+ARG ZXING_BUILD_IMAGE=debian:12-slim
 # Built once, reused by all tiers.
-FROM eclipse-temurin:25-jdk AS jarbuild
+FROM ${JDK_BUILD_IMAGE} AS jarbuild
 WORKDIR /build
 COPY pom.xml .
 COPY src ./src
@@ -18,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends maven \
 # zxing-cpp ZXingReader with `-json` output. The `-json` flag landed in the 3.x
 # series (v2.3.0 and distro 2.2.x lack it), so build from source pinned to v3.1.0.
 # Static link (BUILD_SHARED_LIBS=OFF) so the binary is self-contained in the JRE stage.
-FROM debian:12-slim AS zxingbuild
+FROM ${ZXING_BUILD_IMAGE} AS zxingbuild
 ARG ZXING_TAG=v3.1.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git cmake g++ make ca-certificates \

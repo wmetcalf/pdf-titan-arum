@@ -13,7 +13,10 @@
 #
 # Build context = repo root:
 #   docker build -f deploy/docker/Dockerfile.titanarum-host -t titanarum:<tag> .
-FROM python:3.12-slim-bookworm
+# The base is an ARG so the build can be pinned, declared before the first FROM
+# because that is the only scope in which docker honours an ARG inside a FROM.
+ARG BASE_IMAGE=python:3.12-slim-bookworm
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 

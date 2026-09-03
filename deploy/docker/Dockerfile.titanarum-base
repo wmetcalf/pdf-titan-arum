@@ -1,4 +1,11 @@
 # Base: JDK 25 + the pdf-titan-arum fat jar + fonts + a -json-capable ZXingReader.
+
+# The RUNTIME base is an ARG so a build can be pinned to a digest. Only the final
+# stage becomes the image, so this is the one that must be parameterized; the
+# builder stages' bases never reach the shipped layers. It must be declared HERE,
+# before the first FROM -- docker honours an ARG inside a FROM only in that
+# scope. scripts/build_images.sh passes the resolved reference.
+ARG BASE_IMAGE=eclipse-temurin:25-jre
 # Built once, reused by all tiers.
 FROM eclipse-temurin:25-jdk AS jarbuild
 WORKDIR /build
@@ -22,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && cp "$(find /zxing/build -name ZXingReader -type f | head -1)" /ZXingReader \
  && /ZXingReader -version
 
-FROM eclipse-temurin:25-jre
+FROM ${BASE_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fontconfig fonts-dejavu-core python3-venv \
       libturbojpeg-java libheif1 \

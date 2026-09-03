@@ -51,7 +51,7 @@ COPY pyproject.toml README.md /src/titanarum/
 COPY titanarum /src/titanarum/titanarum
 # blastbox 0.1.20 is the first PyPI release that ships blastbox.worker.http_agent
 # (the network worker this image runs) + the AWS worker backends; 0.1.19 lacked
-# them. That was the original floor; it is now >=0.1.27, which is the release
+# them. That was the original floor; it is now >=0.1.32, which is the release
 # that finally publishes six weeks of unreleased main. The `[host]` extra matches the on-prem host
 # image (and pulls cryptography for the mTLS/PKI path); `<0.2` guards against a
 # future breaking 0.2.0.

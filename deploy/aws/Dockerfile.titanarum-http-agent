@@ -55,7 +55,7 @@ COPY titanarum /src/titanarum/titanarum
 # that finally publishes six weeks of unreleased main. The `[host]` extra matches the on-prem host
 # image (and pulls cryptography for the mTLS/PKI path); `<0.2` guards against a
 # future breaking 0.2.0.
-RUN /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]>=0.1.27,<0.2" \
+RUN /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]>=0.1.32,<0.2" \
  && /opt/titanarum/bin/pip install --no-cache-dir /src/titanarum \
  && rm -rf /src \
  && /opt/titanarum/bin/python -c "import blastbox.worker.http_agent, titanarum.engine; print('http_agent ok')"

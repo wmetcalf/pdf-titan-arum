@@ -116,36 +116,50 @@ def test_the_scripts_default_base_matches_the_dockerfiles_own(
     )
 
 
-def test_the_warm_rootfs_comes_from_the_stamped_cold_worker() -> None:
-    """Both warm tiers boot an export of the cold worker, not a separate build.
+def test_the_warm_rootfs_comes_from_its_own_stamped_image() -> None:
+    """Each tier exports ITS OWN warm image, not the cold worker.
 
-    Rebuilding a rootfs from a Dockerfile instead would produce an artifact on
-    that file's default base -- not the image the stamps were verified against.
+    Exporting the cold worker is not a shortcut: the Firecracker guest boots
+    /init, which execs run_guest.py against a baked guest.env, and those are
+    what deploy/firecracker/Dockerfile.titanarum adds. A bare cold-worker export
+    boots and never signals READY -- measured on toolz2, the warm base timed out
+    at 120s and every job fell back to cold while the dispatcher looked healthy.
     """
     export = (ROOT / "scripts" / "export_warm_rootfs.sh").read_text(encoding="utf-8")
-    assert 'IMAGE="titanarum-cold-worker:$TAG"' in export, (
-        "the export must come from the stamped cold worker"
+    assert 'GV_IMAGE="titanarum-warm:gvisor-$TAG"' in export
+    assert 'FC_IMAGE="titanarum-fc-worker:$TAG"' in export
+    assert "titanarum-cold-worker" not in export, (
+        "the rootfs must come from the warm images, not the cold worker"
     )
     assert "docker build" not in export, (
-        "the export script must not BUILD anything; that would bypass the stamps"
+        "the export script must not BUILD; that would bypass the stamps"
     )
 
 
 def test_the_fc_export_refuses_an_image_that_cannot_boot() -> None:
-    """A Firecracker rootfs needs /init; the worker filesystem alone is not one.
-
-    Exporting the bare cold worker produced an ext4 that booted and never
-    signalled READY -- the warm base timed out at 120s and every job silently
-    fell back to cold while the dispatcher looked healthy. The script must
-    refuse rather than write an artifact that cannot boot.
-    """
+    """Belt and braces: even the right image is checked for /init."""
     export = (ROOT / "scripts" / "export_warm_rootfs.sh").read_text(encoding="utf-8")
     assert "-f /init" in export, "the FC export must check the image can boot"
     assert "exit 3" in export, "the check must abort rather than warn"
-    # The gVisor export has no such requirement and must not be gated on it.
-    gvisor_at = export.index(">> gvisor rootfs")
-    init_at = export.index("-f /init")
-    assert gvisor_at < init_at, (
-        "the /init gate must not block the gVisor export, which correctly does "
-        "boot from a plain cold-worker export"
+    assert export.index(">> gvisor rootfs") < export.index("-f /init"), (
+        "the /init gate must not block the gVisor export, which needs no init"
     )
+
+
+def test_no_build_arg_the_dockerfiles_ignore() -> None:
+    """docker SILENTLY ignores an undeclared --build-arg.
+
+    titanarum's Dockerfiles declare neither BLASTBOX_VERSION nor BLASTBOX_WHEEL
+    (RedTusk's do), so passing either would look like it pinned the install
+    while doing nothing -- the class of lie this script exists to prevent.
+    """
+    script = SCRIPT.read_text(encoding="utf-8")
+    for arg in ("BLASTBOX_VERSION", "BLASTBOX_WHEEL"):
+        declared = any(
+            f"ARG {arg}" in (ROOT / "deploy" / "docker" / d).read_text(encoding="utf-8")
+            for d in ("Dockerfile.titanarum-cold-worker", "Dockerfile.titanarum-host")
+        )
+        passed = f"--build-arg \"{arg}=" in script or f"{arg}=$" in script
+        assert declared or not passed, (
+            f"the script passes {arg} but no Dockerfile declares it"
+        )

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Turn the stamped cold worker into the rootfs artifacts the warm tiers boot.
 #
-# Both of titanarum's warm tiers boot a rootfs exported from the SAME image the
-# cold tier runs -- gVisor an exported directory tree, Firecracker an ext4 file
-# -- so the provenance of the cold worker carries through to both. Building the
-# rootfs any other way produces an artifact whose contents nothing verified.
+# Each warm tier boots a rootfs exported from ITS OWN stamped image -- gVisor a
+# directory tree from titanarum-warm:gvisor-<tag>, Firecracker an ext4 from
+# titanarum-fc-worker:<tag>. Both are built from this repo's
+# deploy/{gvisor,firecracker}/Dockerfile.titanarum on top of the cold worker,
+# so the chain base -> cold worker -> warm image -> rootfs is stamped end to end.
+#
+# Exporting the COLD WORKER instead does not work and is not a shortcut: the
+# Firecracker guest boots /init, which execs run_guest.py against a baked
+# guest.env, and those are exactly what the warm Dockerfile adds. A bare export
+# boots and never signals READY.
 #
 # Usage:  scripts/export_warm_rootfs.sh <tag>
 # Env:    TITANARUM_GVISOR_DIR (default $HOME/titanarum-bb-gvisor)
@@ -15,7 +21,8 @@ set -euo pipefail
 TAG="${1:?usage: export_warm_rootfs.sh <tag>}"
 GVISOR_DIR="${TITANARUM_GVISOR_DIR:-$HOME/titanarum-bb-gvisor}"
 FC_DIR="${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}"
-IMAGE="titanarum-cold-worker:$TAG"
+GV_IMAGE="titanarum-warm:gvisor-$TAG"
+FC_IMAGE="titanarum-fc-worker:$TAG"
 
 # The two destinations differ in ownership on a real node -- the gVisor tree is
 # root-owned, the FC dir belongs to the deploy user -- so elevate per path
@@ -25,21 +32,23 @@ as_owner() {  # <dir> <cmd...>
   if [ -w "$1" ]; then shift; "$@"; else shift; sudo "$@"; fi
 }
 
-docker image inspect --format '{{.Id}}' "$IMAGE" >/dev/null 2>&1 || {
-  echo "$IMAGE is not built. Run scripts/build_images.sh $TAG first." >&2
-  exit 2
-}
+for img in "$GV_IMAGE" "$FC_IMAGE"; do
+  docker image inspect --format '{{.Id}}' "$img" >/dev/null 2>&1 || {
+    echo "$img is not built. Run scripts/build_images.sh $TAG first." >&2
+    exit 2
+  }
+done
 
 # `docker export | tar -x` over an EXISTING tree overwrites the members in the
 # archive and leaves everything else behind: a file the new image deleted or
 # renamed stays, and the guest boots a mixture of two builds. Extract into a
 # fresh directory and swap, keeping the old one for rollback.
-echo ">> gvisor rootfs <- $IMAGE"
+echo ">> gvisor rootfs <- $GV_IMAGE"
 staging="$GVISOR_DIR/rootfs-$TAG"
 [ -d "$GVISOR_DIR" ] || sudo mkdir -p "$GVISOR_DIR"
 as_owner "$GVISOR_DIR" rm -rf "$staging"
 as_owner "$GVISOR_DIR" mkdir -p "$staging"
-cid="$(docker create "$IMAGE")"
+cid="$(docker create "$GV_IMAGE")"
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 if [ -w "$GVISOR_DIR" ]; then docker export "$cid" | tar -x -C "$staging"
 else docker export "$cid" | sudo tar -x -C "$staging"; fi
@@ -60,24 +69,23 @@ echo "   $GVISOR_DIR/rootfs  (previous kept as rootfs.bak)"
 # signals READY: measured on toolz2, the warm base timed out at 120s and the
 # tier fell back to cold for every job while the dispatcher looked healthy. So
 # this refuses rather than writing an artifact that cannot boot.
-if ! docker run --rm --entrypoint test "$IMAGE" -f /init 2>/dev/null; then
+if ! docker run --rm --entrypoint test "$FC_IMAGE" -f /init 2>/dev/null; then
   echo >&2
-  echo "$IMAGE has no /init, so it cannot be a Firecracker rootfs." >&2
-  echo "The gVisor tree above is exported and in place; the FC image needs" >&2
-  echo "blastbox's deploy/firecracker/Dockerfile.titanarum (with a" >&2
-  echo "guest.titanarum.env), which does not exist yet -- redtusk and" >&2
-  echo "clippyshot have one. Leaving $FC_DIR untouched." >&2
+  echo "$FC_IMAGE has no /init, so it cannot be a Firecracker rootfs." >&2
+  echo "deploy/firecracker/Dockerfile.titanarum is what adds /init," >&2
+  echo "run_guest.py and guest.titanarum.env; if the built image lacks them," >&2
+  echo "that build did not use it. Leaving $FC_DIR untouched." >&2
   exit 3
 fi
 
-echo ">> firecracker rootfs <- $IMAGE"
+echo ">> firecracker rootfs <- $FC_IMAGE"
 out="$FC_DIR/titanarum-rootfs.ext4"
 mib="${ROOTFS_MIB:-}"
 if [ -z "$mib" ]; then
   if [ -f "$out" ]; then mib=$(( $(stat -c %s "$out") / 1024 / 1024 )); else mib=3072; fi
 fi
 rd="$(mktemp -d "${TMPDIR:-/tmp}/titanrootfs.XXXXXX")"
-cid="$(docker create "$IMAGE")"
+cid="$(docker create "$FC_IMAGE")"
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$rd"' EXIT
 docker export "$cid" | tar -x -C "$rd"
 docker rm "$cid" >/dev/null

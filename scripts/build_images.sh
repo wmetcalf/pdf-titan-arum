@@ -17,7 +17,6 @@
 #   scripts/build_images.sh <tag> [blastbox-version]
 #
 # Env: WORKER_BASE / HOST_BASE  override the upstream bases
-#      BLASTBOX_WHEEL          ship a pre-release host blastbox (section 1)
 # Example:
 #   scripts/build_images.sh bb0133 0.1.33
 set -euo pipefail
@@ -52,7 +51,7 @@ BLASTBOX_VERSION="${2:-$(grep -v '^[[:space:]]*#' pyproject.toml |
 
 # The upstream bases the two root images build on. Overridable so a base bump
 # is one env var rather than an edit in two files; the DEFAULTS must match the
-# Dockerfiles' own ARG defaults, which tests/unit/test_build_script_arg_names.py
+# Dockerfiles' own ARG defaults, which tests/test_build_script_arg_names.py
 # asserts -- a drift here would pin a base the Dockerfile does not otherwise use.
 WORKER_BASE="${WORKER_BASE:-eclipse-temurin:25-jre}"
 HOST_BASE="${HOST_BASE:-python:3.12-slim-bookworm}"
@@ -140,19 +139,15 @@ stamp_flags() {  # <dockerfile> <base> [base-arg] [source-repo]
 # command so `set -e` sees its status; wrapping it in `$(...)` would discard
 # that, and an `exit` inside a substitution only leaves the SUBSHELL.
 
-# The images install this blastbox; the Dockerfiles default the ARG, and a
-# default that drifts from what is stamped produces the exact lie this tooling
-# exists to catch: a label naming one version over a venv holding another.
-version_arg=(--build-arg "BLASTBOX_VERSION=$BLASTBOX_VERSION")
+# NOTE: no BLASTBOX_VERSION build-arg. Unlike RedTusk's, titanarum's Dockerfiles
+# do not declare `ARG BLASTBOX_VERSION` -- they pin blastbox through their own
+# requirement -- and docker SILENTLY IGNORES a --build-arg the Dockerfile does
+# not declare. Passing one would look like it pinned the install while doing
+# nothing, which is the class of lie this whole script exists to prevent.
 
-# The pre-release escape hatch documented for the host image (DEPLOYMENT.md
-# section 1) is `ARG BLASTBOX_WHEEL`. Without a way to pass it, an operator
-# told to build with this script would silently get the PyPI blastbox instead
-# of the host-side fix they came for. Empty = the pinned PyPI release ships.
-wheel_arg=()
-if [ -n "${BLASTBOX_WHEEL:-}" ]; then
-  wheel_arg=(--build-arg "BLASTBOX_WHEEL=$BLASTBOX_WHEEL")
-fi
+# NOTE: no BLASTBOX_WHEEL passthrough either. Dockerfile.titanarum-host does not
+# declare that ARG (RedTusk's does), and docker silently ignores an undeclared
+# --build-arg -- an override that appears to work and does nothing.
 
 echo ">> worker base (jar + AOT)  -> titanarum-base:$TAG"
 docker pull -q "$WORKER_BASE" >/dev/null
@@ -165,24 +160,33 @@ echo ">> cold worker              -> titanarum-cold-worker:$TAG"
 stamp_flags deploy/docker/Dockerfile.titanarum-cold-worker "titanarum-base:$TAG"
 docker build -f deploy/docker/Dockerfile.titanarum-cold-worker \
   "${flags[@]}" \
-  "${version_arg[@]}" \
-  -t "titanarum-cold-worker:$TAG" .
+   -t "titanarum-cold-worker:$TAG" .
 
 echo ">> host / dispatcher        -> titanarum:$TAG"
 docker pull -q "$HOST_BASE" >/dev/null
 stamp_flags deploy/docker/Dockerfile.titanarum-host "$HOST_BASE"
 docker build -f deploy/docker/Dockerfile.titanarum-host \
   "${flags[@]}" \
-  "${version_arg[@]}" "${wheel_arg[@]}" \
-  -t "titanarum:$TAG" .
+   -t "titanarum:$TAG" .
 
-# Warm-tier artifacts are NOT separate images here. Unlike redtusk -- which
-# builds a gvisor and a firecracker image from Dockerfiles in blastbox -- both of
-# titanarum's warm tiers boot a rootfs exported straight from the COLD WORKER
-# (docker-compose.gvisor.yml: "a `docker export` of titanarum-cold-worker:TAG").
-# So there is nothing extra to build, and everything to export:
-# scripts/export_warm_rootfs.sh turns the stamped cold worker into both.
-warm_images=()
+# Warm-tier images. Both live in THIS repo -- deploy/gvisor/Dockerfile.titanarum
+# and deploy/firecracker/Dockerfile.titanarum -- and both take the cold worker as
+# their base. They are separate images for a reason: a Firecracker rootfs is not
+# the worker's filesystem, it boots /init which execs run_guest.py against a
+# baked guest.env, and those are what these Dockerfiles add.
+echo ">> gvisor warm image        -> titanarum-warm:gvisor-$TAG"
+stamp_flags deploy/gvisor/Dockerfile.titanarum "titanarum-cold-worker:$TAG"
+docker build -f deploy/gvisor/Dockerfile.titanarum \
+  "${flags[@]}" \
+  -t "titanarum-warm:gvisor-$TAG" .
+
+echo ">> firecracker warm image   -> titanarum-fc-worker:$TAG"
+stamp_flags deploy/firecracker/Dockerfile.titanarum "titanarum-cold-worker:$TAG"
+docker build -f deploy/firecracker/Dockerfile.titanarum \
+  "${flags[@]}" \
+  -t "titanarum-fc-worker:$TAG" .
+
+warm_images=("titanarum-warm:gvisor-$TAG" "titanarum-fc-worker:$TAG")
 
 echo
 echo ">> verify: every image must record what it was built from"

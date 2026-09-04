@@ -200,7 +200,7 @@ _ENGINES = {"probe": ProbeEngine, "pdfrasterize": PdfRasterizeEngine, "pdf": Pdf
 
 
 def get_engine(name: str) -> object:
-    """Return an engine instance from BLASTBOX_FC_ENGINE.
+    """Return an engine instance from BLASTBOX_GVISOR_ENGINE.
 
     A built-in example name (``probe`` / ``pdf``), or an adopter engine given as
     ``module.path:ClassName`` (e.g. ``clippyshot.engine:ClippyShotEngine``) which

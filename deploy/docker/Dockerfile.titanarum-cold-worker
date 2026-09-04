@@ -9,7 +9,7 @@ USER root
 # >=0.1.33,<0.2 dependency range) rather than re-resolving it.
 COPY pyproject.toml README.md /src/titanarum/
 COPY titanarum /src/titanarum/titanarum
-RUN /opt/titanarum/bin/pip install --no-cache-dir "blastbox==0.1.38" \
+RUN /opt/titanarum/bin/pip install --no-cache-dir "blastbox==0.1.39" \
  && /opt/titanarum/bin/pip install --no-cache-dir /src/titanarum \
  && rm -rf /src \
  && /opt/titanarum/bin/python -c "import blastbox.worker.cold, titanarum.engine; print('cold ok')"

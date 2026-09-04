@@ -1,165 +1,128 @@
-"""`scripts/build_images.sh` must pin bases with ARGs docker will honour.
+"""What blastbox-images.toml declares must match the Dockerfiles it names.
 
-Docker WARNS and IGNORES a `--build-arg` the Dockerfile never declares, and
-declaring one is not enough: an ARG inside a stage cannot parameterize a FROM,
-and in a multi-stage build only the LAST stage becomes the image. Any of those
-leaves the build resolving a mutable tag while the stamp claims a pinned base.
+These used to assert the same things about scripts/build_images.sh. The bash is
+gone -- `blastbox build-images` executes the declaration now -- but the failure
+modes did not go anywhere: docker silently ignores a --build-arg the Dockerfile
+does not declare, so a wrong `base_arg` pins nothing while the stamp claims a
+digest the build never used.
 
-Two design points, both learned on RedTusk before this file existed:
-
-* The (Dockerfile, base-arg) pairs are READ OUT OF THE SCRIPT rather than
-  written down here. A hand-maintained table only catches a rename on the
-  Dockerfile side; a typo in the script's own argument -- the failure this
-  guards -- sails straight through it.
-* The Dockerfile parsing is imported from blastbox, not reimplemented. A second
-  copy drifts from the one that actually gates builds.
+The generic checks live in blastbox and are tested there. What is REPO business
+is that this repo's declaration matches this repo's Dockerfiles.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
-from blastbox.host.stamp import StampError, assert_arg_selects_base
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "build_images.sh"
-TEXT = SCRIPT.read_text(encoding="utf-8")
 
-# Continuations joined the way the shell joins them, then each logical line
-# matched whole -- a two-line call otherwise swallows the next line's first word.
-LOGICAL = re.sub(r"\\\n[ \t]*", " ", TEXT)
+if TYPE_CHECKING:  # the real type, so mypy checks the attribute access below
+    from blastbox.host.images import ImageSpec
 
-_CALL = re.compile(
-    r"^[ \t]*stamp_flags[ \t]+(?P<df>\"[^\"]*\"|\S+)[ \t]+(?P<base>\"[^\"]*\"|\S+)"
-    r"(?:[ \t]+(?P<arg>[A-Za-z_]\w*))?(?:[ \t]+(?:\"[^\"]*\"|\S+))?[ \t]*$",
-    re.MULTILINE,
-)
-CALLS = [
-    (m.group("df").strip('"'), (m.group("arg") or "BASE_IMAGE"))
-    for m in _CALL.finditer(LOGICAL)
-]
+# importorskip at RUNTIME: these tests must still collect where blastbox is not
+# installed. The TYPE_CHECKING import is erased at runtime, so it cannot
+# reintroduce the hard dependency importorskip exists to avoid.
+images = pytest.importorskip("blastbox.host.images")
+
+PLAN = images.load_plan(ROOT)
+ALL = list(PLAN.images)
 
 
-def test_the_script_actually_stamps_something() -> None:
-    """If the call shape changes, every check below passes vacuously."""
-    assert CALLS, "no `stamp_flags <dockerfile> <base>` calls found in build_images.sh"
+def test_the_declaration_names_every_tier() -> None:
+    """A tier missing from the spec is a tier nothing rebuilds -- the fleet then
+    runs two versions while every tag says one."""
+    names = {i.name for i in PLAN.images}
+    assert {"titanarum-base", "titanarum-cold-worker", "titanarum"} <= names
+    assert {"titanarum-warm-gvisor", "titanarum-fc-worker"} <= names
 
 
-@pytest.mark.parametrize("dockerfile,base_arg", CALLS)
-def test_each_arg_the_script_passes_selects_that_dockerfiles_base(
-    dockerfile: str, base_arg: str
-) -> None:
-    path = ROOT / dockerfile
-    assert path.is_file(), f"build_images.sh stamps {dockerfile}, which does not exist"
-    try:
-        assert_arg_selects_base(path, base_arg)
-    except StampError as exc:
-        pytest.fail(f"build_images.sh passes --base-arg {base_arg} for {dockerfile}: {exc}")
+def test_every_image_is_built_from_this_repo() -> None:
+    """Unlike redtusk, THIS engine's warm Dockerfiles live here.
 
-
-def test_every_docker_build_is_stamped() -> None:
-    """An unstamped image is the whole problem; one must not sneak back in."""
-    builds = [
-        b.strip('"')
-        for b in re.findall(r"^[ \t]*docker build -f (\"[^\"]*\"|\S+)", LOGICAL, re.MULTILINE)
-    ]
-    stamped = {df for df, _ in CALLS}
-    assert builds, "no `docker build` lines found; this test asserts nothing"
-    assert set(builds) <= stamped, f"built but never stamped: {sorted(set(builds) - stamped)}"
-
-
-def test_a_refused_stamp_aborts_instead_of_building_unstamped() -> None:
-    """`set -e` DISCARDS the status of a `$(...)` in a command's arguments.
-
-    Left that way a refusing stamp lets the build run with no labels and no
-    --build-arg, so the worker falls back to its Dockerfile default -- a mutable
-    tag pointing at whatever stale base is on the box.
+    That distinction is the 2026-09-02 outage: the Firecracker rootfs was built
+    from inputs looked for in blastbox's tree instead of this one, the guest had
+    no /init, and every warm guest hung to the boot timeout. Pinned so nobody
+    "fixes" it by copying redtusk's spec.
     """
-    assert not re.search(r"docker build[^\n]*\$\(stamp_flags", TEXT)
-    assert "read -r -a flags" in TEXT, "stamp output must be read into an array"
-    body = re.search(r"^stamp_flags\(\) \{(.*?)^\}", TEXT, re.MULTILINE | re.DOTALL)
-    assert body, "stamp_flags is no longer a function this test can read"
-    assert re.search(r"exit\s+1", body.group(1)), "a refusing stamp must abort"
+    foreign = [i.name for i in PLAN.images if i.context != "."]
+    assert not foreign, f"built from another tree: {foreign}"
 
 
-def test_the_script_verifies_what_it_stamped() -> None:
-    assert re.search(r"^\s*blastbox stamp --read", TEXT, re.MULTILINE), (
-        "build_images.sh must read every stamp back"
-    )
-    gate = re.search(r'\[ "\$rc" -eq 0 \][^\n]*\|\|\s*\{(.*?)^\}', TEXT, re.MULTILINE | re.DOTALL)
-    assert gate, "the read-back results are no longer gated the way this test reads"
-    assert re.search(r"exit\s+1", gate.group(1)), "a failed verification must fail the build"
+@pytest.mark.parametrize("spec", ALL, ids=lambda s: str(s.name))
+def test_each_declared_base_arg_selects_that_dockerfiles_base(spec: ImageSpec) -> None:
+    """docker discards a --build-arg the Dockerfile does not declare, so the
+    build resolves its own default while the stamp claims the pinned base."""
+    from blastbox.host.stamp import StampError, assert_arg_selects_base
+
+    path = ROOT / spec.dockerfile
+    assert path.is_file(), f"the plan names {spec.dockerfile}, which does not exist"
+    try:
+        assert_arg_selects_base(path, spec.base_arg)
+    except StampError as exc:
+        pytest.fail(f"blastbox-images.toml declares base_arg={spec.base_arg}: {exc}")
 
 
-@pytest.mark.parametrize(
-    "var,dockerfile",
-    [("WORKER_BASE", "deploy/docker/Dockerfile.titanarum-base"),
-     ("HOST_BASE", "deploy/docker/Dockerfile.titanarum-host")],
-)
-def test_the_scripts_default_base_matches_the_dockerfiles_own(
-    var: str, dockerfile: str
+@pytest.mark.parametrize("spec", ALL, ids=lambda s: str(s.name))
+def test_a_declared_upstream_base_matches_the_dockerfiles_own_default(
+    spec: ImageSpec,
 ) -> None:
-    """If they drift, a plain build and a stamped build differ while both look fine."""
-    m = re.search(rf'^{var}="\$\{{{var}:-([^}}]+)\}}"', TEXT, re.MULTILINE)
-    assert m, f"{var} is no longer set the way this test reads it"
+    """The plan pins these; the Dockerfile defaults them. They must agree, or a
+    plain `docker build` and a planned build produce images on different bases
+    while both look correct."""
+    if spec.internal:  # a chain base has no upstream default to agree with
+        pytest.skip(f"{spec.name} builds on {spec.base}, which this plan builds")
     declared = re.search(
-        r"^\s*ARG\s+BASE_IMAGE=(\S+)",
-        (ROOT / dockerfile).read_text(encoding="utf-8"),
+        rf"^\s*ARG\s+{re.escape(spec.base_arg)}=(\S+)",
+        (ROOT / spec.dockerfile).read_text(encoding="utf-8"),
         re.MULTILINE,
     )
-    assert declared, f"{dockerfile} no longer defaults ARG BASE_IMAGE"
-    assert m.group(1) == declared.group(1), (
-        f"build_images.sh defaults {var}={m.group(1)!r} but {dockerfile} defaults "
-        f"ARG BASE_IMAGE={declared.group(1)!r}"
+    assert declared, f"{spec.dockerfile} no longer defaults ARG {spec.base_arg}"
+    assert spec.base == declared.group(1), (
+        f"the plan pins {spec.name} to {spec.base!r} but {spec.dockerfile} "
+        f"defaults ARG {spec.base_arg}={declared.group(1)!r}"
     )
 
 
-def test_the_warm_rootfs_comes_from_its_own_stamped_image() -> None:
-    """Each tier exports ITS OWN warm image, not the cold worker.
+def test_the_builder_stages_are_declared() -> None:
+    """titanarum-base COPIES artifacts out of both. Undeclared, they are mutable
+    tags nothing pulls, resolves or records, so an upstream push changes what
+    lands in the image while every label stays identical."""
+    base = next(i for i in PLAN.images if i.name == "titanarum-base")
+    assert {"JDK_BUILD_IMAGE", "ZXING_BUILD_IMAGE"} <= set(base.build_args)
 
-    Exporting the cold worker is not a shortcut: the Firecracker guest boots
-    /init, which execs run_guest.py against a baked guest.env, and those are
-    what deploy/firecracker/Dockerfile.titanarum adds. A bare cold-worker export
-    boots and never signals READY -- measured on toolz2, the warm base timed out
-    at 120s and every job fell back to cold while the dispatcher looked healthy.
-    """
-    export = (ROOT / "scripts" / "export_warm_rootfs.sh").read_text(encoding="utf-8")
-    assert 'GV_IMAGE="titanarum-warm:gvisor-$TAG"' in export
-    assert 'FC_IMAGE="titanarum-fc-worker:$TAG"' in export
-    assert "titanarum-cold-worker" not in export, (
-        "the rootfs must come from the warm images, not the cold worker"
+
+def test_the_firecracker_rootfs_declares_what_it_must_contain() -> None:
+    """The guest boots /init, which execs run_guest.py against a baked
+    guest.env. A rootfs without them hangs every warm guest until the boot
+    timeout -- which is exactly what happened, because nothing had written down
+    what the artifact needed."""
+    fc = [r for r in PLAN.rootfs if r.kind == "ext4"]
+    assert len(fc) == 1
+    assert {"/init", "/opt/blastbox/guest.env"} <= set(fc[0].requires)
+    # Overridable, as the script it replaces was.
+    assert fc[0].resolved_size_mib({}) == 3072
+    assert fc[0].resolved_size_mib({"ROOTFS_MIB": "4096"}) == 4096
+
+
+def test_both_rootfs_artifacts_are_declared() -> None:
+    assert {r.kind for r in PLAN.rootfs} == {"dir", "ext4"}
+
+
+def test_the_floor_matches_what_pyproject_pins() -> None:
+    """The wrapper's gate and the package's own floor must agree. Lower, and the
+    script accepts a blastbox the package refuses to install alongside."""
+    text = (ROOT / "scripts" / "build_images.sh").read_text(encoding="utf-8")
+    floor = re.search(r"^BB_MIN=(\S+)", text, re.MULTILINE)
+    assert floor, "build_images.sh no longer states a minimum the way this test reads it"
+    pins = re.findall(
+        r"blastbox(?:\[[^\]]*\])?>=(\d+\.\d+\.\d+)",
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
     )
-    assert "docker build" not in export, (
-        "the export script must not BUILD; that would bypass the stamps"
+    assert pins, "pyproject no longer pins blastbox the way this test reads it"
+    assert set(pins) == {floor.group(1)}, (
+        f"build_images.sh requires >= {floor.group(1)} but pyproject pins {sorted(set(pins))}"
     )
-
-
-def test_the_fc_export_refuses_an_image_that_cannot_boot() -> None:
-    """Belt and braces: even the right image is checked for /init."""
-    export = (ROOT / "scripts" / "export_warm_rootfs.sh").read_text(encoding="utf-8")
-    assert "-f /init" in export, "the FC export must check the image can boot"
-    assert "exit 3" in export, "the check must abort rather than warn"
-    assert export.index(">> gvisor rootfs") < export.index("-f /init"), (
-        "the /init gate must not block the gVisor export, which needs no init"
-    )
-
-
-def test_no_build_arg_the_dockerfiles_ignore() -> None:
-    """docker SILENTLY ignores an undeclared --build-arg.
-
-    titanarum's Dockerfiles declare neither BLASTBOX_VERSION nor BLASTBOX_WHEEL
-    (RedTusk's do), so passing either would look like it pinned the install
-    while doing nothing -- the class of lie this script exists to prevent.
-    """
-    script = SCRIPT.read_text(encoding="utf-8")
-    for arg in ("BLASTBOX_VERSION", "BLASTBOX_WHEEL"):
-        declared = any(
-            f"ARG {arg}" in (ROOT / "deploy" / "docker" / d).read_text(encoding="utf-8")
-            for d in ("Dockerfile.titanarum-cold-worker", "Dockerfile.titanarum-host")
-        )
-        passed = f"--build-arg \"{arg}=" in script or f"{arg}=$" in script
-        assert declared or not passed, (
-            f"the script passes {arg} but no Dockerfile declares it"
-        )

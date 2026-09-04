@@ -1,0 +1,65 @@
+# pdf-titan-arum's image chain, declared once.
+#
+# This replaces scripts/build_images.sh and scripts/export_warm_rootfs.sh.
+# Both were correct; the problem was that four engine repos each carried a
+# near-copy of the same bash and the copies had drifted -- a different ARG name
+# here, a missing pull there, a rootfs exported from an image nobody verified.
+#
+# Build and export with:
+#   blastbox build-images . --tag <tag>
+# Add --dry-run to see exactly what it would do and touch nothing.
+
+[engine]
+name = "titanarum"
+
+[[image]]
+name = "titanarum-base"
+dockerfile = "deploy/docker/Dockerfile.titanarum-base"
+base = "eclipse-temurin:25-jre"
+# Both are BUILDER stages this image copies artifacts out of. `blastbox
+# build-images` pulls and resolves each to a registry digest before the build,
+# so an upstream push cannot change what lands in the image while every
+# recorded label stays identical.
+build_args = { JDK_BUILD_IMAGE = "eclipse-temurin:25-jdk", ZXING_BUILD_IMAGE = "debian:12-slim" }
+
+[[image]]
+name = "titanarum-cold-worker"
+dockerfile = "deploy/docker/Dockerfile.titanarum-cold-worker"
+base = "titanarum-base"
+
+[[image]]
+name = "titanarum"
+dockerfile = "deploy/docker/Dockerfile.titanarum-host"
+base = "python:3.12-slim-bookworm"
+
+# The warm Dockerfiles live in THIS repo, not in blastbox -- unlike redtusk's.
+# That distinction is not cosmetic: on 2026-09-02 a cold worker image was
+# exported as this engine's Firecracker rootfs because the inputs were looked
+# for in the wrong tree. The guest then had no /init, every warm guest hung to
+# the boot timeout, and the tier stayed dead until the previous file was
+# restored by hand. Declaring them here is the record of where they come from.
+[[image]]
+name = "titanarum-warm-gvisor"
+dockerfile = "deploy/gvisor/Dockerfile.titanarum"
+base = "titanarum-cold-worker"
+
+[[image]]
+name = "titanarum-fc-worker"
+dockerfile = "deploy/firecracker/Dockerfile.titanarum"
+base = "titanarum-cold-worker"
+
+[[rootfs]]
+kind = "dir"
+image = "titanarum-warm-gvisor"
+dest = "${TITANARUM_GVISOR_DIR:-$HOME/titanarum-bb-gvisor}/rootfs"
+
+[[rootfs]]
+kind = "ext4"
+image = "titanarum-fc-worker"
+dest = "${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}/titanarum-rootfs.ext4"
+# Overridable, as the export script it replaces was: a deployment that grew
+# this deliberately must not be shrunk back by a literal in the spec.
+size_mib = "${ROOTFS_MIB:-3072}"
+# The guest boots /init, which execs run_guest.py against a baked guest.env.
+# This is the requirement nobody had written down when the tier went down.
+requires = ["/init", "/opt/blastbox/guest.env"]

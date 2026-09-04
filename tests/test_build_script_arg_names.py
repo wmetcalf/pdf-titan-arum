@@ -103,6 +103,9 @@ def test_the_firecracker_rootfs_declares_what_it_must_contain() -> None:
     fc = [r for r in PLAN.rootfs if r.kind == "ext4"]
     assert len(fc) == 1
     assert {"/init", "/opt/blastbox/guest.env"} <= set(fc[0].requires)
+    # Overridable, as the script it replaces was.
+    assert fc[0].resolved_size_mib({}) == 3072
+    assert fc[0].resolved_size_mib({"ROOTFS_MIB": "4096"}) == 4096
 
 
 def test_both_rootfs_artifacts_are_declared() -> None:

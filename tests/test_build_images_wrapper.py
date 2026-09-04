@@ -323,13 +323,13 @@ def test_a_python3_without_packaging_does_not_cause_a_false_refusal(
     assert "sort -V" in p.stderr
 
 
-@pytest.mark.parametrize("spelling", ["v0.1.35", "V0.1.35", "0.1.38rc1", "0.1.38.dev1"])
+@pytest.mark.parametrize("spelling", ["v0.1.35", "V0.1.35", f"{BB_MIN}rc1", f"{BB_MIN}.dev1"])
 def test_pep440_spellings_below_the_floor_are_refused(stub_cli: Path, spelling: str) -> None:
     """pip normalizes these; `sort -V` does not.
 
-    `v0.1.35` normalizes to the vulnerable 0.1.35, and `0.1.38rc1`/`0.1.38.dev1`
-    both predate the released floor -- yet `sort -V` orders every one of them
-    above `0.1.38` on the raw string.
+    `v0.1.35` normalizes to the vulnerable 0.1.35, and a pre-release or dev
+    build of the floor predates the released floor -- yet `sort -V` orders
+    every one of them above it on the raw string.
     """
     p = _run(stub_cli, "tagX", f"--blastbox-version={spelling}")
     assert p.returncode == 2, f"exit={p.returncode} out={p.stdout} err={p.stderr}"
@@ -337,8 +337,13 @@ def test_pep440_spellings_below_the_floor_are_refused(stub_cli: Path, spelling: 
 
 
 def test_a_v_prefixed_version_above_the_floor_is_accepted(stub_cli: Path) -> None:
-    """Refusing the `v` spelling outright would be wrong: pip accepts it."""
-    p = _run(stub_cli, "tagX", "v0.1.38", "--dry-run")
+    """Refusing the `v` spelling outright would be wrong: pip accepts it.
+
+    Derived from BB_MIN rather than written out: a hard-coded version silently
+    becomes a BELOW-the-floor case the next time the floor moves, and the test
+    then fails for a reason that has nothing to do with what it checks.
+    """
+    p = _run(stub_cli, "tagX", f"v{BB_MIN}", "--dry-run")
     assert p.returncode == 0, f"exit={p.returncode} err={p.stderr}"
 
 
@@ -359,7 +364,7 @@ def test_the_fallback_refuses_spellings_sort_v_cannot_rank(stub_cli: Path, tmp_p
     """
     env = {**os.environ, "PATH": f"{stub_cli}:{_minimal_bin(tmp_path / 'nopython')}"}
     p = subprocess.run(
-        ["bash", str(SCRIPT), "tagX", "0.1.38rc1"],
+        ["bash", str(SCRIPT), "tagX", f"{BB_MIN}rc1"],
         capture_output=True,
         text=True,
         env=env,
@@ -385,3 +390,41 @@ def test_the_fallback_still_accepts_a_v_prefixed_release(stub_cli: Path, tmp_pat
         check=False,
     )
     assert p.returncode == 0, f"exit={p.returncode} out={p.stdout} err={p.stderr}"
+
+
+def test_the_too_old_refusal_runs_nothing_and_keeps_its_text(tmp_path: Path) -> None:
+    """A refusal message must not EXECUTE part of itself.
+
+    Inside a double-quoted string bash reads backticks as command substitution,
+    so an explanation mentioning `docker build -t` ran it -- printing an
+    unrelated docker error, or `command not found`, and dropping the command
+    text out of the very sentence that needed it.
+
+    Executed rather than grepped: a source-level check for backticks would pass
+    on a string that still runs, and fail on one that legitimately quotes them.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "blastbox"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = version ]; then echo "blastbox 0.0.1"; exit 0; fi\n'
+        'printf "%s\\n" "$@"\n'
+    )
+    stub.chmod(0o755)
+    marker = tmp_path / "docker-was-run"
+    docker = bin_dir / "docker"
+    docker.write_text(f'#!/bin/sh\necho "$*" >> "{marker}"\nexit 9\n')
+    docker.chmod(0o755)
+
+    p = subprocess.run(
+        ["bash", str(SCRIPT), "tagX", "--dry-run"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        check=False,
+    )
+    assert p.returncode == 2, f"exit={p.returncode} err={p.stderr}"
+    assert "is too old" in p.stderr, p.stderr
+    assert not marker.exists(), f"the refusal ran docker: {marker.read_text()}"
+    assert "`docker build -t`" in p.stderr, p.stderr

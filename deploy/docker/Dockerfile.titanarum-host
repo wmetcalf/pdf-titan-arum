@@ -49,7 +49,7 @@ COPY pyproject.toml README.md /tmp/build/
 COPY titanarum /tmp/build/titanarum
 RUN python3 -m venv /opt/titanarum \
     && /opt/titanarum/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]==0.1.34" \
+    && /opt/titanarum/bin/pip install --no-cache-dir "blastbox[host]==0.1.35" \
     && /opt/titanarum/bin/pip install --no-cache-dir /tmp/build \
     && rm -rf /tmp/build \
     && /opt/titanarum/bin/python -c "import blastbox.host.ingress.app, titanarum.engine, titanarum.blastbox_ingress; print('host ok')"

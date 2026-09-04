@@ -137,6 +137,8 @@ public class PdfTitanArumApp implements Callable<Integer> {
     // Resource limits
     private static final long MAX_PDF_BYTES           = 500L * 1024 * 1024; // 500 MB
     private static final float MAX_DPI                = 600.0f;
+    /** The `--dpi` default, reused when a file-IPC job states no usable value. */
+    private static final float DEFAULT_DPI            = 150.0f;
     private static final long MAX_EMBEDDED_FILE_BYTES = 100L * 1024 * 1024; // 100 MB
     private static final int MAX_SCRIPT_BYTES         = 10 * 1024 * 1024;   // 10 MB
     private static final int MAX_XFA_BYTES            = 10 * 1024 * 1024;   // 10 MB
@@ -5520,6 +5522,26 @@ for (int pageNum : pagesToProcess) {
     }
 
     /** File-IPC worker mode. Announces readiness, waits for control.go, runs one job, exits. */
+    /**
+     * A render DPI this worker will accept from a {@code job.json}.
+     *
+     * <p>The CLI rejects anything outside {@code 1..MAX_DPI}, but {@code callWith} — the
+     * programmatic entry the file-IPC and pool paths use — applies no bound of its own, so an
+     * enormous DPI reaches PDFBox and allocates a gigapixel raster (OOM'ing the worker rather
+     * than failing the job). The Python adapter clamps at the producing end for exactly this
+     * reason; this is the same bound at the CONSUMING end, where it also covers a
+     * {@code job.json} written by anything else.
+     *
+     * <p>Clamped rather than rejected, to agree with the adapter: a job is not worth failing
+     * over a render setting, and the value actually used is recorded in the report. A missing
+     * or unusable value (absent field → {@code 0.0f}, negative, NaN, infinite) becomes the
+     * documented {@code --dpi} default.
+     */
+    static float boundedDpi(float requested) {
+        if (!Float.isFinite(requested) || requested <= 0.0f) return DEFAULT_DPI;
+        return Math.min(requested, MAX_DPI);
+    }
+
     private Integer runWorker(Path scratch) throws Exception {
         File controlDir = scratch.resolve("control").toFile();
         controlDir.mkdirs();
@@ -5560,7 +5582,7 @@ for (int pageNum : pagesToProcess) {
         // (e) SAME programmatic entry WorkerPool.processJob uses. callWith writes report.json
         //     (including partial reports with parseError/timedOut) into outputDir itself.
         callWith(pdfBytes, name, Paths.get(job.outputDir()),
-                 job.dpi(), pages, job.skipQr(), job.addLinkAnnotations(),
+                 boundedDpi(job.dpi()), pages, job.skipQr(), job.addLinkAnnotations(),
                  /* modifiedPdfOutput */ null, job.password());
 
         // (f) exit 0 whenever report.json was written (parseError/timedOut are surfaced by the adapter)

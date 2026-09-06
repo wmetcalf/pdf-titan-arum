@@ -534,8 +534,13 @@ def _build_payload(report: dict, artifacts: list[DeclaredArtifact],
         if art_id is None:
             continue  # can only reference a DECLARED artifact
         page_1based = _as_int(ss.get("page"), 1)
-        w = _as_float(ss.get("width") or 1, 1.0)
-        h = _as_float(ss.get("height") or 1, 1.0)
+        # No `or 1` here: it turned a NUMERIC 0 into 1 before the guard below could
+        # see it, so a report saying "this page is 0 wide" was emitted as 1 px --
+        # a fabricated dimension rather than a skipped page (codex). _as_float
+        # already returns the default for a missing or unparseable value, which is
+        # the only case the `or 1` was needed for.
+        w = _as_float(ss.get("width"), 1.0)
+        h = _as_float(ss.get("height"), 1.0)
         if w <= 0 or h <= 0:
             # skip rather than crash: contract Dimensions requires > 0
             # (matches the Hash skip-don't-crash pattern)

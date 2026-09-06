@@ -306,28 +306,37 @@ def test_a_page_with_a_non_positive_dimension_is_skipped_not_emitted(tmp_path):
     outdir = tmp_path / "out"
     report_dir = outdir / "titan"
     (report_dir / "screenshots").mkdir(parents=True)
-    for name in ("page-0001.png", "page-0002.png", "page-0003.png", "page-0004.png"):
-        (report_dir / "screenshots" / name).write_bytes(b"\x89PNG stub")
+    for i in range(1, 9):
+        (report_dir / "screenshots" / f"page-000{i}.png").write_bytes(b"\x89PNG stub")
     (report_dir / "report.json").write_text("{}")
     report = _report(screenshots=[
         {"page": 1, "path": "screenshots/page-0001.png", "width": -5, "height": 1000},
         {"page": 2, "path": "screenshots/page-0002.png", "width": 800, "height": -1},
-        # Exactly zero, and as a STRING: `ss.get("width") or 1` defaults a numeric 0
-        # to 1 before the guard sees it, but "0" is truthy and survives to _as_float
-        # as 0.0. That is the only input that separates `<= 0` from `< 0`, and
-        # without it a mutant weakening the guard to `< 0` passes.
-        {"page": 3, "path": "screenshots/page-0003.png", "width": "0", "height": 1000},
-        {"page": 4, "path": "screenshots/page-0004.png", "width": 800, "height": 1000},
+        # Numeric zero is the natural JSON form and the one that was broken: the
+        # `or 1` normalization turned it into 1 before the guard could see it, so
+        # "0 wide" was emitted as 1 px -- a fabricated dimension (codex).
+        {"page": 3, "path": "screenshots/page-0003.png", "width": 0, "height": 1000},
+        {"page": 4, "path": "screenshots/page-0004.png", "width": 800, "height": 0.0},
+        # And as a string, which took a different route to the same guard.
+        {"page": 5, "path": "screenshots/page-0005.png", "width": "0", "height": 1000},
+        # Missing still defaults to 1 and is emitted -- that is what the `or 1` was
+        # for, and _as_float already does it. BOTH dimensions get a case: with only
+        # the width one, a mutant changing the HEIGHT default to 0.0 survived.
+        {"page": 6, "path": "screenshots/page-0006.png", "height": 1000},
+        {"page": 7, "path": "screenshots/page-0007.png", "width": 800},
+        {"page": 8, "path": "screenshots/page-0008.png", "width": 800, "height": 1000},
     ])
     arts = eng._enumerate_artifacts(outdir, report_dir, report)
     payload = eng._build_payload(report, arts, outdir, report_dir)
 
     pages = [c for c in payload.children if isinstance(c, Page)]
-    assert [p.index for p in pages] == [3], (
-        "only the well-formed screenshot may become a Page; got "
+    assert [p.index for p in pages] == [5, 6, 7], (
+        "only the screenshots with usable dimensions may become Pages; got "
         f"{[(p.index, p.dims.width, p.dims.height) for p in pages]}"
     )
-    assert pages[0].dims.width == 800 and pages[0].dims.height == 1000
+    assert (pages[0].dims.width, pages[0].dims.height) == (1.0, 1000.0)   # width missing
+    assert (pages[1].dims.width, pages[1].dims.height) == (800.0, 1.0)    # height missing
+    assert (pages[2].dims.width, pages[2].dims.height) == (800.0, 1000.0)
 
 
 def test_summary_fields_drops_non_finite_dpi():

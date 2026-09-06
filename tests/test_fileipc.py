@@ -112,6 +112,33 @@ def test_run_worker_still_raises_on_nonzero_exit_without_report(tmp_path, monkey
         eng._run_worker(inp, outdir, timeout=30.0, sha256="c" * 64)
 
 
+def test_a_zero_timeout_becomes_the_default_not_an_unbounded_run(tmp_path, monkeypatch):
+    """`timeout <= 0` means "no budget was given", not "run without one".
+
+    The worker arms its cooperative and hard-halt watchdogs only when
+    timeout_seconds > 0, so passing 0 straight through would leave a hung PDF with
+    no deadline on either side -- exactly what _worker_timeouts exists to prevent.
+    Nothing tested the substitution: changing the 120.0 default to 0.0 left the
+    whole suite green.
+
+    Both directions are asserted, so this cannot pass by never reading the value.
+    """
+    seen: list[float] = []
+
+    def fake_run_worker(input_path, report_dir, *, timeout, sha256):
+        seen.append(timeout)
+
+    monkeypatch.setattr(eng, "_run_worker", fake_run_worker)
+    engine = eng.TitanArumEngine()
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    for given, expected in ((0.0, 120.0), (-1.0, 120.0), (45.0, 45.0)):
+        seen.clear()
+        engine._produce_report(pdf, tmp_path / "rep", timeout=given)
+        assert seen == [expected], f"timeout={given} was forwarded as {seen}"
+
+
 def test_env_dpi_is_clamped_finite_and_bounded(monkeypatch):
     # TITANARUM_DPI is dispatcher-forwarded (so potentially client-influenced) and worker mode
     # (callWith) does NOT re-apply the CLI's 1..MAX_DPI clamp. A huge DPI -> gigapixel raster ->

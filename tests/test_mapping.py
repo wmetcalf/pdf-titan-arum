@@ -292,6 +292,44 @@ def test_rel_for_survives_symlink_loop(tmp_path):
     assert eng._rel_for("loop", outdir, report_dir) == ""  # OSError must not propagate
 
 
+def test_a_page_with_a_non_positive_dimension_is_skipped_not_emitted(tmp_path):
+    """A screenshot whose width or height is <= 0 must not become a Page.
+
+    The contract's Dimensions requires > 0, so emitting one produces a payload the
+    consumer cannot parse -- the engine skips instead, the same skip-don't-crash
+    pattern the Hash mapping uses. Nothing tested that: disabling the guard
+    entirely (`if False:`) left the whole suite green.
+
+    The positive control is in the same test: a well-formed screenshot alongside
+    the bad one still becomes a Page, so this cannot pass by mapping nothing.
+    """
+    outdir = tmp_path / "out"
+    report_dir = outdir / "titan"
+    (report_dir / "screenshots").mkdir(parents=True)
+    for name in ("page-0001.png", "page-0002.png", "page-0003.png", "page-0004.png"):
+        (report_dir / "screenshots" / name).write_bytes(b"\x89PNG stub")
+    (report_dir / "report.json").write_text("{}")
+    report = _report(screenshots=[
+        {"page": 1, "path": "screenshots/page-0001.png", "width": -5, "height": 1000},
+        {"page": 2, "path": "screenshots/page-0002.png", "width": 800, "height": -1},
+        # Exactly zero, and as a STRING: `ss.get("width") or 1` defaults a numeric 0
+        # to 1 before the guard sees it, but "0" is truthy and survives to _as_float
+        # as 0.0. That is the only input that separates `<= 0` from `< 0`, and
+        # without it a mutant weakening the guard to `< 0` passes.
+        {"page": 3, "path": "screenshots/page-0003.png", "width": "0", "height": 1000},
+        {"page": 4, "path": "screenshots/page-0004.png", "width": 800, "height": 1000},
+    ])
+    arts = eng._enumerate_artifacts(outdir, report_dir, report)
+    payload = eng._build_payload(report, arts, outdir, report_dir)
+
+    pages = [c for c in payload.children if isinstance(c, Page)]
+    assert [p.index for p in pages] == [3], (
+        "only the well-formed screenshot may become a Page; got "
+        f"{[(p.index, p.dims.width, p.dims.height) for p in pages]}"
+    )
+    assert pages[0].dims.width == 800 and pages[0].dims.height == 1000
+
+
 def test_summary_fields_drops_non_finite_dpi():
     # _summary_fields fed report dpi straight into the Record metadata, bypassing the _as_float
     # non-finite guard the mapper applies everywhere else; a hostile dpi=Infinity would otherwise

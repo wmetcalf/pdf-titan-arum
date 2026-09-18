@@ -1,0 +1,45 @@
+# Declarative image chain for Titanarum (PDF) warm/cold tiers.
+#
+#     BLASTBOX_SRC=/home/coz/bb-v0140 \
+#     TITANARUM_FC_DIR=/home/coz/titanarum-bb-fc \
+#     blastbox build-images /home/coz/titanarum --tag <tag>      # --dry-run first
+#
+# Why: a hand-exported FC rootfs drifts from the host tier and fails SILENTLY --
+# the guest never signals READY, every warm job dies on the 300s timeout, and the
+# API keeps answering 200. The `.broken-export` file next to the live rootfs in
+# $TITANARUM_FC_DIR is what that looks like when it is caught by hand instead.
+
+[engine]
+name = "titanarum"
+
+[[image]]
+name       = "titanarum-base"
+dockerfile = "deploy/docker/Dockerfile.titanarum-base"
+base       = "eclipse-temurin:25-jre"
+context    = "."
+
+[[image]]
+name       = "titanarum"
+dockerfile = "deploy/docker/Dockerfile.titanarum-host"
+base       = "python:3.12-slim-bookworm"
+context    = "."
+
+[[image]]
+name       = "titanarum-cold-worker"
+dockerfile = "deploy/docker/Dockerfile.titanarum-cold-worker"
+base       = "titanarum-base"
+context    = "."
+
+[[image]]
+name       = "titanarum-fc-worker"
+dockerfile = "deploy/firecracker/Dockerfile.titanarum"
+base       = "titanarum-cold-worker"
+context    = "."
+build_args = { ENGINE = "titanarum.engine:TitanArumEngine" }
+
+[[rootfs]]
+kind     = "ext4"
+image    = "titanarum-fc-worker"
+dest     = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"
+size_mib = 3072
+requires = ["/init", "/opt/blastbox/run_guest.py"]

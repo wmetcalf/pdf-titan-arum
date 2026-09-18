@@ -1,6 +1,11 @@
+# Pinnable bases so `blastbox build-images` stamps the digest it actually built
+# against; without these ARGs docker silently ignores --build-arg BASE_IMAGE.
+ARG JDK_BUILD_IMAGE=eclipse-temurin:25-jdk
+ARG BASE_IMAGE=eclipse-temurin:25-jre
+
 # Base: JDK 25 + the pdf-titan-arum fat jar + fonts + a -json-capable ZXingReader.
 # Built once, reused by all tiers.
-FROM eclipse-temurin:25-jdk AS jarbuild
+FROM ${JDK_BUILD_IMAGE} AS jarbuild
 WORKDIR /build
 COPY pom.xml .
 COPY src ./src
@@ -22,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && cp "$(find /zxing/build -name ZXingReader -type f | head -1)" /ZXingReader \
  && /ZXingReader -version
 
-FROM eclipse-temurin:25-jre
+FROM ${BASE_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fontconfig fonts-dejavu-core python3-venv \
       libturbojpeg-java libheif1 \

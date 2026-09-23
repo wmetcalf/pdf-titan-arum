@@ -40,7 +40,12 @@ services:
     # `command: ["sh","-c",...]` would become `blastbox sh -c ...` (→ "invalid choice: sh").
     # Override the entrypoint to a real shell so the state-clear + `exec blastbox dispatch`
     # runs (RedTusk's host image has no ENTRYPOINT, so it didn't need this).
-    entrypoint: ["sh", "-c"]
+    # tini as PID 1 HERE TOO: this entrypoint replaces the image's, so the image's
+    # tini never runs for this service -- and this is the service that needs it most.
+    # `runsc restore` daemonizes each warm sandbox, reparenting it to PID 1; without a
+    # reaper each exited sandbox stays a zombie and `runsc delete` waits ~120s for it
+    # on every job (release=120.0 vs 0.05 with tini).
+    entrypoint: ["/usr/bin/tini", "--", "sh", "-c"]
     command: ["rm -rf /var/lib/blastbox/gvisor-snapshot /var/lib/blastbox/gvisor-base-* /var/lib/blastbox/gvisor-root 2>/dev/null; mkdir -p /var/lib/blastbox/gvisor-root; exec blastbox dispatch"]
     restart: unless-stopped
     # Aggregate memory ceiling for the warm pool (the host memory cgroup

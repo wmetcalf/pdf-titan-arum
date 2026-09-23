@@ -43,3 +43,23 @@ image    = "titanarum-fc-worker"
 dest     = "$TITANARUM_FC_DIR/titanarum-rootfs.ext4"
 size_mib = 3072
 requires = ["/init", "/opt/blastbox/run_guest.py"]
+
+# gVisor warm guest: the KVM-less C/R tier. Built from titanarum's OWN
+# deploy/gvisor/Dockerfile.titanarum (it takes ARG BASE_IMAGE, so the default
+# base_arg applies). NOTE the agent it installs -- run_warm.py and engines.py -- is
+# VENDORED from blastbox's deploy/ into this repo. Checked 2026-09-23 against 0.1.42:
+# differences are cosmetic only. A vendored agent drifts from its host exactly like a
+# hand-exported rootfs does, so re-check it on every blastbox bump.
+[[image]]
+name       = "titanarum-warm-gvisor"
+dockerfile = "deploy/gvisor/Dockerfile.titanarum"
+base       = "titanarum-cold-worker"
+context    = "."
+build_args = { ENGINE = "titanarum.engine:TitanArumEngine" }
+
+# runsc restores a DIRECTORY tree. No /init: runsc launches BLASTBOX_GVISOR_WARM_ARGV.
+[[rootfs]]
+kind     = "dir"
+image    = "titanarum-warm-gvisor"
+dest     = "$TITANARUM_GVISOR_DIR/rootfs"
+requires = ["/opt/blastbox/run_warm.py", "/opt/blastbox/engines.py", "/opt/blastbox/engine", "/in", "/out", "/ctrl"]

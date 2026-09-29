@@ -47,7 +47,7 @@ requires = ["/init", "/opt/blastbox/run_guest.py"]
 # gVisor warm guest: the KVM-less C/R tier. Built from titanarum's OWN
 # deploy/gvisor/Dockerfile.titanarum (it takes ARG BASE_IMAGE, so the default
 # base_arg applies). NOTE the agent it installs -- run_warm.py and engines.py -- is
-# VENDORED from blastbox's deploy/ into this repo. Checked 2026-09-23 against 0.1.42:
+# VENDORED from blastbox's deploy/ into this repo. Checked 2026-09-29 against 0.1.43 (unchanged since 0.1.42):
 # differences are cosmetic only. A vendored agent drifts from its host exactly like a
 # hand-exported rootfs does, so re-check it on every blastbox bump.
 [[image]]

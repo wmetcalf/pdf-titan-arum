@@ -24,7 +24,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # info` (blastbox honours DOCKER_HOST), reaching the daemon only via
 # docker-socket-proxy over TCP. No raw socket bind, no group_add needed.
 RUN apt-get update -qq \
-    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg tini \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
     && gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -q '9DC858229FC7DD38854AE2D88D81803C0EBFCD88' \
@@ -71,7 +71,13 @@ HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3 \
 # Default to serve; compose overrides `command` per service (api -> blastbox
 # serve, dispatcher -> blastbox dispatch). The `titanarum` CLI (version/
 # selftest) stays on PATH for one-shot in-process use.
-ENTRYPOINT ["blastbox"]
+# tini as PID 1, the same as the clippyshot and redtusk host images. The dispatcher's
+# `runsc restore` daemonizes every warm sandbox, which reparents it to PID 1. With
+# blastbox itself as PID 1 nothing ever wait()ed for those processes: each exited
+# sandbox stayed a zombie, `runsc delete` waited its full ~120s for a PID that still
+# "existed", and every gVisor warm job paid it in the release phase (release=120.0
+# vs 0.05 elsewhere), throttling the tier to ~2 jobs/min. tini reaps them.
+ENTRYPOINT ["/usr/bin/tini", "--", "blastbox"]
 CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]
 
 LABEL org.opencontainers.image.title="titanarum" \

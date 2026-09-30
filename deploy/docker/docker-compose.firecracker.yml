@@ -18,8 +18,9 @@
 # docker socket, no ports.
 #
 # No entrypoint override is needed here (unlike dispatcher-gvisor): titanarum's
-# host image sets `ENTRYPOINT ["blastbox"]`, so `command: ["dispatch"]` alone
-# already runs `blastbox dispatch`. This tier also needs NO pre-boot
+# host image sets `ENTRYPOINT ["/usr/bin/tini", "--", "blastbox"]`, so
+# `command: ["dispatch"]` alone already runs `blastbox dispatch`, under tini as
+# PID 1 -- which is why this service keeps the image's entrypoint. This tier also needs NO pre-boot
 # state-clear step: blastbox's SnapshotManager.build() does
 # `base_dir.mkdir(parents=True, exist_ok=True)` and the FC scratch_root
 # (default /tmp/blastbox-fc-slots) lives entirely on THIS container's own

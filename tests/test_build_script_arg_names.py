@@ -102,10 +102,35 @@ def test_the_firecracker_rootfs_declares_what_it_must_contain() -> None:
     what the artifact needed."""
     fc = [r for r in PLAN.rootfs if r.kind == "ext4"]
     assert len(fc) == 1
-    assert {"/init", "/opt/blastbox/guest.env"} <= set(fc[0].requires)
+    assert {
+        "/init",
+        "/opt/blastbox/guest.env",
+        "/opt/blastbox/run_guest.py",
+        "/opt/blastbox/engines.py",
+        "/opt/blastbox/engine",
+    } <= set(fc[0].requires)
     # Overridable, as the script it replaces was.
     assert fc[0].resolved_size_mib({}) == 3072
     assert fc[0].resolved_size_mib({"ROOTFS_MIB": "4096"}) == 4096
+
+
+def test_the_gvisor_rootfs_declares_what_it_must_contain() -> None:
+    """runsc restores a directory tree and launches BLASTBOX_GVISOR_WARM_ARGV in
+    it: the venv python3 wrapper running the vendored agent, which reads its
+    engine from a file, with /in /out /ctrl bind-mounted over directories that
+    must exist. Undeclared, an export missing any of them publishes a warm tier
+    that restores and then cannot serve -- the same shape as the FC outage."""
+    gv = [r for r in PLAN.rootfs if r.kind == "dir"]
+    assert len(gv) == 1
+    assert {
+        "/opt/titanarum/bin/python3",
+        "/opt/blastbox/run_warm.py",
+        "/opt/blastbox/engines.py",
+        "/opt/blastbox/engine",
+        "/in",
+        "/out",
+        "/ctrl",
+    } <= set(gv[0].requires)
 
 
 def test_both_rootfs_artifacts_are_declared() -> None:

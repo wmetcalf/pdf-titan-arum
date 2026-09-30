@@ -52,6 +52,25 @@ base = "titanarum-cold-worker"
 kind = "dir"
 image = "titanarum-warm-gvisor"
 dest = "${TITANARUM_GVISOR_DIR:-$HOME/titanarum-bb-gvisor}/rootfs"
+# No /init here: runsc launches BLASTBOX_GVISOR_WARM_ARGV, which is the venv
+# python3 WRAPPER running the vendored agent. The agent reads its engine from
+# /opt/blastbox/engine (docker export drops ENV), and the restored sandbox
+# bind-mounts /in /out /ctrl onto directories that must already exist. Any of
+# these missing means a dispatcher that restores a sandbox which cannot serve.
+#
+# run_warm.py and engines.py are VENDORED from blastbox's deploy/ (gvisor/ and
+# firecracker/ respectively). Checked against blastbox 0.1.43: differences are
+# formatting and docstring naming only. Re-check them on every blastbox bump --
+# a vendored agent drifts from its host exactly like a hand-exported rootfs.
+requires = [
+    "/opt/titanarum/bin/python3",
+    "/opt/blastbox/run_warm.py",
+    "/opt/blastbox/engines.py",
+    "/opt/blastbox/engine",
+    "/in",
+    "/out",
+    "/ctrl",
+]
 
 [[rootfs]]
 kind = "ext4"
@@ -60,6 +79,15 @@ dest = "${TITANARUM_FC_DIR:-$HOME/titanarum-bb-fc}/titanarum-rootfs.ext4"
 # Overridable, as the export script it replaces was: a deployment that grew
 # this deliberately must not be shrunk back by a literal in the spec.
 size_mib = "${ROOTFS_MIB:-3072}"
-# The guest boots /init, which execs run_guest.py against a baked guest.env.
-# This is the requirement nobody had written down when the tier went down.
-requires = ["/init", "/opt/blastbox/guest.env"]
+# The guest boots /init, which execs run_guest.py against a baked guest.env;
+# run_guest.py imports the vendored engines.py and reads /opt/blastbox/engine. This is the
+# requirement nobody had written down when the tier went down.
+requires = [
+    "/init",
+    "/opt/blastbox/guest.env",
+    "/opt/blastbox/run_guest.py",
+    "/opt/blastbox/engines.py",
+    # Without it run_guest.py falls back to BLASTBOX_FC_ENGINE, then to the
+    # "probe" example engine: a guest that boots and answers, but not as titanarum.
+    "/opt/blastbox/engine",
+]

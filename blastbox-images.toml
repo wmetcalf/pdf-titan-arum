@@ -59,7 +59,7 @@ dest = "${TITANARUM_GVISOR_DIR:-$HOME/titanarum-bb-gvisor}/rootfs"
 # these missing means a dispatcher that restores a sandbox which cannot serve.
 #
 # run_warm.py and engines.py are VENDORED from blastbox's deploy/ (gvisor/ and
-# firecracker/ respectively). Checked against blastbox 0.1.43: differences are
+# firecracker/ respectively). Checked against blastbox 0.1.45: differences are
 # formatting and docstring naming only. Re-check them on every blastbox bump --
 # a vendored agent drifts from its host exactly like a hand-exported rootfs.
 requires = [

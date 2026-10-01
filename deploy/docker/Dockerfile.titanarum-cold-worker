@@ -11,7 +11,7 @@ USER root
 # said 0.1.33 for three releases while the pip line said otherwise.
 COPY pyproject.toml README.md /src/titanarum/
 COPY titanarum /src/titanarum/titanarum
-RUN /opt/titanarum/bin/pip install --no-cache-dir "blastbox==0.1.43" \
+RUN /opt/titanarum/bin/pip install --no-cache-dir "blastbox==0.1.45" \
  && /opt/titanarum/bin/pip install --no-cache-dir /src/titanarum \
  && rm -rf /src \
  && /opt/titanarum/bin/python -c "import blastbox.worker.cold, titanarum.engine; print('cold ok')"

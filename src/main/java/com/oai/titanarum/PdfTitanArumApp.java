@@ -2795,6 +2795,13 @@ for (int pageNum : pagesToProcess) {
                 pages.add(pageCount);
             }
         }
+        // An explicit selection is held to the same ceiling as "all": every selected page costs a
+        // screenshot, a page PDF and its URL crops, so a range must not bypass MAX_PAGES_ALL.
+        if (pages.size() > MAX_PAGES_ALL) {
+            System.err.println("WARNING: --pages selection capped at " + MAX_PAGES_ALL
+                + " of " + pages.size() + " selected pages");
+            return new ArrayList<>(new ArrayList<>(pages).subList(0, MAX_PAGES_ALL));
+        }
         return new ArrayList<>(pages);
     }
 

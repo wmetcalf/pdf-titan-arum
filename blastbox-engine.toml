@@ -67,9 +67,9 @@ description = "url-pNNNN-NNNN.png crop of a page screenshot around each URL hit.
 id = "titan_pages_*"
 path = "titan/pages/*"
 kind = "page_pdf"
-max_count = 0
+max_count = 1000
 role = "page_pdf"
-description = "One single-page PDF exported per processed page (skip_page_export turns it off)."
+description = "One single-page PDF exported per processed page (skip_page_export turns it off). The page selection is capped at MAX_PAGES_ALL = 1000."
 
 [[artifacts]]
 id = "titan_scripts_*"
@@ -124,20 +124,23 @@ description = "Catch-all: any other file under titan/ (top level, or an unrecogn
 
 [payload]
 # Root: EmbeddedResource(depth 0, content_type application/pdf) whose metadata Record carries the
-# _summary_fields() triage summary (input_pdf, document_sha256, generated_at, page_count,
-# blank_page_count, revision_count, dpi, optional pdf_object_hash/file_magic/doc_*/n_*). Children:
+# _summary_fields() triage summary (schema_version, input_pdf, document_sha256, generated_at,
+# page_count, blank_page_count, revision_count, dpi, pdf_object_hash, file_magic, doc_*, n_*). Children:
 # one EmbeddedResource per embedded file (depth 1, metadata Record) and one Page per declared
 # screenshot (0-based index, px dims, ArtifactRef image, sha256/phash/dhash/colorhash hashes,
 # optional ExtractedText OCR child).
 root = "embedded_resource"
 node_types = ["embedded_resource", "page", "extracted_text", "record"]
-# Checked on the root EmbeddedResource's metadata Record: _summary_fields() sets these seven on
-# every result (defaults ""/0/0.0 when the report omits them). pdf_object_hash, file_magic,
-# doc_* and n_* are conditional. No schema_version: the summary carries none.
-required_root_fields = ["input_pdf", "document_sha256", "generated_at", "page_count", "blank_page_count", "revision_count", "dpi"]
+# Checked on the root EmbeddedResource's metadata Record: _summary_fields() sets every one of
+# these on every result. The first seven are required by the report schema (schema.py); the
+# rest are "" / 0 when the report has nothing, never absent. schema_version is
+# engine.SUMMARY_SCHEMA_VERSION.
+required_root_fields = ["schema_version", "input_pdf", "document_sha256", "generated_at", "page_count", "blank_page_count", "revision_count", "dpi", "pdf_object_hash", "file_magic", "doc_pdf_version", "doc_title", "doc_author", "doc_producer", "doc_creator", "n_urls", "n_javascript", "n_launch_actions", "n_actions", "n_embedded_files", "n_js_indicators", "n_structural_anomalies", "n_stream_length_anomalies", "n_metadata_spoofing_indicators", "n_form_fields", "n_tables"]
+schema_version = "1"
 
 # --- findings: every one is a warnings[] entry; codes are fixed strings or a fixed prefix plus
-# --- the JVM report's own type string -----------------------------------------------------
+# --- the JVM report's own type string. warnings[] lists them in the order below (severity,
+# --- high -> info), after parse_error / timed_out ---------------------------------------------
 [[detections]]
 code = "js_indicator.*"
 severity = "high"
@@ -213,41 +216,25 @@ description = "The JVM watchdog fired; the report is partial."
 [[detections]]
 code = "warnings_truncated"
 severity = "info"
-source = "warnings[].code == 'warnings_truncated' (the 200-entry warning cap)"
-description = "Findings after the 200th were dropped from warnings[] (they remain in report.json)."
+source = "warnings[].code == 'warnings_truncated' (last entry, when the 200-entry warning cap was hit)"
+description = "Over the cap, every non-empty finding family keeps at least one entry and the remaining slots go in severity order; the dropped findings remain in report.json."
 
 # --- gaps ------------------------------------------------------------------------------------
 [[gaps]]
 id = "findings-are-warnings"
-description = "Every finding is a blastbox Warning: no severity, no confidence, no structured fields (object number, page, offset survive only inside the free-text message), and the code suffix is whatever string the JVM put in report.*[].type, never enumerated or validated by schema.py (array items are bare objects)."
-
-[[gaps]]
-id = "warning-cap-hides-findings"
-description = "_build_warnings stops at 200 entries in a fixed order (jsIndicators first, embedded_mismatch last), so a PDF with many form fields or JS hits can push later families (hidden_layer, url_flag, embedded_mismatch) out of the envelope entirely; only report.json keeps them."
+description = "Every finding is a blastbox Warning: no severity, no confidence, no structured fields (object number, page, offset survive only inside the free-text message), and the code suffix is whatever string the JVM put in report.*[].type, never enumerated or validated by schema.py (array items are bare objects). Left: severity/confidence/structured fields need a blastbox Warning (or typed finding node) change; the per-code severities live in [[detections]] here."
 
 [[gaps]]
 id = "payload-omits-report"
-description = "The payload carries only a counts summary, embedded-file nodes and screenshot Pages. URLs, page text, phone numbers, emails, tables, scripts, actions, revisions and resource images exist only in titan/report.json, which a consumer must fetch and parse itself."
-
-[[gaps]]
-id = "root-fields-unversioned"
-description = "The seven always-present summary fields are required, but the summary has no schema/version field, and the optional pdf_object_hash/file_magic/doc_*/n_* fields appear only when non-empty, so their absence cannot be told apart from a zero or missing report value. The defaults (\"\"/0/0.0) also mask a report that omitted a field."
+description = "The payload carries only a counts summary, embedded-file nodes and screenshot Pages. URLs, page text, phone numbers, emails, tables, scripts, actions, revisions and resource images exist only in titan/report.json, which a consumer must fetch and parse itself. Left: Loadout reads these from report.json today; duplicating them as typed nodes is a payload-budget design decision."
 
 [[gaps]]
 id = "artifact-counts-uncapped"
-description = "Only the image budget (screenshots + images, TITANARUM_MAX_IMAGES_EXTRACTED, default 2000) bounds a count. An explicit TITANARUM_PAGES range is clamped to the document, not to MAX_PAGES_ALL, so screenshots/page PDFs/url crops scale with page count; attachments, scripts, XFA and launch-action files have no count cap. No family but scripts/xfa/attachments/original image bytes has a byte cap, and report.json has none."
+description = "Only the image budget (screenshots + images, TITANARUM_MAX_IMAGES_EXTRACTED, default 2000) and the page selection (MAX_PAGES_ALL = 1000, for 'all' and explicit ranges alike) bound a count. Attachments, scripts, XFA and launch-action files have no count cap; no family but scripts/xfa/attachments/original image bytes has a byte cap, and report.json has none. Left for an owner decision on the cap values (Loadout's tighter limits are being fixed consumer-side)."
 
 [[gaps]]
 id = "revision-renders-not-pages"
-description = "Revision screenshots (titan/revisions/rev-NNN/) are declared kind=revision and never become Page nodes, so their dimensions, hashes and page numbers are only in report.json."
-
-[[gaps]]
-id = "reconstruct-drops-families"
-description = "On the gVisor stale-readdir fallback (_reconstruct_artifacts_from_report) url_crops, launch_actions, revisions and the original-bytes image files are not re-declared, so the same PDF can declare fewer artifacts on that path."
-
-[[gaps]]
-id = "detected-is-constant"
-description = "envelope.detected.label is the first ';' field of report.fileMagic (else 'pdf') at confidence 1.0, and fileMagic is the header line, so the label is e.g. '%PDF-1.6' (a version marker, not a type name) and detected.mime is that same string, not a MIME type."
+description = "Revision screenshots (titan/revisions/rev-NNN/) are declared kind=revision and never become Page nodes, so their dimensions, hashes and page numbers are only in report.json. Left: emitting them as Page nodes would collide with the current-revision page indices (Loadout refuses a duplicate page index); needs a representation decision."
 
 [[gaps]]
 id = "loadout-ignores-findings"

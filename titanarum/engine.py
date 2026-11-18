@@ -374,26 +374,33 @@ def _safe_artifact_id(rel_path: str, used: set[str]) -> str:
     return cand
 
 
+_KIND_BY_DIR = {
+    "screenshots": "screenshot", "pages": "page_pdf", "scripts": "script",
+    "xfa": "xfa", "attachments": "embedded_file", "images_rendered": "image",
+    "images_resources": "image", "url_crops": "url_crop",
+    "launch_actions": "launch_action", "revisions": "revision",
+}
+
+
+def _kind_for(fp: Path, report_dir: Path) -> str:
+    """Artifact kind from the file's top-level subdirectory under report_dir (one rule for the
+    directory listing and the report-driven reconstruction, so both declare the same kinds)."""
+    if fp.name == "report.json" and fp.parent == report_dir:
+        return "report"
+    top = fp.relative_to(report_dir).parts
+    return _KIND_BY_DIR.get(top[0], "file") if len(top) > 1 else "file"
+
+
 def _enumerate_artifacts(outdir: Path, report_dir: Path,
                          report: dict) -> list[DeclaredArtifact]:
     """Declare every regular file under report_dir. report.json -> kind='report'."""
-    kind_by_dir = {
-        "screenshots": "screenshot", "pages": "page_pdf", "scripts": "script",
-        "xfa": "xfa", "attachments": "embedded_file", "images_rendered": "image",
-        "images_resources": "image", "url_crops": "url_crop",
-        "launch_actions": "launch_action", "revisions": "revision",
-    }
     used: set[str] = set()
     arts: list[DeclaredArtifact] = []
 
     def _declare(fp: Path) -> DeclaredArtifact:
         rel = fp.relative_to(outdir).as_posix()
-        if fp.name == "report.json" and fp.parent == report_dir:
-            kind = "report"
-        else:
-            top = fp.relative_to(report_dir).parts
-            kind = kind_by_dir.get(top[0], "file") if len(top) > 1 else "file"
-        return DeclaredArtifact(id=_safe_artifact_id(rel, used), path=rel, kind=kind)
+        return DeclaredArtifact(id=_safe_artifact_id(rel, used), path=rel,
+                                kind=_kind_for(fp, report_dir))
 
     listed = sorted(p for p in report_dir.rglob("*") if p.is_file())
     for fp in listed:
@@ -413,48 +420,84 @@ def _reconstruct_artifacts_from_report(outdir: Path, report_dir: Path,
     rel_report = (report_dir / "report.json").relative_to(outdir).as_posix()
     arts.append(DeclaredArtifact(id=_safe_artifact_id(rel_report, used),
                                  path=rel_report, kind="report"))
-    field_kind = [
-        ("screenshots", "path", "screenshot"), ("pagePdfs", "path", "page_pdf"),
-        ("javascript", "file", "script"), ("xfaScripts", "file", "xfa"),
-        ("embeddedFiles", "file", "embedded_file"),
-        ("renderedImages", "path", "image"), ("resourceImages", "path", "image"),
-    ]
-    for arr_key, field, kind in field_kind:
-        for hit in report.get(arr_key, []) or []:
-            val = hit.get(field)
-            # val is attacker-controlled: a non-string (int/list/dict from a hostile report)
-            # would make `report_dir / val` below raise TypeError. Require a non-empty string.
-            if not isinstance(val, str) or not val:
-                continue
-            # val is attacker-controlled PDF content (embeddedFiles[].file,
-            # screenshot/image paths, etc.) - confine fp to report_dir. An
-            # absolute value or one containing ".." must never escape, and
-            # relative_to() must never be allowed to throw.
-            fp = report_dir / val
-            # resolve() itself can throw on a hostile value (e.g. an embedded NUL ->
-            # ValueError 'embedded null byte'); _rel_for guards its resolve() the same way.
-            try:
-                resolved = fp.resolve()
-            except (ValueError, OSError, RuntimeError):
-                # embedded NUL -> ValueError; symlink loop -> RuntimeError (3.12) / OSError ELOOP.
-                continue
-            if not resolved.is_relative_to(report_dir.resolve()):
-                continue
-            # Derive the artifact path from the RESOLVED path, not the raw fp: a hostile value with
-            # a leading ".." can resolve INSIDE report_dir yet not be lexically under outdir, and
-            # fp.relative_to(outdir) on that raw path raises ValueError (matches _rel_for, which
-            # also resolves first). resolved is confined to report_dir, so this can never throw.
-            if resolved.is_file():
-                rel = resolved.relative_to(outdir.resolve()).as_posix()
-                arts.append(DeclaredArtifact(id=_safe_artifact_id(rel, used),
-                                             path=rel, kind=kind))
+    seen: set[str] = {rel_report}
+    for val in _report_file_refs(report):
+        # val is attacker-controlled: a non-string (int/list/dict from a hostile report)
+        # would make `report_dir / val` below raise TypeError. Require a non-empty string.
+        if not isinstance(val, str) or not val:
+            continue
+        # val is attacker-controlled PDF content (embeddedFiles[].file,
+        # screenshot/image paths, etc.) - confine fp to report_dir. An
+        # absolute value or one containing ".." must never escape, and
+        # relative_to() must never be allowed to throw.
+        fp = report_dir / val
+        # resolve() itself can throw on a hostile value (e.g. an embedded NUL ->
+        # ValueError 'embedded null byte'); _rel_for guards its resolve() the same way.
+        try:
+            resolved = fp.resolve()
+        except (ValueError, OSError, RuntimeError):
+            # embedded NUL -> ValueError; symlink loop -> RuntimeError (3.12) / OSError ELOOP.
+            continue
+        if not resolved.is_relative_to(report_dir.resolve()):
+            continue
+        # Derive the artifact path from the RESOLVED path, not the raw fp: a hostile value with
+        # a leading ".." can resolve INSIDE report_dir yet not be lexically under outdir, and
+        # fp.relative_to(outdir) on that raw path raises ValueError (matches _rel_for, which
+        # also resolves first). resolved is confined to report_dir, so this can never throw.
+        if resolved.is_file():
+            rel = resolved.relative_to(outdir.resolve()).as_posix()
+            if rel in seen:
+                continue  # e.g. several URL hits share one crop
+            seen.add(rel)
+            arts.append(DeclaredArtifact(id=_safe_artifact_id(rel, used), path=rel,
+                                         kind=_kind_for(resolved, report_dir.resolve())))
     return arts
 
 
+# Every report field that names a file the JVM wrote under report_dir: (array, field).
+_FILE_REF_FIELDS: tuple[tuple[str, str], ...] = (
+    ("screenshots", "path"), ("pagePdfs", "path"), ("javascript", "file"),
+    ("xfaScripts", "file"), ("embeddedFiles", "file"), ("renderedImages", "path"),
+    ("renderedImages", "originalPath"), ("resourceImages", "path"),
+    ("resourceImages", "originalPath"), ("urls", "cropPath"), ("launchActions", "artifact"),
+)
+
+
+def _report_file_refs(report: dict) -> list[Any]:
+    """Raw (untrusted, unvalidated) file references from the report, including the revision
+    renders (revisions[].screenshots[].path) and their URL crops (revisions[].urls[].cropPath)."""
+    out: list[Any] = []
+
+    def _collect(container: Any, arr_key: str, field: str) -> None:
+        items = container.get(arr_key) if isinstance(container, dict) else None
+        for hit in items if isinstance(items, list) else []:
+            if isinstance(hit, dict):
+                out.append(hit.get(field))
+
+    for arr_key, field in _FILE_REF_FIELDS:
+        _collect(report, arr_key, field)
+    revisions = report.get("revisions")
+    for rev in revisions if isinstance(revisions, list) else []:
+        _collect(rev, "screenshots", "path")
+        _collect(rev, "urls", "cropPath")
+    return out
+
+
+# Version of the root summary Record below. Bump on a breaking change to its fields; the engine
+# contract pins it (payload.schema_version).
+SUMMARY_SCHEMA_VERSION = "1"
+
+
 def _summary_fields(report: dict) -> dict[str, Any]:
-    """Compact, metadata-budget-safe summary (NOT the whole report)."""
+    """Compact, metadata-budget-safe summary (NOT the whole report).
+
+    Every key is always present (""/0 when the report has nothing), so a consumer can tell a
+    zero from a missing field and the contract can require them all."""
     di = report.get("documentInfo") or {}
+    if not isinstance(di, dict):
+        di = {}
     fields: dict[str, Any] = {
+        "schema_version": SUMMARY_SCHEMA_VERSION,
         "input_pdf": report.get("inputPdf", ""),
         "document_sha256": report.get("documentSha256", ""),
         "generated_at": report.get("generatedAt", ""),
@@ -463,21 +506,20 @@ def _summary_fields(report: dict) -> dict[str, Any]:
         "revision_count": report.get("revisionCount", 0),
         "dpi": _as_float(report.get("dpi"), 0.0),  # finite-guard: dpi is only root-typed as number
     }
-    if report.get("pdfObjectHash"):
-        fields["pdf_object_hash"] = report["pdfObjectHash"]
-    if report.get("fileMagic"):
-        fields["file_magic"] = report["fileMagic"]
-    for k in ("pdfVersion", "title", "author", "producer", "creator"):
-        if di.get(k):
-            fields[f"doc_{_snake(k)}"] = str(di[k])[:255]
+    fields["pdf_object_hash"] = _as_str(report.get("pdfObjectHash"))
+    fields["file_magic"] = _as_str(report.get("fileMagic"))[:255]
+    for k in SUMMARY_DOC_FIELDS:
+        fields[f"doc_{_snake(k)}"] = str(di[k])[:255] if di.get(k) else ""
     # counts of high-signal arrays (cheap triage)
-    for arr in ("urls", "javascript", "launchActions", "actions", "embeddedFiles",
-                "jsIndicators", "structuralAnomalies", "streamLengthAnomalies",
-                "metadataSpoofingIndicators", "formFields", "tables"):
-        n = len(report.get(arr, []) or [])
-        if n:
-            fields[f"n_{_snake(arr)}"] = n
+    for arr in SUMMARY_COUNTED_ARRAYS:
+        fields[f"n_{_snake(arr)}"] = len(report.get(arr, []) or [])
     return fields
+
+
+SUMMARY_DOC_FIELDS = ("pdfVersion", "title", "author", "producer", "creator")
+SUMMARY_COUNTED_ARRAYS = ("urls", "javascript", "launchActions", "actions", "embeddedFiles",
+                          "jsIndicators", "structuralAnomalies", "streamLengthAnomalies",
+                          "metadataSpoofingIndicators", "formFields", "tables")
 
 
 def _snake(camel: str) -> str:
@@ -617,13 +659,14 @@ def _rel_for(path_value: str | None, outdir: Path, report_dir: Path) -> str:
 
 
 def _build_detection(report: dict) -> Detection:
-    magic = (report.get("fileMagic") or "").split(";")[0].strip()
-    label = (magic or "pdf")[:64]
-    return Detection(
-        label=label,
-        mime=(report.get("fileMagic") or "application/pdf")[:255],
-        confidence=1.0,
-        source="titanarum")
+    """A type classification: the JVM's fileMagic is the header line ('%PDF-1.6') for a PDF and a
+    descriptive name ('Zip archive (...)') otherwise. The version stays in root field
+    file_magic; the detection says only whether this is a PDF."""
+    if _as_str(report.get("fileMagic")).startswith("%PDF"):
+        return Detection(label="pdf", mime="application/pdf", confidence=1.0,
+                         source="titanarum")
+    return Detection(label="unknown", mime="application/octet-stream", confidence=0.0,
+                     source="titanarum")
 
 
 def _clip(s: Any, n: int) -> str:
@@ -643,17 +686,7 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
                                f"partial results after {report.get('timedOutAfterMs')} ms",
                                2000)))
 
-    def _emit(items, make):
-        for it in items or []:
-            # Reserve the last slot for the truncation marker itself, so the
-            # total (items + marker) never exceeds `cap`.
-            if len(warns) >= max(cap - 1, 0):
-                warns.append(Warning(code="warnings_truncated",
-                                     message=f"warning list capped at {cap}"))
-                return True
-            warns.append(make(it))
-        return False
-
+    # Families in severity order (high -> info, matching blastbox-engine.toml [[detections]]).
     seqs = [
         (report.get("jsIndicators"),
          lambda i: Warning(code=_clip(f"js_indicator.{i.get('type','')}", 64),
@@ -667,19 +700,10 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
          lambda i: Warning(code=_clip(f"action.{i.get('type','')}", 64),
                            message=_clip(i.get("target") or i.get("submitUrl")
                                          or i.get("remoteFile") or "", 2000))),
-        (report.get("streamLengthAnomalies"),
-         lambda i: Warning(code=_clip(f"stream_anomaly.{i.get('anomalyType','')}", 64),
-                           message=_clip(f"obj={i.get('objectNumber')} "
-                                         f"delta={i.get('delta')}", 2000))),
-        (report.get("structuralAnomalies"),
-         lambda i: Warning(code=_clip(f"structural.{i.get('type','')}", 64),
-                           message=_clip(i.get("detail", ""), 2000))),
-        (report.get("metadataSpoofingIndicators"),
-         lambda i: Warning(code=_clip(f"metadata_spoof.{i.get('type','')}", 64),
-                           message=_clip(i.get("detail", ""), 2000))),
-        (report.get("formFields"),
-         lambda i: Warning(code="form_field",
-                           message=_clip(f"{i.get('name','')} {i.get('flags',[])}", 2000))),
+        ([e for e in (report.get("embeddedFiles") or []) if e.get("mimeTypeMismatch")],
+         lambda i: Warning(code="embedded_mismatch",
+                           message=_clip(f"{i.get('originalName','')}: "
+                                         f"{i.get('mimeTypeMismatch','')}", 2000))),
         ([o for o in (report.get("ocgLayers") or []) if o.get("suspicious")],
          lambda i: Warning(code="hidden_layer",
                            message=_clip(f"{i.get('name','')} "
@@ -687,14 +711,43 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
         ([u for u in (report.get("urls") or []) if u.get("flags")],
          lambda i: Warning(code="url_flag",
                            message=_clip(f"{i.get('url','')} {i.get('flags',[])}", 2000))),
-        ([e for e in (report.get("embeddedFiles") or []) if e.get("mimeTypeMismatch")],
-         lambda i: Warning(code="embedded_mismatch",
-                           message=_clip(f"{i.get('originalName','')}: "
-                                         f"{i.get('mimeTypeMismatch','')}", 2000))),
+        (report.get("metadataSpoofingIndicators"),
+         lambda i: Warning(code=_clip(f"metadata_spoof.{i.get('type','')}", 64),
+                           message=_clip(i.get("detail", ""), 2000))),
+        (report.get("structuralAnomalies"),
+         lambda i: Warning(code=_clip(f"structural.{i.get('type','')}", 64),
+                           message=_clip(i.get("detail", ""), 2000))),
+        (report.get("streamLengthAnomalies"),
+         lambda i: Warning(code=_clip(f"stream_anomaly.{i.get('anomalyType','')}", 64),
+                           message=_clip(f"obj={i.get('objectNumber')} "
+                                         f"delta={i.get('delta')}", 2000))),
+        (report.get("formFields"),
+         lambda i: Warning(code="form_field",
+                           message=_clip(f"{i.get('name','')} {i.get('flags',[])}", 2000))),
     ]
-    for items, make in seqs:
-        if _emit(items, make):
-            break
+    families = [(list(items or []), make) for items, make in seqs]
+    total = sum(len(items) for items, _ in families)
+    if len(warns) + total <= cap:
+        for items, make in families:
+            warns.extend(make(it) for it in items)
+        return warns
+
+    # Over budget. Reserve the last slot for the truncation marker so items + marker never
+    # exceed `cap`; give every non-empty family one slot first (in severity order) so a flood
+    # of one family can never hide another, then fill what is left in severity order.
+    slots = max(cap - 1 - len(warns), 0)
+    quota = [0] * len(families)
+    for i, (items, _) in enumerate(families):
+        if items and slots:
+            quota[i], slots = 1, slots - 1
+    for i, (items, _) in enumerate(families):
+        extra = min(len(items) - quota[i], slots)
+        if extra > 0:
+            quota[i], slots = quota[i] + extra, slots - extra
+    for (items, make), n in zip(families, quota, strict=True):
+        warns.extend(make(it) for it in items[:n])
+    if cap > 0:
+        warns.append(Warning(code="warnings_truncated", message=f"warning list capped at {cap}"))
     return warns
 
 

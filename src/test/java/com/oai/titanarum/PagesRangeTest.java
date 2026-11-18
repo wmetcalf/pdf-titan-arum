@@ -41,4 +41,15 @@ class PagesRangeTest {
     void normalRangeUnaffected() throws Exception {
         assertEquals(List.of(2, 3, 4), compute("2-4", 10));
     }
+
+    @Test
+    void explicitRangeIsCappedLikeAll() throws Exception {
+        // "all" stops at MAX_PAGES_ALL (1000); an explicit range over a bigger document must not
+        // bypass that cap (every selected page yields a screenshot, page PDF and URL crops).
+        List<Integer> pages = compute("1-5000", 5000);
+        assertEquals(1000, pages.size());
+        assertEquals(1, pages.get(0));
+        assertEquals(1000, pages.get(999));
+        assertEquals(1000, compute("all", 5000).size());
+    }
 }

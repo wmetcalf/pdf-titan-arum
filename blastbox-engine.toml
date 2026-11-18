@@ -1,0 +1,272 @@
+schema = "blastbox-engine-contract/1"
+
+# The `titanarum` engine (titanarum/engine.py:TitanArumEngine). detonate() hands one job to the
+# pdf-titan-arum JVM worker (cold, or the warmup() pre-booted JVM), which writes everything under
+# <outdir>/titan/; _enumerate_artifacts() then declares EVERY regular file found there, with the
+# kind taken from its top-level subdirectory. Artifact ids are the outdir-relative path with every
+# character outside [A-Za-z0-9._-] replaced by "_" (so titan/screenshots/page-0001.png ->
+# titan_screenshots_page-0001.png), truncated to 120 chars, with _N appended on a collision.
+#
+# max_count: 2000 is the JVM's per-document image budget (TITANARUM_MAX_IMAGES_EXTRACTED, default
+# 2000, shared by screenshots, revision screenshots and extracted images). 100000 marks a family
+# the engine does NOT cap at all (see gap artifact-counts-uncapped); it is not a real limit.
+
+[engine]
+name = "titanarum"
+formats = ["pdf"]
+network = ["none"]
+# detonate() returns ok or rejected (encrypted / wrong password / not a PDF, from parseError).
+# A worker crash, a missing report.json or a report failing schema.validate_report raises, which
+# the harness seals as engine_error. No input-size cap on this path: the JVM's 500 MB MAX_PDF_BYTES
+# guards only its CLI entry, not the --run job the engine uses.
+statuses = ["ok", "rejected", "engine_error"]
+
+[[artifacts]]
+id = "titan_report.json"
+path = "titan/report.json"
+kind = "report"
+required = true
+max_count = 1
+role = "report"
+description = "The JVM worker's full forensic report (schema-validated by titanarum/schema.py). Not size-capped."
+
+[[artifacts]]
+id = "titan_screenshots_*"
+path = "titan/screenshots/*"
+kind = "screenshot"
+max_count = 2000
+role = "page_render"
+description = "page-NNNN.png per processed page (default selection: pages 1-4 + last). Referenced by payload Page.image."
+
+[[artifacts]]
+id = "titan_images_*-original*"
+path = "titan/images_*/*-original.*"
+kind = "image"
+max_count = 2000
+max_bytes = 104857600
+role = "image_original_bytes"
+description = "The original encoded codestream of a JPEG (.jpg), JPEG2000 (.jpx) or JBIG2 (.jb2) image XObject, beside its PNG decode. Capped at MAX_EMBEDDED_FILE_BYTES."
+
+[[artifacts]]
+id = "titan_images_*"
+path = "titan/images_*/*"
+kind = "image"
+max_count = 2000
+role = "image"
+description = "PNG decode of each drawn (images_rendered/) or resource (images_resources/) image XObject. skip_images turns it off."
+
+[[artifacts]]
+id = "titan_url_crops_*"
+path = "titan/url_crops/*"
+kind = "url_crop"
+max_count = 100000
+role = "url_crop"
+description = "url-pNNNN-NNNN.png crop of a page screenshot around each URL hit."
+
+[[artifacts]]
+id = "titan_pages_*"
+path = "titan/pages/*"
+kind = "page_pdf"
+max_count = 100000
+role = "page_pdf"
+description = "One single-page PDF exported per processed page (skip_page_export turns it off)."
+
+[[artifacts]]
+id = "titan_scripts_*"
+path = "titan/scripts/*"
+kind = "script"
+max_count = 100000
+max_bytes = 10485760
+role = "javascript"
+description = "Each JavaScript action/name-tree/form-field script, truncated at MAX_SCRIPT_BYTES."
+
+[[artifacts]]
+id = "titan_xfa_*"
+path = "titan/xfa/*"
+kind = "xfa"
+max_count = 100000
+max_bytes = 10485760
+role = "xfa"
+description = "XFA form packet/scripts; packets over MAX_XFA_BYTES are not written."
+
+[[artifacts]]
+id = "titan_attachments_*"
+path = "titan/attachments/*"
+kind = "embedded_file"
+max_count = 100000
+max_bytes = 104857600
+role = "embedded_file"
+description = "Each embedded file / attachment, bounded-copied at MAX_EMBEDDED_FILE_BYTES."
+
+[[artifacts]]
+id = "titan_launch_actions_*"
+path = "titan/launch_actions/*"
+kind = "launch_action"
+max_count = 100000
+role = "launch_action"
+description = "Material written for a /Launch action."
+
+[[artifacts]]
+id = "titan_revisions_*"
+path = "titan/revisions/*"
+kind = "revision"
+max_count = 100000
+role = "revision_render"
+description = "rev-NNN/page-NNNN.png and rev-NNN/url_crops/*.png for up to 5 earlier incremental-update revisions."
+
+[[artifacts]]
+id = "titan_*"
+path = "titan/*"
+kind = "file"
+max_count = 100000
+role = "other"
+description = "Catch-all: any other file under titan/ (top level, or an unrecognised subdirectory) is declared kind=file. None is expected from the --run path."
+
+[payload]
+# Root: EmbeddedResource(depth 0, content_type application/pdf) whose metadata Record carries the
+# _summary_fields() triage summary (input_pdf, document_sha256, generated_at, page_count,
+# blank_page_count, revision_count, dpi, optional pdf_object_hash/file_magic/doc_*/n_*). Children:
+# one EmbeddedResource per embedded file (depth 1, metadata Record) and one Page per declared
+# screenshot (0-based index, px dims, ArtifactRef image, sha256/phash/dhash/colorhash hashes,
+# optional ExtractedText OCR child).
+root = "embedded_resource"
+node_types = ["embedded_resource", "page", "extracted_text", "record"]
+
+# --- findings: every one is a warnings[] entry; codes are fixed strings or a fixed prefix plus
+# --- the JVM report's own type string -----------------------------------------------------
+[[detections]]
+code = "js_indicator.*"
+severity = "high"
+source = "warnings[].code = 'js_indicator.' + report.jsIndicators[].type (suspicious_api, jseff_obfuscation, cve_detection, executable_dropper, suspicious_action, suspicious_structure)"
+description = "JavaScript indicator; message is '<indicator>: <detail>', context the matched snippet."
+
+[[detections]]
+code = "launch_action"
+severity = "high"
+source = "warnings[].code == 'launch_action' (report.launchActions[])"
+description = "/Launch action; message is '<operation> <file> <parameters>'."
+
+[[detections]]
+code = "action.*"
+severity = "medium"
+source = "warnings[].code = 'action.' + report.actions[].type (SubmitForm, ImportData, GoToR, GoToE, URI, Rendition, Named, Sound, Movie)"
+description = "Non-JavaScript action; message is its target / submitUrl / remoteFile."
+
+[[detections]]
+code = "embedded_mismatch"
+severity = "medium"
+source = "warnings[].code == 'embedded_mismatch' (report.embeddedFiles[].mimeTypeMismatch)"
+description = "An embedded file whose declared MIME type disagrees with its content."
+
+[[detections]]
+code = "hidden_layer"
+severity = "medium"
+source = "warnings[].code == 'hidden_layer' (report.ocgLayers[] with suspicious=true)"
+description = "Suspicious optional-content (OCG) layer."
+
+[[detections]]
+code = "url_flag"
+severity = "medium"
+source = "warnings[].code == 'url_flag' (report.urls[] with non-empty flags)"
+description = "A URL the worker flagged; message is '<url> [<flags>]'."
+
+[[detections]]
+code = "metadata_spoof.*"
+severity = "low"
+source = "warnings[].code = 'metadata_spoof.' + report.metadataSpoofingIndicators[].type (predates_pdf_format, future_creation_date, future_modification_date, creation_after_modification, tool_mismatch)"
+description = "Document-info dates or producer/creator that contradict each other or the file."
+
+[[detections]]
+code = "structural.*"
+severity = "low"
+source = "warnings[].code = 'structural.' + report.structuralAnomalies[].type (header_offset, invalid_version, missing_binary_comment, malformed_binary_comment, missing_eof, data_after_eof, qr_scan_budget_exceeded, images_extracted_cap_exceeded)"
+description = "File-structure anomaly, or a JVM budget trip that makes the report incomplete."
+
+[[detections]]
+code = "stream_anomaly.*"
+severity = "low"
+source = "warnings[].code = 'stream_anomaly.' + report.streamLengthAnomalies[].anomalyType (e.g. missing_endstream)"
+description = "A stream whose /Length disagrees with its data; message 'obj=<n> delta=<d>'."
+
+[[detections]]
+code = "form_field"
+severity = "info"
+source = "warnings[].code == 'form_field' (report.formFields[])"
+description = "AcroForm field present; message '<name> [<flags>]'."
+
+[[detections]]
+code = "parse_error"
+severity = "info"
+source = "warnings[].code == 'parse_error' (report.parseError); status rejected for encrypted / wrong password / not a PDF"
+description = "The PDF parsed only leniently, or not at all."
+
+[[detections]]
+code = "timed_out"
+severity = "info"
+source = "warnings[].code == 'timed_out' (report.timedOut)"
+description = "The JVM watchdog fired; the report is partial."
+
+[[detections]]
+code = "warnings_truncated"
+severity = "info"
+source = "warnings[].code == 'warnings_truncated' (the 200-entry warning cap)"
+description = "Findings after the 200th were dropped from warnings[] (they remain in report.json)."
+
+# --- gaps ------------------------------------------------------------------------------------
+[[gaps]]
+id = "findings-are-warnings"
+description = "Every finding is a blastbox Warning: no severity, no confidence, no structured fields (object number, page, offset survive only inside the free-text message), and the code suffix is whatever string the JVM put in report.*[].type, never enumerated or validated by schema.py (array items are bare objects)."
+
+[[gaps]]
+id = "warning-cap-hides-findings"
+description = "_build_warnings stops at 200 entries in a fixed order (jsIndicators first, embedded_mismatch last), so a PDF with many form fields or JS hits can push later families (hidden_layer, url_flag, embedded_mismatch) out of the envelope entirely; only report.json keeps them."
+
+[[gaps]]
+id = "payload-omits-report"
+description = "The payload carries only a counts summary, embedded-file nodes and screenshot Pages. URLs, page text, phone numbers, emails, tables, scripts, actions, revisions and resource images exist only in titan/report.json, which a consumer must fetch and parse itself."
+
+[[gaps]]
+id = "root-fields-unchecked"
+description = "The triage summary lives in the root EmbeddedResource's metadata Record, which this contract format cannot require (required_root_fields applies to a Record root only), and the payload has no schema/version field."
+
+[[gaps]]
+id = "artifact-counts-uncapped"
+description = "Only the image budget (screenshots + images, TITANARUM_MAX_IMAGES_EXTRACTED, default 2000) bounds a count. An explicit TITANARUM_PAGES range is clamped to the document, not to MAX_PAGES_ALL, so screenshots/page PDFs/url crops scale with page count; attachments, scripts, XFA and launch-action files have no count cap. No family but scripts/xfa/attachments/original image bytes has a byte cap, and report.json has none."
+
+[[gaps]]
+id = "revision-renders-not-pages"
+description = "Revision screenshots (titan/revisions/rev-NNN/) are declared kind=revision and never become Page nodes, so their dimensions, hashes and page numbers are only in report.json."
+
+[[gaps]]
+id = "reconstruct-drops-families"
+description = "On the gVisor stale-readdir fallback (_reconstruct_artifacts_from_report) url_crops, launch_actions, revisions and the original-bytes image files are not re-declared, so the same PDF can declare fewer artifacts on that path."
+
+[[gaps]]
+id = "detected-is-constant"
+description = "envelope.detected.label is the first ';' field of report.fileMagic (else 'pdf') at confidence 1.0, and fileMagic is the header line, so the label is e.g. '%PDF-1.6' (a version marker, not a type name) and detected.mime is that same string, not a MIME type."
+
+[[gaps]]
+id = "loadout-ignores-findings"
+description = "Loadout maps titanarum to no detections at all (engines.py: dets = [] for titanarum): every warning above (JS indicators, launch actions, actions, embedded mismatches, structural/metadata anomalies) is dropped."
+
+[[gaps]]
+id = "loadout-refuses-non-ok"
+description = "Loadout's document_outputs.map_outputs refuses any envelope whose status is not ok, so a rejected (encrypted / not-a-PDF) result fails the Loadout job instead of reporting why."
+
+[[gaps]]
+id = "loadout-refuses-jpx-jb2"
+description = "Loadout's document_outputs.map_outputs requires every kind=image artifact to start with PNG or JPEG magic and refuses the WHOLE result otherwise; the engine declares the original .jpx (JPEG2000) and .jb2 (JBIG2) codestreams of image XObjects as kind=image, so with images on (Loadout's default) any PDF containing such an image fails in Loadout."
+
+[[gaps]]
+id = "loadout-count-and-size-limits"
+description = "Loadout's map_outputs refuses the whole result above 1000 declared artifacts, any artifact over 50 MiB, 100 MiB combined, or a report.json over 5 MiB; the engine caps none of these (attachments and original image bytes may reach 100 MiB each)."
+
+[[gaps]]
+id = "loadout-kind-collapse"
+description = "Loadout's map_outputs turns every non-image kind into a generic 'file' artifact: script, xfa, embedded_file, launch_action, page_pdf and revision lose their kind (Loadout's manifest says titanarum emits script, but no script-typed artifact is produced); URLs and text are re-read from report.json (urls[], pageTexts[]), http/https only."
+
+[[consumers]]
+name = "loadout"
+engine = "titanarum"
+mapper = "backend/loadout/document_outputs.py:map_outputs"
+emits = ["file", "text_message", "screenshot", "script", "url", "detection"]

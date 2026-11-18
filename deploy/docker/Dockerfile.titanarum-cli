@@ -22,5 +22,5 @@ FROM ${BASE_IMAGE}
 # Standalone CLI: read the PDF under /work and write report.json + artifacts to --output.
 # The base image's TITANARUM_ZXING_BIN / PATH / fonts are inherited, so no extra setup.
 WORKDIR /work
-ENTRYPOINT ["java", "-jar", "/app/pdf-titan-arum.jar"]
+ENTRYPOINT ["java", "-XX:-UseBASE64Intrinsics", "-jar", "/app/pdf-titan-arum.jar"]
 CMD ["--help"]

@@ -5,7 +5,8 @@ set -e
 : "${DB_USER:?DB_USER is required}"
 : "${DB_PASSWORD:?DB_PASSWORD is required}"
 
-exec java -jar /app/app.jar server \
+# -XX:-UseBASE64Intrinsics: CVE-2026-114938 mitigation (see Dockerfile).
+exec java -XX:-UseBASE64Intrinsics -jar /app/app.jar server \
   --host 0.0.0.0 \
   --port "${PORT:-7272}" \
   --db "$DB_URL" \

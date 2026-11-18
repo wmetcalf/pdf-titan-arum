@@ -31,6 +31,17 @@ REPO = Path(__file__).resolve().parents[1]
 JAR = REPO / "target" / "pdf-titan-arum-1.3.0.jar"
 
 
+def _last_setting(flags: list[str] | tuple[str, ...]) -> str | None:
+    """HotSpot honours the LAST UseBASE64Intrinsics setting; presence alone proves nothing."""
+    hits = [f for f in flags if "UseBASE64Intrinsics" in f]
+    return hits[-1] if hits else None
+
+
+def _before_jar(argv: list[str]) -> list[str]:
+    """JVM options are the tokens before -jar; after it they are application arguments."""
+    return argv[: argv.index("-jar")] if "-jar" in argv else []
+
+
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for k in ("TITANARUM_JAVA_OPTS", "TITANARUM_JAVA_BIN", "TITANARUM_AOT_CACHE"):
         monkeypatch.delenv(k, raising=False)
@@ -41,9 +52,9 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_default_bundle_disables_base64_intrinsics(monkeypatch):
     _clear_env(monkeypatch)
-    assert FLAG in eng._DEFAULT_JVM_FLAGS  # build-aot.sh bakes the AOT cache from this tuple
+    assert _last_setting(eng._DEFAULT_JVM_FLAGS) == FLAG  # build-aot.sh bakes the AOT cache from it
     argv = eng._java_worker_argv(Path("/scr"))
-    assert FLAG in argv[: argv.index("-jar")]
+    assert _last_setting(_before_jar(argv)) == FLAG
 
 
 def test_java_opts_override_cannot_reenable_the_intrinsic(monkeypatch):
@@ -71,20 +82,24 @@ def test_build_aot_reads_the_flag_bundle_from_engine():
      "Dockerfile"],
 )
 def test_runtime_images_set_java_tool_options(dockerfile):
+    # in the FINAL (runtime) stage: an ENV in a build stage never reaches the shipped image
     text = (REPO / dockerfile).read_text()
-    assert re.search(r'^ENV JAVA_TOOL_OPTIONS="[^"]*' + re.escape(FLAG), text, re.M), dockerfile
+    final = re.split(r"^FROM\b", text, flags=re.M)[-1]
+    m = re.search(r'^ENV JAVA_TOOL_OPTIONS="([^"]*)"', final, re.M)
+    assert m and _last_setting(m.group(1).split()) == FLAG, dockerfile
 
 
 def test_cli_entrypoint_disables_the_intrinsic():
     text = (REPO / "deploy/docker/Dockerfile.titanarum-cli").read_text()
     ep = next(ln for ln in text.splitlines() if ln.startswith("ENTRYPOINT"))
-    assert f'"{FLAG}"' in ep
+    argv = json.loads(ep[len("ENTRYPOINT"):])
+    assert _last_setting(_before_jar(argv)) == FLAG, argv
 
 
 def test_server_entrypoint_disables_the_intrinsic():
     text = (REPO / "docker-entrypoint.sh").read_text()
     launches = [ln for ln in text.splitlines() if re.match(r"\s*exec java\b", ln)]
-    assert launches and all(FLAG in ln for ln in launches)
+    assert launches and all(_last_setting(_before_jar(ln.split())) == FLAG for ln in launches)
 
 
 def test_fc_guest_env_sets_java_tool_options():
@@ -96,6 +111,8 @@ def test_fc_guest_env_sets_java_tool_options():
 # --- live JVM ----------------------------------------------------------------------------------
 
 
+# jvm-marked so the Temurin-25 CI job (the JDK the images ship) runs them, not a runner's stray java
+@pytest.mark.jvm
 @pytest.mark.skipif(shutil.which("java") is None, reason="no java on PATH")
 def test_live_jvm_reports_the_intrinsic_disabled(monkeypatch):
     _clear_env(monkeypatch)
@@ -176,7 +193,8 @@ def test_readme_direct_jar_launches_disable_the_intrinsic():
     text = (REPO / "README.md").read_text()
     launches = [ln for ln in text.splitlines() if re.match(r"\s*java\b.*-jar\b", ln)]
     assert launches
-    assert all(FLAG in ln for ln in launches), [ln for ln in launches if FLAG not in ln]
+    bad = [ln for ln in launches if _last_setting(_before_jar(ln.split())) != FLAG]
+    assert not bad, bad
 
 
 def test_underscore_java_options_cannot_reenable_the_intrinsic(monkeypatch):
@@ -190,6 +208,13 @@ def test_underscore_java_options_cannot_reenable_the_intrinsic(monkeypatch):
     assert "_JAVA_OPTIONS" not in eng._jvm_env()  # absent stays absent
 
 
+def test_underscore_java_options_keeps_quoted_values_verbatim(monkeypatch):
+    # HotSpot honours quotes in _JAVA_OPTIONS ("a  b" keeps two spaces): do not re-tokenise
+    monkeypatch.setenv("_JAVA_OPTIONS", '-Dfoo="a  b" -XX:+UseBASE64Intrinsics')
+    assert eng._jvm_env()["_JAVA_OPTIONS"].startswith('-Dfoo="a  b" ')
+
+
+@pytest.mark.jvm
 @pytest.mark.skipif(shutil.which("java") is None, reason="no java on PATH")
 def test_live_jvm_underscore_java_options_override_is_neutralised(monkeypatch):
     monkeypatch.setenv("_JAVA_OPTIONS", "-XX:+UseBASE64Intrinsics")

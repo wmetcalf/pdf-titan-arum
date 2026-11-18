@@ -139,8 +139,8 @@ def _jvm_env() -> dict[str, str]:
     """
     env = dict(os.environ)
     if "_JAVA_OPTIONS" in env:
-        env["_JAVA_OPTIONS"] = " ".join(
-            _force_base64_intrinsics_off(env["_JAVA_OPTIONS"].split()))
+        # appended, not re-tokenised: HotSpot honours quotes there, and the LAST setting wins
+        env["_JAVA_OPTIONS"] = f"{env['_JAVA_OPTIONS']} {_BASE64_INTRINSICS_OFF}"
     return env
 
 

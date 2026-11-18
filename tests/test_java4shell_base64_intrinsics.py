@@ -4,8 +4,13 @@ intrinsic OFF (``-XX:-UseBASE64Intrinsics``).
 The bug is a heap overflow in the AVX-512 VBMI Base64 *decode intrinsic* (JDK 17.0.6+ .. 27).
 Hostile PDFs reach ``java.util.Base64`` in the worker (AcroForm ``/V`` Name payloads -- the
 CVE-2026-34621 technique the worker decodes and saves), so a JVM that boots without the flag
-is exploitable on a VBMI-capable host. These tests fail if a launch path loses the flag, and
-prove Base64 content still decodes end-to-end with it set.
+can reach the stub on a VBMI-capable host once C2 compiles the decoder hot. These tests fail if
+a launch path loses the flag, and prove Base64 content still decodes end-to-end with it set.
+
+The end-to-end test is a FUNCTIONAL check (decoding still works with the flag), not an exploit
+probe: the worker bundle is C1-only (-XX:TieredStopAtLevel=1, which never intrinsifies the
+decoder) and one decode runs interpreted. The flag itself is guarded by the argv / env /
+PrintFlagsFinal tests.
 """
 from __future__ import annotations
 
@@ -143,8 +148,8 @@ def test_base64_form_payload_still_decodes_with_intrinsic_off(tmp_path, monkeypa
     monkeypatch.setenv("TITANARUM_SKIP_IMAGES", "1")
     assert FLAG in eng._java_worker_argv(tmp_path)
 
-    # A few KiB of script text, so a VBMI host without the flag would decode it via the
-    # vulnerable intrinsic. Pad to a multiple of 3 so the base64 carries no '=' padding noise.
+    # A few KiB of script text: the decode path the CVE lives on, exercised with the flag set.
+    # Pad to a multiple of 3 so the base64 carries no '=' padding noise.
     payload = ("".join(f"app.alert('java4shell-canary-{i:04d}');\n" for i in range(150))).encode()
     payload += b" " * (-len(payload) % 3)
     b64 = base64.b64encode(payload).decode("ascii")
@@ -163,3 +168,32 @@ def test_base64_form_payload_still_decodes_with_intrinsic_off(tmp_path, monkeypa
     assert hits, f"no base64_payload form field in report: {report[:1500]}"
     assert hits[0]["decodedLength"] == len(payload)
     assert hits[0]["decodedSha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_readme_direct_jar_launches_disable_the_intrinsic():
+    # A host `java -jar` launch gets neither the image's JAVA_TOOL_OPTIONS nor an entrypoint
+    # flag, so every documented direct launch must carry the flag itself.
+    text = (REPO / "README.md").read_text()
+    launches = [ln for ln in text.splitlines() if re.match(r"\s*java\b.*-jar\b", ln)]
+    assert launches
+    assert all(FLAG in ln for ln in launches), [ln for ln in launches if FLAG not in ln]
+
+
+def test_underscore_java_options_cannot_reenable_the_intrinsic(monkeypatch):
+    # HotSpot applies _JAVA_OPTIONS AFTER the command line, so a +UseBASE64Intrinsics there beat
+    # the argv flag. The worker env re-asserts the OFF flag last inside it.
+    monkeypatch.setenv("_JAVA_OPTIONS", "-Xss2m -XX:+UseBASE64Intrinsics")
+    env = eng._jvm_env()
+    assert env["_JAVA_OPTIONS"].split()[-1] == FLAG
+    assert "-Xss2m" in env["_JAVA_OPTIONS"].split()
+    monkeypatch.delenv("_JAVA_OPTIONS")
+    assert "_JAVA_OPTIONS" not in eng._jvm_env()  # absent stays absent
+
+
+@pytest.mark.skipif(shutil.which("java") is None, reason="no java on PATH")
+def test_live_jvm_underscore_java_options_override_is_neutralised(monkeypatch):
+    monkeypatch.setenv("_JAVA_OPTIONS", "-XX:+UseBASE64Intrinsics")
+    r = subprocess.run(["java", FLAG, "-XX:+PrintFlagsFinal", "-version"], capture_output=True,
+                       text=True, timeout=60, check=False, env=eng._jvm_env())
+    line = next(ln for ln in r.stdout.splitlines() if " UseBASE64Intrinsics " in ln)
+    assert re.search(r"UseBASE64Intrinsics\s+=\s+false", line), line

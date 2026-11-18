@@ -59,8 +59,8 @@ being exactly as old as your last `mvn package`.
 # Build
 mvn package
 
-# Analyse a PDF
-java -jar target/pdf-titan-arum-1.3.0.jar --input suspicious.pdf --output ./out
+# Analyse a PDF (-XX:-UseBASE64Intrinsics: CVE-2026-114938 mitigation; keep it on every java launch)
+java -XX:-UseBASE64Intrinsics -jar target/pdf-titan-arum-1.3.0.jar --input suspicious.pdf --output ./out
 
 # Results
 cat out/report.json
@@ -87,7 +87,7 @@ docker run --rm -v "$PWD":/work titanarum-cli:dev \
 ## CLI Usage
 
 ```bash
-java -jar target/pdf-titan-arum-1.3.0.jar \
+java -XX:-UseBASE64Intrinsics -jar target/pdf-titan-arum-1.3.0.jar \
   --input <pdf>                   # required
   --output <dir>                  # required
   [--dpi 150]                     # render DPI for screenshots
@@ -118,25 +118,25 @@ java -jar target/pdf-titan-arum-1.3.0.jar \
 
 ```bash
 # Local vLLM / llama.cpp server (model auto-detected)
-java -jar target/pdf-titan-arum-1.3.0.jar \
+java -XX:-UseBASE64Intrinsics -jar target/pdf-titan-arum-1.3.0.jar \
   --input suspicious.pdf --output ./out \
   --ai-url http://localhost:8001/v1
 
 # OpenAI API
-java -jar target/pdf-titan-arum-1.3.0.jar \
+java -XX:-UseBASE64Intrinsics -jar target/pdf-titan-arum-1.3.0.jar \
   --input suspicious.pdf --output ./out \
   --ai-url https://api.openai.com/v1 \
   --ai-key sk-... \
   --ai-model gpt-5-nano
 
 # Fast URL-only scan + AI (no screenshots, no images)
-java -jar target/pdf-titan-arum-1.3.0.jar \
+java -XX:-UseBASE64Intrinsics -jar target/pdf-titan-arum-1.3.0.jar \
   --input suspicious.pdf --output ./out \
   --skip-screenshots --skip-images --skip-phones --skip-page-export \
   --ai-url http://localhost:8001/v1
 
 # With OCR — gives the model visible text from rendered pages
-java -jar target/pdf-titan-arum-1.3.0.jar \
+java -XX:-UseBASE64Intrinsics -jar target/pdf-titan-arum-1.3.0.jar \
   --input suspicious.pdf --output ./out \
   --ocr-screenshots --ocr-url-crops \
   --ai-url http://localhost:8001/v1
@@ -203,7 +203,7 @@ Server listens on `http://localhost:7272`.
 ### Run manually
 
 ```bash
-java -jar target/pdf-titan-arum-server-1.3.0.jar server \
+java -XX:-UseBASE64Intrinsics -jar target/pdf-titan-arum-server-1.3.0.jar server \
   --host 0.0.0.0 \
   --port 7272 \
   --db jdbc:postgresql://localhost/titanarum \

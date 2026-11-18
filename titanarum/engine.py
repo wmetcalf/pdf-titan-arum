@@ -129,6 +129,21 @@ def _force_base64_intrinsics_off(flags: list[str]) -> list[str]:
     return [*kept, _BASE64_INTRINSICS_OFF]
 
 
+def _jvm_env() -> dict[str, str]:
+    """The worker JVM's environment: os.environ, with the CVE-2026-114938 flag re-asserted LAST
+    inside ``_JAVA_OPTIONS`` when that is set.
+
+    HotSpot applies ``_JAVA_OPTIONS`` AFTER the command line, so a ``-XX:+UseBASE64Intrinsics``
+    there would beat the argv flag. (``JAVA_TOOL_OPTIONS`` / ``JDK_JAVA_OPTIONS`` are applied
+    BEFORE the argv, which therefore already wins over them.)
+    """
+    env = dict(os.environ)
+    if "_JAVA_OPTIONS" in env:
+        env["_JAVA_OPTIONS"] = " ".join(
+            _force_base64_intrinsics_off(env["_JAVA_OPTIONS"].split()))
+    return env
+
+
 def _java_worker_argv(scratch: Path) -> list[str]:
     java_bin = os.environ.get("TITANARUM_JAVA_BIN", _DEFAULT_JAVA_BIN)
     jar = os.environ.get("TITANARUM_WORKER_JAR", _DEFAULT_WORKER_JAR)
@@ -271,7 +286,7 @@ def _run_worker(input_path: Path, report_outdir: Path, *,
 
         argv = _java_worker_argv(scratch)
         try:
-            result = subprocess.run(argv, capture_output=True, timeout=subproc_s)
+            result = subprocess.run(argv, capture_output=True, timeout=subproc_s, env=_jvm_env())
         finally:
             # Stop + join the signaller BEFORE the enclosing tempdir is torn down, so it can't
             # write control files into a directory being rmtree'd. subprocess.run(timeout=...)
@@ -725,7 +740,7 @@ class TitanArumEngine:
                 (control_dir / stale).unlink(missing_ok=True)
 
             argv = _java_worker_argv(scratch)
-            env = dict(os.environ)
+            env = _jvm_env()
             env["TITANARUM_WARM"] = "1"
             # Boot/job stdout+stderr go to a FILE (not DEVNULL) so a failed or
             # wedged warm boot leaves a post-mortem trail -- a file, unlike a

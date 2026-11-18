@@ -45,9 +45,18 @@ _DEFAULT_WORKER_JAR = "/app/pdf-titan-arum.jar"
 _DEFAULT_AOT_CACHE = "/app/titanarum.aot"
 _DEFAULT_JAVA_LIBRARY_PATH = "/app"
 
+# CVE-2026-114938 ("Java4Shell"): heap overflow in HotSpot's AVX-512 VBMI Base64 decode
+# intrinsic (JDK 17.0.6+ .. 27). Hostile PDFs reach java.util.Base64 in the worker (AcroForm
+# /V Name payloads), so the intrinsic is OFF for every worker JVM. java.util.Base64 still works
+# (pure-Java path); only the assembly stub is disabled. It sits in the default bundle -- which
+# build-aot.sh reads, so the AOT cache and the warm FC/gVisor JVMs are booted with it -- AND is
+# forced onto a TITANARUM_JAVA_OPTS override, so an operator flag bundle cannot drop it.
+_BASE64_INTRINSICS_OFF = "-XX:-UseBASE64Intrinsics"
+
 # MUST match the flags the AOT cache (if any) was built with, or JDK 25 rejects it.
 _DEFAULT_JVM_FLAGS: tuple[str, ...] = (
     "-XX:+UseSerialGC",
+    _BASE64_INTRINSICS_OFF,
     "-XX:TieredStopAtLevel=1",
     "-Xms1g",
     "-Xmx4g",
@@ -109,6 +118,32 @@ _DEFAULT_JOB: dict[str, Any] = {
 }
 
 
+def _force_base64_intrinsics_off(flags: list[str]) -> list[str]:
+    """Drop any UseBASE64Intrinsics setting from *flags* and append the OFF flag last.
+
+    HotSpot honours the LAST occurrence of a flag, so appending alone would already win;
+    stripping the others keeps the argv unambiguous to a reader of ``ps``/logs.
+    """
+    kept = [f for f in flags if not f.startswith(("-XX:+UseBASE64Intrinsics",
+                                                  "-XX:-UseBASE64Intrinsics"))]
+    return [*kept, _BASE64_INTRINSICS_OFF]
+
+
+def _jvm_env() -> dict[str, str]:
+    """The worker JVM's environment: os.environ, with the CVE-2026-114938 flag re-asserted LAST
+    inside ``_JAVA_OPTIONS`` when that is set.
+
+    HotSpot applies ``_JAVA_OPTIONS`` AFTER the command line, so a ``-XX:+UseBASE64Intrinsics``
+    there would beat the argv flag. (``JAVA_TOOL_OPTIONS`` / ``JDK_JAVA_OPTIONS`` are applied
+    BEFORE the argv, which therefore already wins over them.)
+    """
+    env = dict(os.environ)
+    if "_JAVA_OPTIONS" in env:
+        # appended, not re-tokenised: HotSpot honours quotes there, and the LAST setting wins
+        env["_JAVA_OPTIONS"] = f"{env['_JAVA_OPTIONS']} {_BASE64_INTRINSICS_OFF}"
+    return env
+
+
 def _java_worker_argv(scratch: Path) -> list[str]:
     java_bin = os.environ.get("TITANARUM_JAVA_BIN", _DEFAULT_JAVA_BIN)
     jar = os.environ.get("TITANARUM_WORKER_JAR", _DEFAULT_WORKER_JAR)
@@ -116,7 +151,8 @@ def _java_worker_argv(scratch: Path) -> list[str]:
     aot_cache = os.environ.get("TITANARUM_AOT_CACHE", _DEFAULT_AOT_CACHE)
     opts = os.environ.get("TITANARUM_JAVA_OPTS")
     if opts is not None:
-        jvm_flags = shlex.split(opts)  # replaces the entire default bundle
+        # Replaces the entire default bundle -- except the CVE-2026-114938 flag.
+        jvm_flags = _force_base64_intrinsics_off(shlex.split(opts))
     else:
         jvm_flags = [f"-Djava.library.path={lib_path}", *_DEFAULT_JVM_FLAGS]
         if aot_cache and Path(aot_cache).is_file():
@@ -250,7 +286,7 @@ def _run_worker(input_path: Path, report_outdir: Path, *,
 
         argv = _java_worker_argv(scratch)
         try:
-            result = subprocess.run(argv, capture_output=True, timeout=subproc_s)
+            result = subprocess.run(argv, capture_output=True, timeout=subproc_s, env=_jvm_env())
         finally:
             # Stop + join the signaller BEFORE the enclosing tempdir is torn down, so it can't
             # write control files into a directory being rmtree'd. subprocess.run(timeout=...)
@@ -704,7 +740,7 @@ class TitanArumEngine:
                 (control_dir / stale).unlink(missing_ok=True)
 
             argv = _java_worker_argv(scratch)
-            env = dict(os.environ)
+            env = _jvm_env()
             env["TITANARUM_WARM"] = "1"
             # Boot/job stdout+stderr go to a FILE (not DEVNULL) so a failed or
             # wedged warm boot leaves a post-mortem trail -- a file, unlike a

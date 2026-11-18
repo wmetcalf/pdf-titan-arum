@@ -13,6 +13,14 @@ RUN mvn package -Pserver -DskipTests -q
 
 # ---- Runtime stage ----
 FROM eclipse-temurin:25-jre
+
+# CVE-2026-114938 ("Java4Shell"): heap overflow in HotSpot's AVX-512 VBMI Base64
+# decode intrinsic (JDK 17.0.6+ .. 27). Hostile PDF content reaches java.util.Base64,
+# so the intrinsic is switched off for EVERY JVM this image starts. Base64 keeps
+# working via the pure-Java path; only the assembly stub goes. JAVA_TOOL_OPTIONS is
+# the catch-all; the engine argv (titanarum/engine.py) and the AOT bake ALSO pass the
+# flag explicitly, because `docker export` drops ENV for the warm FC/gVisor rootfs.
+ENV JAVA_TOOL_OPTIONS="-XX:-UseBASE64Intrinsics"
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -13,7 +13,8 @@ def test_java_worker_argv_shape(monkeypatch):
     monkeypatch.setenv("TITANARUM_JAVA_OPTS", "-Xmx1g -XX:+UseSerialGC")
     monkeypatch.setenv("TITANARUM_WORKER_JAR", "/app/pdf-titan-arum.jar")
     argv = eng._java_worker_argv(Path("/scr"))
-    assert argv == ["java", "-Xmx1g", "-XX:+UseSerialGC",
+    # The override replaces the bundle, but the CVE-2026-114938 flag is always appended.
+    assert argv == ["java", "-Xmx1g", "-XX:+UseSerialGC", "-XX:-UseBASE64Intrinsics",
                     "-jar", "/app/pdf-titan-arum.jar", "--run", "/scr"]
 
 

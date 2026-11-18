@@ -858,8 +858,8 @@ private boolean skipQrScan;
                 // Also analyze decoded form-field payloads (the *actual* exploit code)
                 if (report.formFields != null) {
                     for (FormFieldHit ff : report.formFields) {
-                        if (ff.decodedText != null) {   // the full payload, not the capped artifact file
-                            analyzeCodeIndicators(ff.decodedText, "formField[" + ff.name + "].decodedPayload", ji);
+                        if (ff.decodedIndicators != null) {   // found in the full payload, not the capped file
+                            ji.addAll(ff.decodedIndicators);
                         } else if (ff.decodedArtifact != null) {
                             try {
                                 String decoded = Files.readString(outputDir.resolve(ff.decodedArtifact), StandardCharsets.UTF_8);
@@ -1765,7 +1765,6 @@ private boolean skipQrScan;
      */
     private List<FormFieldHit> extractFormFields(PDDocument document, Path scriptsDir) throws IOException {
         List<FormFieldHit> hits = new ArrayList<>();
-        Map<String, String> decodedTextBySha = new HashMap<>();
         PDAcroForm acroForm = document.getDocumentCatalog().getAcroForm();
         if (acroForm == null) return hits;
 
@@ -1838,16 +1837,17 @@ private boolean skipQrScan;
                                 break;
                             }
                         }
-                        // The FULL payload is analysed from memory (the artifact file is capped at
-                        // MAX_SCRIPT_BYTES), decoded leniently for text AND binary payloads: one invalid
-                        // byte inside a JS comment must not hide the code around it. Fields that share one
-                        // payload (/V through an indirect reference) share ONE String, so the heap stays
-                        // O(distinct payloads), not O(fields x payload).
-                        hit.decodedText = decodedTextBySha.computeIfAbsent(hit.decodedSha256,
-                                k -> new String(decoded, StandardCharsets.UTF_8));
+                        // The FULL payload is analysed here, at decode time (the artifact file is capped
+                        // at MAX_SCRIPT_BYTES), decoded leniently for text AND binary payloads: one invalid
+                        // byte inside a JS comment must not hide the code around it. Only the indicator
+                        // hits are kept, so the heap holds one decoded payload at a time.
+                        String decodedText = new String(decoded, StandardCharsets.UTF_8);
+                        hit.decodedIndicators = new ArrayList<>();
+                        analyzeCodeIndicators(decodedText, "formField[" + fieldName + "].decodedPayload",
+                                hit.decodedIndicators);
                         if (looksText) {
                             hit.decodedArtifact = writeCappedTextArtifact(scriptsDir, artifactName + ".js.txt",
-                                hit.decodedText, MAX_SCRIPT_BYTES);
+                                decodedText, MAX_SCRIPT_BYTES);
                         } else {
                             // uniquePath, like the text branch: two field names that sanitise alike
                             // overwrote one .bin, and the first payload was lost
@@ -3760,7 +3760,9 @@ for (int pageNum : pagesToProcess) {
             }
         }
         // Then: replace dangerous characters in the chosen component
-        String cleaned = component.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").replaceAll("\\s+", "_");
+        // \p{Cs}: an UNPAIRED surrogate (a valid pair matches as one code point, not Cs) makes
+        // Path.resolve throw InvalidPathException
+        String cleaned = component.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}\\p{Cs}]", "_").replaceAll("\\s+", "_");
         cleaned = cleaned.replaceAll("_+", "_");
         if (cleaned.isBlank()) {
             cleaned = "artifact";
@@ -3771,7 +3773,9 @@ for (int pageNum : pagesToProcess) {
         // '.png' let a hostile name end in '-original.jpg'.
         int dot = cleaned.lastIndexOf('.');
         String ext = (dot > 0 && cleaned.length() - dot <= 16) ? cleaned.substring(dot) : "";
-        return cleaned.substring(0, 180 - ext.length()) + ext;
+        int cut = 180 - ext.length();
+        if (Character.isHighSurrogate(cleaned.charAt(cut - 1))) cut--;   // never split a surrogate pair
+        return cleaned.substring(0, cut) + ext;
     }
 
     private static String normalizeUrl(String raw) {
@@ -6032,10 +6036,11 @@ for (int pageNum : pagesToProcess) {
         public List<String> flags;
         /** Path to artifact file containing the decoded payload (when base64 detected). */
         public String decodedArtifact;
-        /** The FULL decoded text payload, for indicator analysis: the artifact file is capped at
-         *  MAX_SCRIPT_BYTES, and code past the cap must still be analysed. Not serialised. */
+        /** Indicators found in the FULL decoded payload at decode time (the artifact file is capped
+         *  at MAX_SCRIPT_BYTES, and code past the cap must still be analysed). Only these small hits
+         *  are kept, never the payload, so the heap holds one payload at a time. Not serialised. */
         @JsonIgnore
-        public transient String decodedText;
+        public transient List<JsIndicatorHit> decodedIndicators;
         /** SHA-256 of the decoded payload. */
         public String decodedSha256;
         /** Length of the decoded payload in bytes. */

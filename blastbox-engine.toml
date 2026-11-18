@@ -16,7 +16,8 @@ schema = "blastbox-engine-contract/1"
 name = "titanarum"
 formats = ["pdf"]
 network = ["none"]
-# detonate() returns ok or rejected (encrypted / wrong password / not a PDF, from parseError).
+# detonate() returns ok or rejected (encrypted / wrong password / not a PDF / a %PDF file that fails
+# both parse attempts, from parseError; the last is still detected as pdf).
 # A worker crash, a missing report.json or a report failing schema.validate_report raises, which
 # the harness seals as engine_error. No input-size cap on this path: the JVM's 500 MB MAX_PDF_BYTES
 # guards only its CLI entry, not the --run job the engine uses.
@@ -205,7 +206,7 @@ description = "AcroForm field present; message '<name> [<flags>]'."
 [[detections]]
 code = "parse_error"
 severity = "info"
-source = "warnings[].code == 'parse_error' (report.parseError); status rejected for encrypted / wrong password / not a PDF"
+source = "warnings[].code == 'parse_error' (report.parseError); status rejected for encrypted / wrong password / not a PDF / unparseable PDF ('PDF parse error: ...')"
 description = "The PDF parsed only leniently, or not at all."
 
 [[detections]]
@@ -231,7 +232,7 @@ description = "The payload carries only a counts summary, embedded-file nodes an
 
 [[gaps]]
 id = "host-trust-gate-caps"
-description = "The blastbox host trust gate seals with its Limits defaults (max_artifacts 1000, max_artifact_bytes 50 MiB, 500 MiB total) and this repo's deploy configs raise only BLASTBOX_MAX_METADATA. A result inside this contract (up to 4000 image files, 100 MiB attachments / original codestreams) can therefore be refused whole by the host before any consumer sees it. Owner decision: raise BLASTBOX_MAX_ARTIFACTS / _ARTIFACT_BYTES / _TOTAL_BYTES in the deploy configs, or tighten the engine's budgets to the host's."
+description = "The blastbox host trust gate seals with its Limits defaults (max_artifacts 1000, max_artifact_bytes 50 MiB, 500 MiB total) and this repo's deploy configs raise only BLASTBOX_MAX_METADATA. A result inside this contract (up to 4000 image files, 100 MiB attachments / original codestreams) can therefore be refused whole by the host before any consumer sees it. Owner decision: raise BLASTBOX_MAX_ARTIFACTS (count), BLASTBOX_MAX_ARTIFACT (bytes per artifact) and BLASTBOX_MAX_TOTAL_ARTIFACTS (total bytes) in the deploy configs, or tighten the engine's budgets to the host's."
 
 [[gaps]]
 id = "artifact-counts-uncapped"
@@ -247,7 +248,7 @@ description = "Loadout maps titanarum to no detections at all (engines.py: dets 
 
 [[gaps]]
 id = "loadout-refuses-non-ok"
-description = "Loadout's document_outputs.map_outputs refuses any envelope whose status is not ok, so a rejected (encrypted / not-a-PDF) result fails the Loadout job instead of reporting why."
+description = "Loadout's document_outputs.map_outputs refuses any envelope whose status is not ok, so a rejected (encrypted / not-a-PDF / unparseable) result fails the Loadout job instead of reporting why."
 
 [[gaps]]
 id = "loadout-refuses-jpx-jb2"

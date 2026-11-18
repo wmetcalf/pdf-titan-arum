@@ -78,4 +78,28 @@ class ScriptArtifactCapTest {
         assertTrue(out.endsWith(".png"), out);
         assertEquals("short.png", m.invoke(null, "short.png"));
     }
+
+    @Test
+    void truncationNeverSplitsASurrogatePairAndLoneSurrogatesAreReplaced(@TempDir Path dir) throws Exception {
+        // a cut through an emoji left a lone high surrogate: Path.resolve threw InvalidPathException,
+        // which escaped callWith (no report.json, engine_error)
+        Method m = PdfTitanArumApp.class.getDeclaredMethod("sanitizeFileName", String.class);
+        m.setAccessible(true);
+        for (int a = 170; a <= 182; a++) {
+            String name = "A".repeat(a) + "\uD83D\uDE00" + "B".repeat(20) + ".js.txt";
+            String out = (String) m.invoke(null, name);
+            for (int i = 0; i < out.length(); i++) {
+                char c = out.charAt(i);
+                if (Character.isHighSurrogate(c)) {
+                    assertTrue(i + 1 < out.length() && Character.isLowSurrogate(out.charAt(i + 1)), out);
+                    i++;
+                } else {
+                    assertFalse(Character.isLowSurrogate(c), out);
+                }
+            }
+            dir.resolve(out);   // must not throw
+        }
+        String lone = (String) m.invoke(null, "x\uD800y.js");
+        dir.resolve(lone);
+    }
 }

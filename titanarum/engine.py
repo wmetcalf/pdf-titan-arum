@@ -723,27 +723,50 @@ def _distinct_first(hits: list[Any]) -> list[Any]:
     return first + rest
 
 
-def _split_distinct(ws: Iterable[Warning], keep: int) -> list[list[Warning]]:
-    """[first warning of each distinct code, the other distinct (code, message), the repeats],
-    each holding at most ``keep`` (no more can be used under the cap): an attacker-sized finding
-    array is streamed through, never materialised as Warnings."""
-    codes: set[str] = set()
+def _split_distinct(ws: Iterable[Warning], keep: int
+                    ) -> tuple[list[Warning], list[list[Warning]], list[Warning]]:
+    """[first warning of each distinct code, the other distinct (code, message) round-robin
+    across codes, the repeats]. At most ``keep`` per tier (and per code in the middle tier) are
+    retained: no more can be used under the cap, so an attacker-sized finding array is streamed
+    through, never materialised as Warnings."""
     seen: set[tuple[str, str]] = set()
-    out: list[list[Warning]] = [[], [], []]
+    firsts: list[Warning] = []
+    others: dict[str, list[Warning]] = {}     # per code: N decoys of one code fill only its bucket
+    repeats: list[Warning] = []
     for w in ws:
         key = (w.code, w.message)
-        level = 2 if key in seen else (1 if w.code in codes else 0)
-        if len(out[level]) < keep:
-            out[level].append(w)
+        if key in seen:
+            if len(repeats) < keep:
+                repeats.append(w)
+            continue
+        if w.code not in others:               # a new code: tier 0 (its bucket opens)
+            if len(firsts) < keep:
+                firsts.append(w)
+                others[w.code] = []
+                seen.add(key)
+            continue
+        bucket = others[w.code]
+        if len(bucket) < keep:
+            bucket.append(w)
             seen.add(key)
-            codes.add(w.code)
-        if all(len(t) >= keep for t in out):
-            break
+    return firsts, list(others.values()), repeats
+
+
+def _round_robin(buckets: list[tuple[int, list[Warning]]]) -> list[tuple[int, Warning]]:
+    """Interleave (family, per-code bucket) pairs, first-seen order: N distinct decoys of one code
+    (URI links, decoy /Launch opens) must not displace the second finding of another code, in
+    this family or a lower-severity one."""
+    out: list[tuple[int, Warning]] = []
+    depth = max((len(q) for _, q in buckets), default=0)
+    for n in range(depth):
+        out.extend((fam, q[n]) for fam, q in buckets if n < len(q))
     return out
 
 
+# PdfTitanArumApp's own executable-extension list (exeExts), kept in step with it.
 _RISKY_LAUNCH = re.compile(
-    r"\.(exe|com|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|hta|scr|pif|lnk|msi|dll|cpl)$", re.I)
+    r"\.(exe|dll|scr|sys|com|pif|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|msi|msp|mst|cpl|hta|lnk|bin"
+    r"|ocx|drv|jar|class|appref-ms|gadget|inf|ins|isp|reg|rgs|sct|shb|psc1|application)$", re.I)
 
 
 def _launch_rank(hit: Any) -> int:
@@ -846,14 +869,13 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     # (N different URI links) can displace a finding of another code.
     tiers = [_split_distinct((make(it) for it in items), keep=slots) for items, make in families]
     taken: list[list[Warning]] = [[] for _ in families]
-    pools = ([t[0][:1] for t in tiers], [t[0][1:] for t in tiers],   # floor; other new codes
-             [t[1] for t in tiers], [t[2] for t in tiers])          # other messages; repeats
-    for level in pools:
-        for i, pool in enumerate(level):
-            n = min(len(pool), slots)
-            if n > 0:
-                taken[i].extend(pool[:n])
-                slots -= n
+    ordered: list[tuple[int, Warning]] = []
+    ordered += [(i, t[0][0]) for i, t in enumerate(tiers) if t[0]]            # the family floor
+    ordered += [(i, w) for i, t in enumerate(tiers) for w in t[0][1:]]       # other new codes
+    ordered += _round_robin([(i, q) for i, t in enumerate(tiers) for q in t[1]])  # other msgs
+    ordered += [(i, w) for i, t in enumerate(tiers) for w in t[2]]           # the repeats
+    for fam, w in ordered[:slots]:
+        taken[fam].append(w)
     for t in taken:
         warns.extend(t)
     if cap > 0:

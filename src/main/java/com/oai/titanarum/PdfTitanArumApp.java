@@ -3758,6 +3758,7 @@ for (int pageNum : pagesToProcess) {
     }
 
     private static String sanitizeFileName(String value) {
+        if (value == null) return "artifact";   // e.g. a field with no /T: NFKC normalize threw NPE out of callWith
         String normalized = Normalizer.normalize(value, Normalizer.Form.NFKC);
         // First: strip path traversal by taking only the last safe path component
         String[] parts = normalized.split("[/\\\\]");

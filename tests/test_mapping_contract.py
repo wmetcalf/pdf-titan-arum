@@ -179,3 +179,23 @@ def test_every_non_flood_js_type_survives_a_suspicious_api_flood():
     codes = [w.code for w in eng._build_warnings(report)]
     assert "js_indicator.suspicious_action" in codes
     assert "js_indicator.suspicious_structure" in codes
+
+
+def test_an_attachment_named_only_by_replaced_characters_keeps_its_family_id():
+    # '@', '文件', 'файл': every character becomes '_', and stripping the trailing '_' left the id
+    # 'titan_attachments', which the family glob titan_attachments_* does not match
+    import fnmatch
+    for name in ("@", "文件", "файл"):
+        aid = eng._safe_artifact_id(f"titan/attachments/{name}", set())
+        assert fnmatch.fnmatchcase(aid, "titan_attachments_*"), aid
+
+
+def test_a_budget_trip_keeps_the_structural_slot_under_a_flood():
+    # images_extracted_cap_exceeded / qr_scan_budget_exceeded say the report is INCOMPLETE; the JVM
+    # appends them after the cosmetic file-structure anomalies
+    report = _report(
+        actions=[{"type": "URI", "detail": "x"} for _ in range(250)],
+        structuralAnomalies=[{"type": "missing_binary_comment", "detail": "x"},
+                             {"type": "images_extracted_cap_exceeded", "detail": "y"}])
+    codes = [w.code for w in eng._build_warnings(report)]
+    assert "structural.images_extracted_cap_exceeded" in codes, codes[-5:]

@@ -119,4 +119,11 @@ class ScriptArtifactCapTest {
         String ext = (String) m.invoke(null, "\u6F22".repeat(180) + ".pdf");
         assertTrue(ext.endsWith(".pdf"), ext);
     }
+
+    @Test
+    void aNullNameIsAnArtifact() throws Exception {
+        Method m = PdfTitanArumApp.class.getDeclaredMethod("sanitizeFileName", String.class);
+        m.setAccessible(true);
+        assertEquals("artifact", m.invoke(null, (Object) null));
+    }
 }

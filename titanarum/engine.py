@@ -362,7 +362,9 @@ _ID_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def _safe_artifact_id(rel_path: str, used: set[str]) -> str:
-    base = _ID_RE.sub("_", rel_path).strip("_") or "artifact"
+    # lstrip only: a name made wholly of replaced characters ('@', CJK) ends in '_', and
+    # stripping it left 'titan_attachments', which the id glob titan_attachments_* misses
+    base = _ID_RE.sub("_", rel_path).lstrip("_") or "artifact"
     base = base[:120]
     cand = base
     i = 1
@@ -705,6 +707,18 @@ def _js_rank(hit: Any) -> int:
     return _JS_PRIORITY.get(kind, 5) if isinstance(kind, str) else 9
 
 
+def _structural_rank(hit: Any) -> int:
+    """JVM budget trips (the report is INCOMPLETE) ahead of cosmetic file-structure anomalies:
+    the JVM appends them last, so a capped family's head would otherwise be cosmetic ones."""
+    kind = hit.get("type") if isinstance(hit, dict) else None
+    trip = isinstance(kind, str) and ("budget" in kind or kind.endswith("_cap_exceeded"))
+    return 0 if trip else 1
+
+
+def _ranked(items: Any, rank: Any) -> Any:
+    return sorted(items, key=rank) if isinstance(items, list) else items
+
+
 def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     warns: list[Warning] = []
 
@@ -751,7 +765,7 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
         (report.get("metadataSpoofingIndicators"),
          lambda i: Warning(code=_clip(f"metadata_spoof.{i.get('type','')}", 64),
                            message=_clip(i.get("detail", ""), 2000))),
-        (report.get("structuralAnomalies"),
+        (_ranked(report.get("structuralAnomalies"), _structural_rank),
          lambda i: Warning(code=_clip(f"structural.{i.get('type','')}", 64),
                            message=_clip(i.get("detail", ""), 2000))),
         (report.get("streamLengthAnomalies"),

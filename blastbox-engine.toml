@@ -8,8 +8,8 @@ schema = "blastbox-engine-contract/1"
 # titan_screenshots_page-0001.png), truncated to 120 chars, with _N appended on a collision.
 #
 # max_count: 2000 is the JVM's per-document image budget (TITANARUM_MAX_IMAGES_EXTRACTED, default
-# 2000, shared by screenshots, revision screenshots and extracted images). 100000 marks a family
-# the engine does NOT cap at all (see gap artifact-counts-uncapped); it is not a real limit.
+# 2000, shared by screenshots, revision screenshots and extracted images). max_count = 0 marks a
+# family the engine does NOT cap at all (see gap artifact-counts-uncapped).
 
 [engine]
 name = "titanarum"
@@ -59,7 +59,7 @@ description = "PNG decode of each drawn (images_rendered/) or resource (images_r
 id = "titan_url_crops_*"
 path = "titan/url_crops/*"
 kind = "url_crop"
-max_count = 100000
+max_count = 0
 role = "url_crop"
 description = "url-pNNNN-NNNN.png crop of a page screenshot around each URL hit."
 
@@ -67,7 +67,7 @@ description = "url-pNNNN-NNNN.png crop of a page screenshot around each URL hit.
 id = "titan_pages_*"
 path = "titan/pages/*"
 kind = "page_pdf"
-max_count = 100000
+max_count = 0
 role = "page_pdf"
 description = "One single-page PDF exported per processed page (skip_page_export turns it off)."
 
@@ -75,7 +75,7 @@ description = "One single-page PDF exported per processed page (skip_page_export
 id = "titan_scripts_*"
 path = "titan/scripts/*"
 kind = "script"
-max_count = 100000
+max_count = 0
 max_bytes = 10485760
 role = "javascript"
 description = "Each JavaScript action/name-tree/form-field script, truncated at MAX_SCRIPT_BYTES."
@@ -84,7 +84,7 @@ description = "Each JavaScript action/name-tree/form-field script, truncated at 
 id = "titan_xfa_*"
 path = "titan/xfa/*"
 kind = "xfa"
-max_count = 100000
+max_count = 0
 max_bytes = 10485760
 role = "xfa"
 description = "XFA form packet/scripts; packets over MAX_XFA_BYTES are not written."
@@ -93,7 +93,7 @@ description = "XFA form packet/scripts; packets over MAX_XFA_BYTES are not writt
 id = "titan_attachments_*"
 path = "titan/attachments/*"
 kind = "embedded_file"
-max_count = 100000
+max_count = 0
 max_bytes = 104857600
 role = "embedded_file"
 description = "Each embedded file / attachment, bounded-copied at MAX_EMBEDDED_FILE_BYTES."
@@ -102,7 +102,7 @@ description = "Each embedded file / attachment, bounded-copied at MAX_EMBEDDED_F
 id = "titan_launch_actions_*"
 path = "titan/launch_actions/*"
 kind = "launch_action"
-max_count = 100000
+max_count = 0
 role = "launch_action"
 description = "Material written for a /Launch action."
 
@@ -110,7 +110,7 @@ description = "Material written for a /Launch action."
 id = "titan_revisions_*"
 path = "titan/revisions/*"
 kind = "revision"
-max_count = 100000
+max_count = 0
 role = "revision_render"
 description = "rev-NNN/page-NNNN.png and rev-NNN/url_crops/*.png for up to 5 earlier incremental-update revisions."
 
@@ -118,7 +118,7 @@ description = "rev-NNN/page-NNNN.png and rev-NNN/url_crops/*.png for up to 5 ear
 id = "titan_*"
 path = "titan/*"
 kind = "file"
-max_count = 100000
+max_count = 0
 role = "other"
 description = "Catch-all: any other file under titan/ (top level, or an unrecognised subdirectory) is declared kind=file. None is expected from the --run path."
 
@@ -131,6 +131,10 @@ description = "Catch-all: any other file under titan/ (top level, or an unrecogn
 # optional ExtractedText OCR child).
 root = "embedded_resource"
 node_types = ["embedded_resource", "page", "extracted_text", "record"]
+# Checked on the root EmbeddedResource's metadata Record: _summary_fields() sets these seven on
+# every result (defaults ""/0/0.0 when the report omits them). pdf_object_hash, file_magic,
+# doc_* and n_* are conditional. No schema_version: the summary carries none.
+required_root_fields = ["input_pdf", "document_sha256", "generated_at", "page_count", "blank_page_count", "revision_count", "dpi"]
 
 # --- findings: every one is a warnings[] entry; codes are fixed strings or a fixed prefix plus
 # --- the JVM report's own type string -----------------------------------------------------
@@ -226,8 +230,8 @@ id = "payload-omits-report"
 description = "The payload carries only a counts summary, embedded-file nodes and screenshot Pages. URLs, page text, phone numbers, emails, tables, scripts, actions, revisions and resource images exist only in titan/report.json, which a consumer must fetch and parse itself."
 
 [[gaps]]
-id = "root-fields-unchecked"
-description = "The triage summary lives in the root EmbeddedResource's metadata Record, which this contract format cannot require (required_root_fields applies to a Record root only), and the payload has no schema/version field."
+id = "root-fields-unversioned"
+description = "The seven always-present summary fields are required, but the summary has no schema/version field, and the optional pdf_object_hash/file_magic/doc_*/n_* fields appear only when non-empty, so their absence cannot be told apart from a zero or missing report value. The defaults (\"\"/0/0.0) also mask a report that omitted a field."
 
 [[gaps]]
 id = "artifact-counts-uncapped"

@@ -1,0 +1,68 @@
+package com.oai.titanarum;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * blastbox-engine.toml declares max_bytes for titan/scripts/* and titan/xfa/*. A JavaScript COSString (not a
+ * stream) and a base64 form payload reached writeTextArtifact uncapped, and re-encoding invalid UTF-8 as U+FFFD
+ * can grow a capped stream's bytes up to 3x, so the emitted file could exceed the declared cap. The writer
+ * itself must bound the bytes it puts on disk.
+ */
+class ScriptArtifactCapTest {
+
+    private static byte[] capUtf8(String s, int max) throws Exception {
+        Method m = PdfTitanArumApp.class.getDeclaredMethod("capUtf8", String.class, int.class);
+        m.setAccessible(true);
+        return (byte[]) m.invoke(null, s, max);
+    }
+
+    @Test
+    void underCapIsUnchanged() throws Exception {
+        assertArrayEquals("app.alert(1)".getBytes(StandardCharsets.UTF_8), capUtf8("app.alert(1)", 64));
+    }
+
+    @Test
+    void overCapIsTruncatedToTheCap() throws Exception {
+        assertEquals(10, capUtf8("x".repeat(100), 10).length);
+    }
+
+    @Test
+    void replacementCharExpansionStaysUnderCap() throws Exception {
+        // 10 invalid bytes decode to 10 U+FFFD = 30 UTF-8 bytes
+        String s = new String(new byte[]{(byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff,
+                (byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff}, StandardCharsets.UTF_8);
+        byte[] out = capUtf8(s, 10);
+        assertTrue(out.length <= 10, "got " + out.length);
+    }
+
+    @Test
+    void neverSplitsACodePoint() throws Exception {
+        String s = "ab" + "😀".repeat(4);   // 2 + 4*4 bytes
+        byte[] out = capUtf8(s, 7);                   // 2 + one emoji = 6 fits, 7 would split the second
+        assertEquals(6, out.length);
+        assertEquals("ab😀", new String(out, StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void writerBoundsTheFileOnDisk(@TempDir Path dir) throws Exception {
+        PdfTitanArumApp app = new PdfTitanArumApp();
+        java.lang.reflect.Field f = PdfTitanArumApp.class.getDeclaredField("outputDir");
+        f.setAccessible(true);
+        f.set(app, dir);
+        Method m = PdfTitanArumApp.class.getDeclaredMethod("writeCappedTextArtifact",
+                Path.class, String.class, String.class, int.class);
+        m.setAccessible(true);
+        m.invoke(app, dir, "big.js.txt", "y".repeat(5000), 1024);
+        Path out = dir.resolve("big.js.txt");
+        assertTrue(Files.isRegularFile(out));
+        assertEquals(1024, Files.size(out));
+    }
+}

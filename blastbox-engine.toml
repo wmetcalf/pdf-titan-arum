@@ -78,7 +78,7 @@ kind = "script"
 max_count = 0
 max_bytes = 10485760
 role = "javascript"
-description = "Each JavaScript action/name-tree/form-field script, truncated at MAX_SCRIPT_BYTES."
+description = "Each JavaScript action/name-tree/form-field script (and decoded base64 form payload), its written bytes truncated at MAX_SCRIPT_BYTES by the writer; the report hit's sha256 is of the untruncated code."
 
 [[artifacts]]
 id = "titan_xfa_*"
@@ -87,7 +87,7 @@ kind = "xfa"
 max_count = 0
 max_bytes = 10485760
 role = "xfa"
-description = "XFA form packet/scripts; packets over MAX_XFA_BYTES are not written."
+description = "XFA form packet/scripts; packets over MAX_XFA_BYTES are not written, and each extracted script's written bytes are truncated at MAX_XFA_BYTES."
 
 [[artifacts]]
 id = "titan_attachments_*"

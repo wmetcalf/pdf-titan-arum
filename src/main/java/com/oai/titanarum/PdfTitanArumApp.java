@@ -1606,7 +1606,7 @@ private boolean skipQrScan;
             hit.subtype = "JavaScript";
             hit.code = code;
             hit.sha256 = sha256(code == null ? new byte[0] : code.getBytes(StandardCharsets.UTF_8));
-            hit.file = writeTextArtifact(scriptsDir, sanitizeFileName(context) + ".js.txt", code == null ? "" : code);
+            hit.file = writeCappedTextArtifact(scriptsDir, sanitizeFileName(context) + ".js.txt", code, MAX_SCRIPT_BYTES);
             hits.add(hit);
         }
         COSBase next = dict.getDictionaryObject(COSName.NEXT);
@@ -1677,7 +1677,7 @@ private boolean skipQrScan;
             hit.contentType = contentType;
             hit.code = raw;
             hit.sha256 = sha256(raw == null ? new byte[0] : raw.getBytes(StandardCharsets.UTF_8));
-            hit.file = writeTextArtifact(xfaDir, "xfa-script-" + i + ".txt", raw == null ? "" : raw);
+            hit.file = writeCappedTextArtifact(xfaDir, "xfa-script-" + i + ".txt", raw, MAX_XFA_BYTES);
             hits.add(hit);
         }
         return hits;
@@ -1836,11 +1836,12 @@ private boolean skipQrScan;
                             }
                         }
                         if (looksText) {
-                            hit.decodedArtifact = writeTextArtifact(scriptsDir, artifactName + ".js.txt",
-                                new String(decoded, StandardCharsets.UTF_8));
+                            hit.decodedArtifact = writeCappedTextArtifact(scriptsDir, artifactName + ".js.txt",
+                                new String(decoded, StandardCharsets.UTF_8), MAX_SCRIPT_BYTES);
                         } else {
                             Path binPath = scriptsDir.resolve(artifactName + ".bin");
-                            Files.write(binPath, decoded);
+                            Files.write(binPath, decoded.length > MAX_SCRIPT_BYTES
+                                    ? java.util.Arrays.copyOf(decoded, MAX_SCRIPT_BYTES) : decoded);
                             hit.decodedArtifact = relativePath(binPath);
                         }
                     } catch (IllegalArgumentException e) {
@@ -3668,6 +3669,34 @@ for (int pageNum : pagesToProcess) {
     private String writeTextArtifact(Path dir, String fileName, String content) throws IOException {
         Path out = uniquePath(dir, fileName);
         Files.writeString(out, content == null ? "" : content, StandardCharsets.UTF_8);
+        return relativePath(out);
+    }
+
+    /**
+     * UTF-8 bytes of {@code s}, truncated to at most {@code maxBytes} on a code-point boundary. The cap is on the
+     * ENCODED bytes: a String decoded from invalid UTF-8 carries U+FFFD (3 bytes) per bad byte, so a source capped
+     * at N bytes can re-encode to up to 3N.
+     */
+    static byte[] capUtf8(String s, int maxBytes) {
+        return capUtf8Bytes((s == null ? "" : s).getBytes(StandardCharsets.UTF_8), maxBytes);
+    }
+
+    private static byte[] capUtf8Bytes(byte[] all, int maxBytes) {
+        if (all.length <= maxBytes) return all;
+        int end = Math.max(0, maxBytes);
+        while (end > 0 && (all[end] & 0xC0) == 0x80) end--;   // all[end] is the first byte NOT kept: back off a continuation
+        return java.util.Arrays.copyOf(all, end);
+    }
+
+    /** writeTextArtifact with the file's bytes bounded at {@code maxBytes} (the contract's declared max_bytes). */
+    private String writeCappedTextArtifact(Path dir, String fileName, String content, int maxBytes) throws IOException {
+        byte[] all = (content == null ? "" : content).getBytes(StandardCharsets.UTF_8);
+        byte[] bytes = capUtf8Bytes(all, maxBytes);
+        Path out = uniquePath(dir, fileName);
+        Files.write(out, bytes);
+        if (bytes.length < all.length) {
+            System.err.println("WARNING: " + fileName + " truncated at " + maxBytes + " bytes");
+        }
         return relativePath(out);
     }
 

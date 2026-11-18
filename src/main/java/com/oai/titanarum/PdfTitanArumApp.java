@@ -2624,8 +2624,9 @@ for (int pageNum : pagesToProcess) {
         if (!"jpg".equals(suffix) && !"jpx".equals(suffix) && !"jb2".equals(suffix)) return null;
         COSBase cosBase = xobj.getCOSObject();
         if (!(cosBase instanceof COSStream cosStream)) return null;
+        Path file = null;
         try {
-            Path file = uniquePath(outputDir, baseName + "." + suffix);
+            file = uniquePath(outputDir, baseName + "." + suffix);
             // We want the ORIGINAL encoded codestream (the real ffd8 JPEG / JP2 codestream / JBIG2),
             // not PDFBox's decoded raster: the hasher feeds it to the rosetta decode port so JPEG
             // hashes via turbojpeg (PIL-exact, fleet-uniform) and JP2/JBIG2 cleanly throw -> PDFBox
@@ -2646,6 +2647,10 @@ for (int pageNum : pagesToProcess) {
             return relativePath(file);
         } catch (IOException e) {
             System.err.println("WARNING: could not save original image bytes: " + e.getMessage());
+            // a partial (over-cap) file no report entry names would stay an undeclared artifact
+            if (file != null) {
+                try { Files.deleteIfExists(file); } catch (IOException ignored) { }
+            }
             return null;
         }
     }

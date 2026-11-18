@@ -722,6 +722,18 @@ def _distinct_first(hits: list[Any]) -> list[Any]:
     return first + rest
 
 
+def _split_distinct(ws: list[Warning]) -> tuple[list[Warning], list[Warning]]:
+    """(one warning per distinct (code, message), in order; the repeats)."""
+    seen: set[tuple[str, str]] = set()
+    first: list[Warning] = []
+    rest: list[Warning] = []
+    for w in ws:
+        key = (w.code, w.message)
+        (rest if key in seen else first).append(w)
+        seen.add(key)
+    return first, rest
+
+
 def _structural_rank(hit: Any) -> int:
     """JVM budget trips (the report is INCOMPLETE) ahead of cosmetic file-structure anomalies:
     the JVM appends them last, so a capped family's head would otherwise be cosmetic ones."""
@@ -801,17 +813,28 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     # Over budget. Reserve the last slot for the truncation marker so items + marker never
     # exceed `cap`; give every non-empty family one slot first (in severity order) so a flood
     # of one family can never hide another, then fill what is left in severity order.
+    # Then every DISTINCT (code, message) in severity order, and only then the repeats: one
+    # /Launch or /URI dict referenced from N annotations yields N identical hits, which must not
+    # displace a different finding of the same family or of a lower-severity one.
     slots = max(cap - 1 - len(warns), 0)
-    quota = [0] * len(families)
-    for i, (items, _) in enumerate(families):
-        if items and slots:
-            quota[i], slots = 1, slots - 1
-    for i, (items, _) in enumerate(families):
-        extra = min(len(items) - quota[i], slots)
-        if extra > 0:
-            quota[i], slots = quota[i] + extra, slots - extra
-    for (items, make), n in zip(families, quota, strict=True):
-        warns.extend(make(it) for it in items[:n])
+    split = [_split_distinct([make(it) for it in items]) for items, make in families]
+    taken: list[list[Warning]] = [[] for _ in families]
+    for i, (first, _) in enumerate(split):        # 1. one per non-empty family
+        if first and slots:
+            taken[i].append(first[0])
+            slots -= 1
+    for i, (first, _) in enumerate(split):        # 2. the other distinct findings
+        n = min(len(first) - len(taken[i]), slots)
+        if n > 0:
+            taken[i].extend(first[len(taken[i]):len(taken[i]) + n])
+            slots -= n
+    for i, (_, rest) in enumerate(split):         # 3. the repeats
+        n = min(len(rest), slots)
+        if n > 0:
+            taken[i].extend(rest[:n])
+            slots -= n
+    for t in taken:
+        warns.extend(t)
     if cap > 0:
         warns.append(Warning(code="warnings_truncated", message=f"warning list capped at {cap}"))
     return warns

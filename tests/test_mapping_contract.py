@@ -210,3 +210,15 @@ def test_no_single_js_flood_hides_another_indicator():
     codes = [w.code for w in eng._build_warnings(_report(jsIndicators=api + flood + struct))]
     assert codes.count("js_indicator.suspicious_api") == 2
     assert "js_indicator.suspicious_structure" in codes
+
+
+def test_a_repeat_flood_in_any_family_does_not_hide_a_distinct_finding():
+    # one /Launch or /URI dict referenced from N annotations gives N identical hits
+    report = _report(
+        launchActions=[{"operation": "open", "file": "readme.txt", "parameters": ""}] * 250
+        + [{"operation": "open", "file": "cmd.exe", "parameters": "/c powershell -enc AAAA"}],
+        actions=[{"type": "URI", "detail": "https://docs.example/help"}] * 250
+        + [{"type": "SubmitForm", "detail": "https://exfil.example/c"}])
+    warns = eng._build_warnings(report)
+    assert any("cmd.exe" in w.message for w in warns if w.code == "launch_action")
+    assert "action.SubmitForm" in [w.code for w in warns]

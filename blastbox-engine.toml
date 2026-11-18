@@ -219,7 +219,7 @@ description = "The JVM watchdog fired; the report is partial."
 code = "warnings_truncated"
 severity = "info"
 source = "warnings[].code == 'warnings_truncated' (last entry, when the 200-entry warning cap was hit)"
-description = "Over the cap, every non-empty finding family keeps at least one entry and the remaining slots go in severity order (within js_indicator: one hit per distinct indicator before any repeat, cve_detection and executable_dropper first, suspicious_api last; within structural, budget trips first); the dropped findings remain in report.json."
+description = "Over the cap, every non-empty finding family keeps at least one entry, then every distinct finding (code + message) in severity order, then the repeats (within js_indicator: one hit per distinct indicator before any repeat, cve_detection and executable_dropper first, suspicious_api last; within structural, budget trips first); the dropped findings remain in report.json."
 
 # --- gaps ------------------------------------------------------------------------------------
 [[gaps]]

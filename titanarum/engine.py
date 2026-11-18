@@ -867,10 +867,12 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     # /Launch or /URI dict referenced from N annotations yields N identical hits, which must not
     # displace a different finding of the same family or of a lower-severity one.
     slots = max(cap - 1 - len(warns), 0)
-    # Tiers, each in severity (family) order: one per family, then one per distinct CODE (a new
-    # action / js type), then every other distinct (code, message), then the repeats -- so neither
-    # identical hits (one dict referenced from N annotations) nor N distinct decoys of one code
-    # (N different URI links) can displace a finding of another code.
+    # Tiers (blastbox-engine.toml warnings_truncated): one per family; one per distinct CODE (a
+    # new action / js type); each code's SECOND distinct finding; then the other distinct
+    # (code, message) family by family in severity order, round-robin across a family's codes;
+    # then the repeats. So identical hits never displace a distinct finding, and N distinct decoys
+    # of one code cannot displace another code's first two findings or, within one family, its
+    # later ones; a higher-severity family's later findings do come before a lower family's.
     tiers = [_split_distinct((make(it) for it in items), keep=slots) for items, make in families]
     taken: list[list[Warning]] = [[] for _ in families]
     ordered: list[tuple[int, Warning]] = []

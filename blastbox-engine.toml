@@ -232,7 +232,7 @@ description = "The payload carries only a counts summary, embedded-file nodes an
 
 [[gaps]]
 id = "page-selection-cap-unmarked"
-description = "A page selection ('all' or an explicit range) is capped at MAX_PAGES_ALL = 1000; pages past it are not processed, and the cut is reported only on the worker's stderr, so a result can be ok with requested pages skipped. Owner decision: a report field / structural.* marker for the cut (report schema change)."
+description = "A page selection ('all' or an explicit range) is capped at MAX_PAGES_ALL = 1000 pages (blank-page fill may swap a blank selected page for a later non-blank one, so which pages are cut is in report.pagesProcessed, not simply those past 1000); the cut is reported only on the worker's stderr, so a result can be ok with requested pages skipped. Owner decision: a report field / structural.* marker for the cut (report schema change)."
 
 [[gaps]]
 id = "script-analysis-truncated-unmarked"

@@ -77,3 +77,24 @@ def test_corpus_result_conforms(tmp_path, jar, monkeypatch, pdf):
         assert jpx, [a.path for a in result.artifacts]
         head = (outdir / jpx[0].path).read_bytes()[:8]
         assert not head.startswith((b"\x89PNG", b"\xff\xd8\xff")), head
+
+
+def test_a_full_image_budget_fits_the_image_families():
+    # the JVM's image budget counts IMAGES; each may write a PNG decode and an original codestream,
+    # and a colliding original is renamed '...-original-1.jpg' (outside the -original family). A
+    # budget-full document must not trip artifact_count, and a PNG named '*-original' must not fall
+    # under the original-bytes byte cap.
+    from titanarum import engine as eng
+    used: set[str] = set()
+    sfx = [""] + [f"-{i}" for i in range(1, 2000)]
+    paths = [("titan/report.json", "report")]
+    res = "titan/images_resources/resource-page-0001-Im0"
+    paths += [(f"{res}{s}.png", "image") for s in sfx]
+    paths += [(f"{res}-original{s}.jpg", "image") for s in sfx]
+    arts = [(eng._safe_artifact_id(p, used), p, k, 1) for p, k in paths]
+    v = ec._check(CONTRACT, engine=None, status="ok", artifacts=arts, payload=None)
+    assert not [x for x in v if x.code == "artifact_count"], [str(x) for x in v]
+    big_png = [(eng._safe_artifact_id("titan/images_rendered/x-original.png", set()),
+                "titan/images_rendered/x-original.png", "image", 200 * 1024 * 1024)]
+    v = ec._check(CONTRACT, engine=None, status="ok", artifacts=big_png, payload=None)
+    assert not [x for x in v if "large" in x.code or "bytes" in x.code], [str(x) for x in v]

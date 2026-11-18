@@ -460,7 +460,12 @@ _FILE_REF_FIELDS: tuple[tuple[str, str], ...] = (
     ("xfaScripts", "file"), ("embeddedFiles", "file"), ("renderedImages", "path"),
     ("renderedImages", "originalPath"), ("resourceImages", "path"),
     ("resourceImages", "originalPath"), ("urls", "cropPath"), ("launchActions", "artifact"),
+    ("formFields", "decodedArtifact"),
 )
+
+# Files the JVM writes at a FIXED name that no report field references (checked by stat, which a
+# stale readdir does not affect): the raw XFA packet.
+_FIXED_FILES: tuple[str, ...] = ("xfa/xfa.xml",)
 
 
 def _report_file_refs(report: dict) -> list[Any]:
@@ -476,6 +481,7 @@ def _report_file_refs(report: dict) -> list[Any]:
 
     for arr_key, field in _FILE_REF_FIELDS:
         _collect(report, arr_key, field)
+    out.extend(_FIXED_FILES)
     revisions = report.get("revisions")
     for rev in revisions if isinstance(revisions, list) else []:
         _collect(rev, "screenshots", "path")
@@ -664,6 +670,13 @@ def _build_detection(report: dict) -> Detection:
     file_magic; the detection says only whether this is a PDF."""
     if _as_str(report.get("fileMagic")).startswith("%PDF"):
         return Detection(label="pdf", mime="application/pdf", confidence=1.0,
+                         source="titanarum")
+    # %PDF found past byte 0 (within the JVM's 1024-byte window): fileMagic named the leading
+    # junk, but the JVM parsed the input as a PDF and recorded where the header was
+    anomalies = report.get("structuralAnomalies")
+    if isinstance(anomalies, list) and any(
+            isinstance(a, dict) and a.get("type") == "header_offset" for a in anomalies):
+        return Detection(label="pdf", mime="application/pdf", confidence=0.9,
                          source="titanarum")
     return Detection(label="unknown", mime="application/octet-stream", confidence=0.0,
                      source="titanarum")

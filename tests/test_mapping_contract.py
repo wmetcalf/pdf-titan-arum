@@ -104,6 +104,7 @@ def test_reconstruction_declares_what_the_listing_declares(tmp_path):
         "images_resources/resource-page-0001-Im0.png",
         "images_resources/resource-page-0001-Im0-original.jb2",
         "revisions/rev-001/page-0001.png", "revisions/rev-001/url_crops/url-p0001-0001.png",
+        "scripts/field-payload-decoded.js.txt", "xfa/xfa.xml",
     ]
     for f in files:
         (rd / f).parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +114,8 @@ def test_reconstruction_declares_what_the_listing_declares(tmp_path):
         urls=[{"url": "https://a", "cropPath": "url_crops/url-p0001-0001.png"},
               {"url": "https://b", "cropPath": "url_crops/url-p0001-0001.png"}],
         launchActions=[{"operation": "open", "artifact": "launch_actions/launch-0001.bin"}],
+        formFields=[{"name": "payload", "flags": ["base64_payload"],
+                     "decodedArtifact": "scripts/field-payload-decoded.js.txt"}],
         renderedImages=[{
             "path": "images_rendered/drawn-page-0001-image-0001.png",
             "originalPath": "images_rendered/drawn-page-0001-image-0001-original.jpx"}],
@@ -130,3 +133,14 @@ def test_reconstruction_declares_what_the_listing_declares(tmp_path):
     as_set = lambda arts: {(a.path, a.kind) for a in arts}  # noqa: E731
     assert as_set(rebuilt) == as_set(listed)
     assert len({a.id for a in rebuilt}) == len(rebuilt)
+
+
+def test_detection_of_a_pdf_behind_leading_junk_is_pdf():
+    # the JVM accepts %PDF within the first 1024 bytes and records a header_offset anomaly; its
+    # fileMagic is taken from byte 0, so it names the junk, not the PDF it parsed
+    det = eng._build_detection(_report(
+        fileMagic="unknown",
+        structuralAnomalies=[{"type": "header_offset", "detail": "%PDF header at byte 7",
+                              "offset": 7}]))
+    assert (det.label, det.mime) == ("pdf", "application/pdf")
+    assert 0.0 < det.confidence < 1.0

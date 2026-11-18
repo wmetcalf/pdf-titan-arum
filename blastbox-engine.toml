@@ -8,7 +8,8 @@ schema = "blastbox-engine-contract/1"
 # titan_screenshots_page-0001.png), truncated to 120 chars, with _N appended on a collision.
 #
 # max_count: 2000 is the JVM's per-document image budget (TITANARUM_MAX_IMAGES_EXTRACTED, default
-# 2000, shared by screenshots, revision screenshots and extracted images). max_count = 0 marks a
+# 2000, shared by screenshots, revision screenshots and extracted images); it counts IMAGES, and an
+# image can write two files (PNG decode + original codestream). max_count = 0 marks a
 # family the engine does NOT cap at all (see gap artifact-counts-uncapped).
 
 [engine]
@@ -40,7 +41,7 @@ description = "page-NNNN.png per processed page (default selection: pages 1-4 + 
 
 [[artifacts]]
 id = "titan_images_*-original*"
-path = "titan/images_*/*-original.*"
+path = "titan/images_*/*-original.j??"
 kind = "image"
 max_count = 2000
 max_bytes = 104857600
@@ -51,9 +52,9 @@ description = "The original encoded codestream of a JPEG (.jpg), JPEG2000 (.jpx)
 id = "titan_images_*"
 path = "titan/images_*/*"
 kind = "image"
-max_count = 2000
+max_count = 4000
 role = "image"
-description = "PNG decode of each drawn (images_rendered/) or resource (images_resources/) image XObject. skip_images turns it off."
+description = "PNG decode of each drawn (images_rendered/) or resource (images_resources/) image XObject. skip_images turns it off. 4000 = two files per budgeted image: an original whose name collided ('-original-1.jpg') or whose id was truncated lands here beside the PNGs."
 
 [[artifacts]]
 id = "titan_url_crops_*"

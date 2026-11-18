@@ -858,7 +858,9 @@ private boolean skipQrScan;
                 // Also analyze decoded form-field payloads (the *actual* exploit code)
                 if (report.formFields != null) {
                     for (FormFieldHit ff : report.formFields) {
-                        if (ff.decodedArtifact != null) {
+                        if (ff.decodedText != null) {   // the full payload, not the capped artifact file
+                            analyzeCodeIndicators(ff.decodedText, "formField[" + ff.name + "].decodedPayload", ji);
+                        } else if (ff.decodedArtifact != null) {
                             try {
                                 String decoded = Files.readString(outputDir.resolve(ff.decodedArtifact), StandardCharsets.UTF_8);
                                 analyzeCodeIndicators(decoded, "formField[" + ff.name + "].decodedPayload", ji);
@@ -1836,8 +1838,9 @@ private boolean skipQrScan;
                             }
                         }
                         if (looksText) {
+                            hit.decodedText = new String(decoded, StandardCharsets.UTF_8);
                             hit.decodedArtifact = writeCappedTextArtifact(scriptsDir, artifactName + ".js.txt",
-                                new String(decoded, StandardCharsets.UTF_8), MAX_SCRIPT_BYTES);
+                                hit.decodedText, MAX_SCRIPT_BYTES);
                         } else {
                             Path binPath = scriptsDir.resolve(artifactName + ".bin");
                             Files.write(binPath, decoded.length > MAX_SCRIPT_BYTES
@@ -6014,6 +6017,10 @@ for (int pageNum : pagesToProcess) {
         public List<String> flags;
         /** Path to artifact file containing the decoded payload (when base64 detected). */
         public String decodedArtifact;
+        /** The FULL decoded text payload, for indicator analysis: the artifact file is capped at
+         *  MAX_SCRIPT_BYTES, and code past the cap must still be analysed. Not serialised. */
+        @JsonIgnore
+        public transient String decodedText;
         /** SHA-256 of the decoded payload. */
         public String decodedSha256;
         /** Length of the decoded payload in bytes. */

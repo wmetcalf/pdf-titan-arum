@@ -753,13 +753,17 @@ def _split_distinct(ws: Iterable[Warning], keep: int
 
 
 def _round_robin(buckets: list[tuple[int, list[Warning]]]) -> list[tuple[int, Warning]]:
-    """Interleave (family, per-code bucket) pairs, first-seen order: N distinct decoys of one code
-    (URI links, decoy /Launch opens) must not displace the second finding of another code, in
-    this family or a lower-severity one."""
+    """Family by family in severity order (``buckets`` come in family order), interleaving that
+    family's per-code buckets: N distinct decoys of one code do not displace another code's
+    findings in the same family, and no lower-severity family displaces a higher one's."""
     out: list[tuple[int, Warning]] = []
-    depth = max((len(q) for _, q in buckets), default=0)
-    for n in range(depth):
-        out.extend((fam, q[n]) for fam, q in buckets if n < len(q))
+    fams: dict[int, list[list[Warning]]] = {}
+    for fam, q in buckets:
+        fams.setdefault(fam, []).append(q)
+    for fam, qs in fams.items():
+        depth = max((len(q) for q in qs), default=0)
+        for n in range(depth):
+            out.extend((fam, q[n]) for q in qs if n < len(q))
     return out
 
 
@@ -872,7 +876,9 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     ordered: list[tuple[int, Warning]] = []
     ordered += [(i, t[0][0]) for i, t in enumerate(tiers) if t[0]]            # the family floor
     ordered += [(i, w) for i, t in enumerate(tiers) for w in t[0][1:]]       # other new codes
-    ordered += _round_robin([(i, q) for i, t in enumerate(tiers) for q in t[1]])  # other msgs
+    buckets = [(i, q) for i, t in enumerate(tiers) for q in t[1]]
+    ordered += [(i, q[0]) for i, q in buckets if q]        # each code's 2nd finding, globally
+    ordered += _round_robin([(i, q[1:]) for i, q in buckets])    # the rest, family by family
     ordered += [(i, w) for i, t in enumerate(tiers) for w in t[2]]           # the repeats
     for fam, w in ordered[:slots]:
         taken[fam].append(w)

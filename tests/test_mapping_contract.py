@@ -261,3 +261,17 @@ def test_a_decoy_of_the_same_code_does_not_hide_a_second_finding_of_that_code():
     warns = eng._build_warnings(report)
     assert unc in [w.message for w in warns if w.code == "action.ImportData"]
     assert any("update.jar" in w.message for w in warns if w.code == "launch_action")
+
+
+def test_lower_severity_decoys_do_not_displace_a_higher_families_distinct_findings():
+    d = range(30)
+    report = _report(
+        jsIndicators=[{"type": "suspicious_api", "indicator": f"api{k}", "detail": "d"} for k in d],
+        actions=[{"type": t, "target": f"{t}{i}"}
+                 for t in ("URI", "SubmitForm", "ImportData", "GoToR", "Named", "Rendition")
+                 for i in d],
+        launchActions=[{"operation": "open", "file": f"r{i}.txt"} for i in d],
+        urls=[{"url": f"u{i}", "flags": ["f"]} for i in d],
+        formFields=[{"name": f"f{i}", "flags": []} for i in d])
+    w = eng._build_warnings(report)
+    assert sum(x.code == "js_indicator.suspicious_api" for x in w) == 30

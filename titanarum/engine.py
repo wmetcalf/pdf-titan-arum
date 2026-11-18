@@ -695,6 +695,15 @@ def _clip(s: Any, n: int) -> str:
     return str(s)[:n]
 
 
+# js_indicator types ranked ahead of the rest of their family under the warning cap.
+_JS_PRIORITY = {"cve_detection": 0, "executable_dropper": 1}
+
+
+def _js_rank(hit: Any) -> int:
+    kind = hit.get("type") if isinstance(hit, dict) else None
+    return _JS_PRIORITY.get(kind, 9) if isinstance(kind, str) else 9
+
+
 def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     warns: list[Warning] = []
 
@@ -709,8 +718,13 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
                                2000)))
 
     # Families in severity order (high -> info, matching blastbox-engine.toml [[detections]]).
+    # Within js_indicator the composite findings go first: the JVM appends executable_dropper and
+    # the CVE composite LAST, so a flood of plain suspicious_api hits would cut them off the head.
+    js = report.get("jsIndicators")
+    if isinstance(js, list):
+        js = sorted(js, key=_js_rank)
     seqs = [
-        (report.get("jsIndicators"),
+        (js,
          lambda i: Warning(code=_clip(f"js_indicator.{i.get('type','')}", 64),
                            message=_clip(f"{i.get('indicator','')}: {i.get('detail','')}", 2000),
                            context=_clip(i.get("context", ""), 255) or None)),

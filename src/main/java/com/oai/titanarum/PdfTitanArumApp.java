@@ -812,6 +812,16 @@ private boolean skipQrScan;
                     EmbeddedFileHit existing = seen.get(key);
                     if (existing != null) {
                         existing.duplicateCount = (existing.duplicateCount != null ? existing.duplicateCount : 1) + 1;
+                        // Same name and sha256: the duplicate's file (uniquePath's a-1.ext) holds the same
+                        // bytes and no report entry will name it, so remove it rather than leave an
+                        // unreferenced artifact a report-driven rebuild cannot declare.
+                        if (ef.file != null && !ef.file.equals(existing.file)) {
+                            try {
+                                Files.deleteIfExists(safeResolve(outputDir.toAbsolutePath(), ef.file));
+                            } catch (IOException | RuntimeException ignored) {
+                                // best effort: the listing still declares it if it stays
+                            }
+                        }
                     } else {
                         seen.put(key, ef);
                     }
@@ -2493,9 +2503,9 @@ private boolean skipQrScan;
             ScreenshotArtifact ss = pageToShot.get(hit.page);
             if (ss == null) continue;
 
-            String dedupeKey = hit.url + "|" + hit.page + "|"
-                + hit.bounds.left + "," + hit.bounds.bottom + ","
-                + hit.bounds.right + "," + hit.bounds.top;
+            // The same key dedupeUrlHits uses (bounds rounded to 2 decimals): a raw-float key made a
+            // second crop for two near-identical links whose report entries then collapse to one.
+            String dedupeKey = hit.url + "|" + hit.page + "|" + hit.bounds.toKey();
             String existing = seen.get(dedupeKey);
             if (existing != null) {
                 hit.cropPath = existing;

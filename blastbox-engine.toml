@@ -219,7 +219,7 @@ description = "The JVM watchdog fired; the report is partial."
 code = "warnings_truncated"
 severity = "info"
 source = "warnings[].code == 'warnings_truncated' (last entry, when the 200-entry warning cap was hit)"
-description = "Over the cap, every non-empty finding family keeps at least one entry and the remaining slots go in severity order; the dropped findings remain in report.json."
+description = "Over the cap, every non-empty finding family keeps at least one entry and the remaining slots go in severity order (within js_indicator, cve_detection and executable_dropper first); the dropped findings remain in report.json."
 
 # --- gaps ------------------------------------------------------------------------------------
 [[gaps]]
@@ -229,6 +229,10 @@ description = "Every finding is a blastbox Warning: no severity, no confidence, 
 [[gaps]]
 id = "payload-omits-report"
 description = "The payload carries only a counts summary, embedded-file nodes and screenshot Pages. URLs, page text, phone numbers, emails, tables, scripts, actions, revisions and resource images exist only in titan/report.json, which a consumer must fetch and parse itself. Left: Loadout reads these from report.json today; duplicating them as typed nodes is a payload-budget design decision."
+
+[[gaps]]
+id = "script-analysis-truncated-unmarked"
+description = "A /JS stream is read, and so analysed, only up to MAX_SCRIPT_BYTES (10 MiB), and an XFA packet over MAX_XFA_BYTES skips script extraction; Flate makes such a payload tiny. The cut is reported only on the worker's stderr: no report field or structural.* warning marks a script as not fully analysed, so a consumer cannot tell 'clean' from 'not analysed past 10 MiB'. Owner decision: analyse streamed (no cap on analysis), or add a truncation marker to the report schema. (Form-field payloads ARE analysed in full.)"
 
 [[gaps]]
 id = "host-trust-gate-caps"

@@ -155,3 +155,14 @@ def test_detection_of_a_junk_prefixed_pdf_that_stopped_early_is_pdf():
         fileMagic="unknown (magic: 4a 55 4e 4b)",
         parseError="PDF is password-protected (use --password to supply one)"))
     assert (det.label, det.mime) == ("pdf", "application/pdf") and det.confidence < 1.0
+
+
+def test_the_composite_js_findings_survive_a_flood_of_their_own_family():
+    # the JVM appends the executable_dropper and CVE composite LAST; 250 ordinary suspicious_api
+    # hits in the same family pushed both out of the capped warnings
+    flood = [{"type": "suspicious_api", "indicator": "getField", "detail": "x"} for _ in range(250)]
+    report = _report(jsIndicators=flood + [
+        {"type": "executable_dropper", "indicator": "exportDataObject", "detail": "drop"},
+        {"type": "cve_detection", "indicator": "CVE-2026-34261", "detail": "chain"}])
+    codes = [w.code for w in eng._build_warnings(report)]
+    assert "js_indicator.cve_detection" in codes and "js_indicator.executable_dropper" in codes

@@ -122,3 +122,62 @@ def test_same_named_binary_payloads_keep_both_files(tmp_path, monkeypatch):
     arts = [f.get("decodedArtifact") for f in report.get("formFields") or []]
     assert len(arts) == 2 and len(set(arts)) == 2, arts
     assert "exportDataObject" in _indicators(report, "a b")
+
+
+def _run_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+              pdf_bytes: bytes) -> tuple[Path, dict]:
+    """Like _run, with screenshots on (URL crops need them)."""
+    monkeypatch.setenv("TITANARUM_SKIP_SCREENSHOTS", "0")
+    if not shutil.which("java") or not JAR.is_file():
+        pytest.skip("needs java and the built jar")
+    from blastbox.limits import Limits
+
+    from titanarum.engine import TitanArumEngine
+
+    for k in ("TITANARUM_JAVA_OPTS", "TITANARUM_AOT_CACHE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("TITANARUM_WORKER_JAR", str(JAR))
+    monkeypatch.setenv("TITANARUM_SKIP_IMAGES", "1")
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(pdf_bytes)
+    out = tmp_path / "out"
+    out.mkdir()
+    TitanArumEngine().detonate(pdf, out, Limits.from_env())
+    return out / "titan", json.loads((out / "titan" / "report.json").read_text())
+
+
+def _referenced(report: dict, key: str, field: str) -> set[str]:
+    return {h[field] for h in report.get(key) or [] if isinstance(h, dict) and h.get(field)}
+
+
+@pytest.mark.jvm
+def test_collapsed_duplicate_attachments_leave_no_unreferenced_file(tmp_path, monkeypatch):
+    # the JVM wrote every attachment, then collapsed same name + sha256 hits into one: the second
+    # file stayed on disk with no report reference, so a report-driven rebuild could not declare it
+    titan, report = _run(tmp_path, monkeypatch, _pdf([
+        b"<</Type/Catalog/Pages 2 0 R/Names<</EmbeddedFiles<</Names[(a) 3 0 R (b) 4 0 R]>>>>>>",
+        b"<</Type/Pages/Kids[]/Count 0>>",
+        b"<</Type/Filespec/F(a.txt)/UF(a.txt)/EF<</F 5 0 R>>>>",
+        b"<</Type/Filespec/F(a.txt)/UF(a.txt)/EF<</F 5 0 R>>>>",
+        b"<</Type/EmbeddedFile/Length 5>>stream\nhello\nendstream",
+    ]))
+    on_disk = {f"attachments/{p.name}" for p in (titan / "attachments").glob("*")}
+    refs = _referenced(report, "embeddedFiles", "file")
+    assert on_disk and on_disk == refs, (on_disk, report.get("embeddedFiles"))
+
+
+@pytest.mark.jvm
+def test_url_crops_are_deduplicated_like_the_report(tmp_path, monkeypatch):
+    # crops were keyed on raw float bounds, the report's URL hits on bounds rounded to 2 decimals:
+    # two near-identical links left a crop file no report entry names
+    annot = (b"<</Type/Annot/Subtype/Link/Rect[100 %s 300 120]/Border[0 0 0]"
+             b"/A<</S/URI/URI(https://example.com/x)>>>>")
+    titan, report = _run_full(tmp_path, monkeypatch, _pdf([
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Annots[4 0 R 5 0 R]>>",
+        annot % b"100.001",
+        annot % b"100.002",
+    ]))
+    on_disk = {f"url_crops/{p.name}" for p in (titan / "url_crops").glob("*")}
+    assert on_disk == _referenced(report, "urls", "cropPath"), (on_disk, report.get("urls"))

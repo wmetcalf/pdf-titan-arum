@@ -707,6 +707,21 @@ def _js_rank(hit: Any) -> int:
     return _JS_PRIORITY.get(kind, 5) if isinstance(kind, str) else 9
 
 
+def _distinct_first(hits: list[Any]) -> list[Any]:
+    """One hit per distinct (type, indicator) first, in the given order, then the repeats: a flood
+    is many hits of ONE indicator (one action referenced from N annotations), so no flood can
+    displace a different indicator from the capped family's head."""
+    seen: set[tuple[str, str]] = set()
+    first: list[Any] = []
+    rest: list[Any] = []
+    for h in hits:
+        key = ((str(h.get("type")), str(h.get("indicator"))) if isinstance(h, dict)
+               else ("", repr(h)))
+        (rest if key in seen else first).append(h)
+        seen.add(key)
+    return first + rest
+
+
 def _structural_rank(hit: Any) -> int:
     """JVM budget trips (the report is INCOMPLETE) ahead of cosmetic file-structure anomalies:
     the JVM appends them last, so a capped family's head would otherwise be cosmetic ones."""
@@ -737,7 +752,7 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     # the CVE composite LAST, so a flood of plain suspicious_api hits would cut them off the head.
     js = report.get("jsIndicators")
     if isinstance(js, list):
-        js = sorted(js, key=_js_rank)
+        js = _distinct_first(sorted(js, key=_js_rank))
     seqs = [
         (js,
          lambda i: Warning(code=_clip(f"js_indicator.{i.get('type','')}", 64),

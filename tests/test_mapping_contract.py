@@ -199,3 +199,14 @@ def test_a_budget_trip_keeps_the_structural_slot_under_a_flood():
                              {"type": "images_extracted_cap_exceeded", "detail": "y"}])
     codes = [w.code for w in eng._build_warnings(report)]
     assert "structural.images_extracted_cap_exceeded" in codes, codes[-5:]
+
+
+def test_no_single_js_flood_hides_another_indicator():
+    # a flood is many hits of ONE indicator; every distinct indicator gets a slot before any repeat
+    api = [{"type": "suspicious_api", "indicator": i, "detail": "d"}
+           for i in ("exportDataObject", "nLaunch_autolaunch")]
+    flood = [{"type": "suspicious_action", "indicator": "file_uri_action", "detail": "d"}] * 250
+    struct = [{"type": "suspicious_structure", "indicator": "fontmatrix_injection", "detail": "d"}]
+    codes = [w.code for w in eng._build_warnings(_report(jsIndicators=api + flood + struct))]
+    assert codes.count("js_indicator.suspicious_api") == 2
+    assert "js_indicator.suspicious_structure" in codes

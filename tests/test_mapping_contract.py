@@ -166,3 +166,16 @@ def test_the_composite_js_findings_survive_a_flood_of_their_own_family():
         {"type": "cve_detection", "indicator": "CVE-2026-34261", "detail": "chain"}])
     codes = [w.code for w in eng._build_warnings(report)]
     assert "js_indicator.cve_detection" in codes and "js_indicator.executable_dropper" in codes
+
+
+
+def test_every_non_flood_js_type_survives_a_suspicious_api_flood():
+    # suspicious_action (UNC / NTLM theft) and suspicious_structure (CVE-2024-4367 FontMatrix,
+    # CVE-2010-0188) are also appended after the per-script suspicious_api hits
+    flood = [{"type": "suspicious_api", "indicator": "getField", "detail": "x"} for _ in range(240)]
+    report = _report(jsIndicators=flood + [
+        {"type": "suspicious_action", "indicator": "unc_path_gotor", "detail": "d"},
+        {"type": "suspicious_structure", "indicator": "fontmatrix_injection", "detail": "d"}])
+    codes = [w.code for w in eng._build_warnings(report)]
+    assert "js_indicator.suspicious_action" in codes
+    assert "js_indicator.suspicious_structure" in codes

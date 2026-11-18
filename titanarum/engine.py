@@ -695,13 +695,14 @@ def _clip(s: Any, n: int) -> str:
     return str(s)[:n]
 
 
-# js_indicator types ranked ahead of the rest of their family under the warning cap.
-_JS_PRIORITY = {"cve_detection": 0, "executable_dropper": 1}
+# js_indicator order under the warning cap: the composites first, every other type next, and the
+# per-script suspicious_api hits (the flood) last -- the JVM appends the rest after them.
+_JS_PRIORITY = {"cve_detection": 0, "executable_dropper": 1, "suspicious_api": 9}
 
 
 def _js_rank(hit: Any) -> int:
     kind = hit.get("type") if isinstance(hit, dict) else None
-    return _JS_PRIORITY.get(kind, 9) if isinstance(kind, str) else 9
+    return _JS_PRIORITY.get(kind, 5) if isinstance(kind, str) else 9
 
 
 def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:

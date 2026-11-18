@@ -29,7 +29,7 @@ def main() -> int:
         "generatedAt": "2026-07-10T12:00:00Z",
         "documentSha256": job.get("sha256") or ("0" * 64),
         "pdfObjectHash": "d41d8cd98f00b204e9800998ecf8427e",
-        "fileMagic": "255044462d312e34",
+        "fileMagic": "%PDF-1.4",
         "documentInfo": {"pdfVersion": "1.4"},
         "pageCount": 1, "blankPageCount": 0, "pagesSpec": job.get("pages", "default"),
         "pagesProcessed": [1], "qrScanEnabled": not job.get("skip_qr", False),

@@ -812,6 +812,16 @@ private boolean skipQrScan;
                     EmbeddedFileHit existing = seen.get(key);
                     if (existing != null) {
                         existing.duplicateCount = (existing.duplicateCount != null ? existing.duplicateCount : 1) + 1;
+                        // Same name and sha256: the duplicate's file (uniquePath's a-1.ext) holds the same
+                        // bytes and no report entry will name it, so remove it rather than leave an
+                        // unreferenced artifact a report-driven rebuild cannot declare.
+                        if (ef.file != null && !ef.file.equals(existing.file)) {
+                            try {
+                                Files.deleteIfExists(safeResolve(outputDir.toAbsolutePath(), ef.file));
+                            } catch (IOException | RuntimeException ignored) {
+                                // best effort: the listing still declares it if it stays
+                            }
+                        }
                     } else {
                         seen.put(key, ef);
                     }
@@ -858,7 +868,9 @@ private boolean skipQrScan;
                 // Also analyze decoded form-field payloads (the *actual* exploit code)
                 if (report.formFields != null) {
                     for (FormFieldHit ff : report.formFields) {
-                        if (ff.decodedArtifact != null) {
+                        if (ff.decodedIndicators != null) {   // found in the full payload, not the capped file
+                            ji.addAll(ff.decodedIndicators);
+                        } else if (ff.decodedArtifact != null) {
                             try {
                                 String decoded = Files.readString(outputDir.resolve(ff.decodedArtifact), StandardCharsets.UTF_8);
                                 analyzeCodeIndicators(decoded, "formField[" + ff.name + "].decodedPayload", ji);
@@ -1606,7 +1618,7 @@ private boolean skipQrScan;
             hit.subtype = "JavaScript";
             hit.code = code;
             hit.sha256 = sha256(code == null ? new byte[0] : code.getBytes(StandardCharsets.UTF_8));
-            hit.file = writeTextArtifact(scriptsDir, sanitizeFileName(context) + ".js.txt", code == null ? "" : code);
+            hit.file = writeCappedTextArtifact(scriptsDir, sanitizeFileName(context) + ".js.txt", code, MAX_SCRIPT_BYTES);
             hits.add(hit);
         }
         COSBase next = dict.getDictionaryObject(COSName.NEXT);
@@ -1677,7 +1689,7 @@ private boolean skipQrScan;
             hit.contentType = contentType;
             hit.code = raw;
             hit.sha256 = sha256(raw == null ? new byte[0] : raw.getBytes(StandardCharsets.UTF_8));
-            hit.file = writeTextArtifact(xfaDir, "xfa-script-" + i + ".txt", raw == null ? "" : raw);
+            hit.file = writeCappedTextArtifact(xfaDir, "xfa-script-" + i + ".txt", raw, MAX_XFA_BYTES);
             hits.add(hit);
         }
         return hits;
@@ -1835,12 +1847,23 @@ private boolean skipQrScan;
                                 break;
                             }
                         }
+                        // The FULL payload is analysed here, at decode time (the artifact file is capped
+                        // at MAX_SCRIPT_BYTES), decoded leniently for text AND binary payloads: one invalid
+                        // byte inside a JS comment must not hide the code around it. Only the indicator
+                        // hits are kept, so the heap holds one decoded payload at a time.
+                        String decodedText = new String(decoded, StandardCharsets.UTF_8);
+                        hit.decodedIndicators = new ArrayList<>();
+                        analyzeCodeIndicators(decodedText, "formField[" + fieldName + "].decodedPayload",
+                                hit.decodedIndicators);
                         if (looksText) {
-                            hit.decodedArtifact = writeTextArtifact(scriptsDir, artifactName + ".js.txt",
-                                new String(decoded, StandardCharsets.UTF_8));
+                            hit.decodedArtifact = writeCappedTextArtifact(scriptsDir, artifactName + ".js.txt",
+                                decodedText, MAX_SCRIPT_BYTES);
                         } else {
-                            Path binPath = scriptsDir.resolve(artifactName + ".bin");
-                            Files.write(binPath, decoded);
+                            // uniquePath, like the text branch: two field names that sanitise alike
+                            // overwrote one .bin, and the first payload was lost
+                            Path binPath = uniquePath(scriptsDir, artifactName + ".bin");
+                            Files.write(binPath, decoded.length > MAX_SCRIPT_BYTES
+                                    ? java.util.Arrays.copyOf(decoded, MAX_SCRIPT_BYTES) : decoded);
                             hit.decodedArtifact = relativePath(binPath);
                         }
                     } catch (IllegalArgumentException e) {
@@ -2480,9 +2503,9 @@ private boolean skipQrScan;
             ScreenshotArtifact ss = pageToShot.get(hit.page);
             if (ss == null) continue;
 
-            String dedupeKey = hit.url + "|" + hit.page + "|"
-                + hit.bounds.left + "," + hit.bounds.bottom + ","
-                + hit.bounds.right + "," + hit.bounds.top;
+            // The same key dedupeUrlHits uses (bounds rounded to 2 decimals): a raw-float key made a
+            // second crop for two near-identical links whose report entries then collapse to one.
+            String dedupeKey = hit.url + "|" + hit.page + "|" + hit.bounds.toKey();
             String existing = seen.get(dedupeKey);
             if (existing != null) {
                 hit.cropPath = existing;
@@ -2601,8 +2624,9 @@ for (int pageNum : pagesToProcess) {
         if (!"jpg".equals(suffix) && !"jpx".equals(suffix) && !"jb2".equals(suffix)) return null;
         COSBase cosBase = xobj.getCOSObject();
         if (!(cosBase instanceof COSStream cosStream)) return null;
+        Path file = null;
         try {
-            Path file = uniquePath(outputDir, baseName + "." + suffix);
+            file = uniquePath(outputDir, baseName + "." + suffix);
             // We want the ORIGINAL encoded codestream (the real ffd8 JPEG / JP2 codestream / JBIG2),
             // not PDFBox's decoded raster: the hasher feeds it to the rosetta decode port so JPEG
             // hashes via turbojpeg (PIL-exact, fleet-uniform) and JP2/JBIG2 cleanly throw -> PDFBox
@@ -2623,6 +2647,10 @@ for (int pageNum : pagesToProcess) {
             return relativePath(file);
         } catch (IOException e) {
             System.err.println("WARNING: could not save original image bytes: " + e.getMessage());
+            // a partial (over-cap) file no report entry names would stay an undeclared artifact
+            if (file != null) {
+                try { Files.deleteIfExists(file); } catch (IOException ignored) { }
+            }
             return null;
         }
     }
@@ -2794,6 +2822,13 @@ for (int pageNum : pagesToProcess) {
             if (pageCount > 4) {
                 pages.add(pageCount);
             }
+        }
+        // An explicit selection is held to the same ceiling as "all": every selected page costs a
+        // screenshot, a page PDF and its URL crops, so a range must not bypass MAX_PAGES_ALL.
+        if (pages.size() > MAX_PAGES_ALL) {
+            System.err.println("WARNING: --pages selection capped at " + MAX_PAGES_ALL
+                + " of " + pages.size() + " selected pages");
+            return new ArrayList<>(new ArrayList<>(pages).subList(0, MAX_PAGES_ALL));
         }
         return new ArrayList<>(pages);
     }
@@ -3664,6 +3699,34 @@ for (int pageNum : pagesToProcess) {
         return relativePath(out);
     }
 
+    /**
+     * UTF-8 bytes of {@code s}, truncated to at most {@code maxBytes} on a code-point boundary. The cap is on the
+     * ENCODED bytes: a String decoded from invalid UTF-8 carries U+FFFD (3 bytes) per bad byte, so a source capped
+     * at N bytes can re-encode to up to 3N.
+     */
+    static byte[] capUtf8(String s, int maxBytes) {
+        return capUtf8Bytes((s == null ? "" : s).getBytes(StandardCharsets.UTF_8), maxBytes);
+    }
+
+    private static byte[] capUtf8Bytes(byte[] all, int maxBytes) {
+        if (all.length <= maxBytes) return all;
+        int end = Math.max(0, maxBytes);
+        while (end > 0 && (all[end] & 0xC0) == 0x80) end--;   // all[end] is the first byte NOT kept: back off a continuation
+        return java.util.Arrays.copyOf(all, end);
+    }
+
+    /** writeTextArtifact with the file's bytes bounded at {@code maxBytes} (the contract's declared max_bytes). */
+    private String writeCappedTextArtifact(Path dir, String fileName, String content, int maxBytes) throws IOException {
+        byte[] all = (content == null ? "" : content).getBytes(StandardCharsets.UTF_8);
+        byte[] bytes = capUtf8Bytes(all, maxBytes);
+        Path out = uniquePath(dir, fileName);
+        Files.write(out, bytes);
+        if (bytes.length < all.length) {
+            System.err.println("WARNING: " + fileName + " truncated at " + maxBytes + " bytes");
+        }
+        return relativePath(out);
+    }
+
     private static Path safeResolve(Path dir, String name) throws IOException {
         if (!dir.isAbsolute()) {
             throw new IllegalArgumentException("dir must be an absolute path: " + dir);
@@ -3700,6 +3763,7 @@ for (int pageNum : pagesToProcess) {
     }
 
     private static String sanitizeFileName(String value) {
+        if (value == null) return "artifact";   // e.g. a field with no /T: NFKC normalize threw NPE out of callWith
         String normalized = Normalizer.normalize(value, Normalizer.Form.NFKC);
         // First: strip path traversal by taking only the last safe path component
         String[] parts = normalized.split("[/\\\\]");
@@ -3712,12 +3776,37 @@ for (int pageNum : pagesToProcess) {
             }
         }
         // Then: replace dangerous characters in the chosen component
-        String cleaned = component.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").replaceAll("\\s+", "_");
+        // \p{Cs}: an UNPAIRED surrogate (a valid pair matches as one code point, not Cs) makes
+        // Path.resolve throw InvalidPathException
+        String cleaned = component.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}\\p{Cs}]", "_").replaceAll("\\s+", "_");
         cleaned = cleaned.replaceAll("_+", "_");
         if (cleaned.isBlank()) {
             cleaned = "artifact";
         }
-        return cleaned.length() > 180 ? cleaned.substring(0, 180) : cleaned;
+        if (cleaned.length() <= 180 && utf8Length(cleaned) <= MAX_NAME_BYTES) return cleaned;
+        // Truncate the STEM and keep a short extension: the extension is what the artifact
+        // families match on (images_*/*-original.j?? vs a .png decode), and a cut that dropped
+        // '.png' let a hostile name end in '-original.jpg'. The cap is on chars AND on UTF-8
+        // bytes: NAME_MAX is 255 bytes, and a too-long name threw out of callWith (no report).
+        int dot = cleaned.lastIndexOf('.');
+        String ext = (dot > 0 && cleaned.length() - dot <= 16 && utf8Length(cleaned.substring(dot)) <= 32)
+                ? cleaned.substring(dot) : "";
+        String stem = cleaned.substring(0, cleaned.length() - ext.length());
+        int cut = Math.min(stem.length(), 180 - ext.length());
+        if (cut > 0 && cut < stem.length() && Character.isHighSurrogate(stem.charAt(cut - 1))) cut--;   // never split a pair
+        stem = stem.substring(0, cut);
+        int budget = MAX_NAME_BYTES - utf8Length(ext);
+        while (!stem.isEmpty() && utf8Length(stem) > budget) {
+            stem = stem.substring(0, stem.offsetByCodePoints(stem.length(), -1));   // drop one whole code point
+        }
+        return (stem.isEmpty() ? "artifact" : stem) + ext;
+    }
+
+    /** NAME_MAX (255 bytes) less room for uniquePath's "-NNNN" suffix. */
+    private static final int MAX_NAME_BYTES = 230;
+
+    private static int utf8Length(String s) {
+        return s.getBytes(StandardCharsets.UTF_8).length;
     }
 
     private static String normalizeUrl(String raw) {
@@ -5978,6 +6067,11 @@ for (int pageNum : pagesToProcess) {
         public List<String> flags;
         /** Path to artifact file containing the decoded payload (when base64 detected). */
         public String decodedArtifact;
+        /** Indicators found in the FULL decoded payload at decode time (the artifact file is capped
+         *  at MAX_SCRIPT_BYTES, and code past the cap must still be analysed). Only these small hits
+         *  are kept, never the payload, so the heap holds one payload at a time. Not serialised. */
+        @JsonIgnore
+        public transient List<JsIndicatorHit> decodedIndicators;
         /** SHA-256 of the decoded payload. */
         public String decodedSha256;
         /** Length of the decoded payload in bytes. */

@@ -464,6 +464,21 @@ job root, owned by UID 10001), and `BLASTBOX_MAX_METADATA=104857600` (titanarum 
 text, so the metadata envelope runs larger than the blastbox 4 MiB default — **must be identical on
 the api and every dispatcher**; the trust gate enforces equality).
 
+### Engine contract
+
+[`blastbox-engine.toml`](blastbox-engine.toml) states what the `titanarum` engine emits: every
+artifact family under `titan/` with its kind and caps, the payload node types, the warning codes a
+consumer turns into findings, Loadout's mapper, and a `[[gaps]]` list of what the output cannot
+express today (or what Loadout drops or refuses). `tests/conftest.py` checks every
+`TitanArumEngine.detonate()` the suite makes against it, and `tests/test_engine_contract.py` runs
+the AOT warmup corpus through the real jar (`-m jvm`). Both are inert on a blastbox release that
+predates the checker.
+
+```sh
+python -m blastbox.contract.engine_contract validate blastbox-engine.toml
+python -m blastbox.contract.engine_contract check blastbox-engine.toml <job output>/metadata.json
+```
+
 ---
 
 ## Extraction Features

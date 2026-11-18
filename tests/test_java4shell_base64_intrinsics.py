@@ -85,13 +85,13 @@ def test_runtime_images_set_java_tool_options(dockerfile):
     # in the FINAL (runtime) stage: an ENV in a build stage never reaches the shipped image
     text = (REPO / dockerfile).read_text()
     final = re.split(r"^FROM\b", text, flags=re.M)[-1]
-    m = re.search(r'^ENV JAVA_TOOL_OPTIONS="([^"]*)"', final, re.M)
-    assert m and _last_setting(m.group(1).split()) == FLAG, dockerfile
+    values = re.findall(r'^ENV JAVA_TOOL_OPTIONS="([^"]*)"', final, re.M)   # Docker keeps the LAST
+    assert values and _last_setting(values[-1].split()) == FLAG, dockerfile
 
 
 def test_cli_entrypoint_disables_the_intrinsic():
     text = (REPO / "deploy/docker/Dockerfile.titanarum-cli").read_text()
-    ep = next(ln for ln in text.splitlines() if ln.startswith("ENTRYPOINT"))
+    ep = [ln for ln in text.splitlines() if ln.startswith("ENTRYPOINT")][-1]   # the last one wins
     argv = json.loads(ep[len("ENTRYPOINT"):])
     assert _last_setting(_before_jar(argv)) == FLAG, argv
 

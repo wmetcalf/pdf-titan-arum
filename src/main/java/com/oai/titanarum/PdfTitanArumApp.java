@@ -3767,15 +3767,30 @@ for (int pageNum : pagesToProcess) {
         if (cleaned.isBlank()) {
             cleaned = "artifact";
         }
-        if (cleaned.length() <= 180) return cleaned;
+        if (cleaned.length() <= 180 && utf8Length(cleaned) <= MAX_NAME_BYTES) return cleaned;
         // Truncate the STEM and keep a short extension: the extension is what the artifact
         // families match on (images_*/*-original.j?? vs a .png decode), and a cut that dropped
-        // '.png' let a hostile name end in '-original.jpg'.
+        // '.png' let a hostile name end in '-original.jpg'. The cap is on chars AND on UTF-8
+        // bytes: NAME_MAX is 255 bytes, and a too-long name threw out of callWith (no report).
         int dot = cleaned.lastIndexOf('.');
-        String ext = (dot > 0 && cleaned.length() - dot <= 16) ? cleaned.substring(dot) : "";
-        int cut = 180 - ext.length();
-        if (Character.isHighSurrogate(cleaned.charAt(cut - 1))) cut--;   // never split a surrogate pair
-        return cleaned.substring(0, cut) + ext;
+        String ext = (dot > 0 && cleaned.length() - dot <= 16 && utf8Length(cleaned.substring(dot)) <= 32)
+                ? cleaned.substring(dot) : "";
+        String stem = cleaned.substring(0, cleaned.length() - ext.length());
+        int cut = Math.min(stem.length(), 180 - ext.length());
+        if (cut > 0 && cut < stem.length() && Character.isHighSurrogate(stem.charAt(cut - 1))) cut--;   // never split a pair
+        stem = stem.substring(0, cut);
+        int budget = MAX_NAME_BYTES - utf8Length(ext);
+        while (!stem.isEmpty() && utf8Length(stem) > budget) {
+            stem = stem.substring(0, stem.offsetByCodePoints(stem.length(), -1));   // drop one whole code point
+        }
+        return (stem.isEmpty() ? "artifact" : stem) + ext;
+    }
+
+    /** NAME_MAX (255 bytes) less room for uniquePath's "-NNNN" suffix. */
+    private static final int MAX_NAME_BYTES = 230;
+
+    private static int utf8Length(String s) {
+        return s.getBytes(StandardCharsets.UTF_8).length;
     }
 
     private static String normalizeUrl(String raw) {

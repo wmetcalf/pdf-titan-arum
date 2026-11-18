@@ -102,4 +102,21 @@ class ScriptArtifactCapTest {
         String lone = (String) m.invoke(null, "x\uD800y.js");
         dir.resolve(lone);
     }
+
+    @Test
+    void multibyteNamesFitNameMaxInBytes(@TempDir Path dir) throws Exception {
+        // NAME_MAX is 255 BYTES: 75+ CJK characters fit a 180-char cap but not the filesystem, and
+        // the FileSystemException escaped callWith (no report.json, engine_error)
+        Method m = PdfTitanArumApp.class.getDeclaredMethod("sanitizeFileName", String.class);
+        m.setAccessible(true);
+        for (String name : new String[]{"\u6F22".repeat(75) + ".js.txt", "\u6F22".repeat(180) + ".pdf",
+                "\uD83D\uDE00".repeat(90) + ".png", "a".repeat(300)}) {
+            String out = (String) m.invoke(null, name);
+            assertTrue(out.getBytes(StandardCharsets.UTF_8).length <= 230, out);
+            Files.createFile(dir.resolve(out));
+            Files.createFile(dir.resolve(out.replaceFirst("(\\.[^.]*)?$", "-9999$1")));   // uniquePath's suffix fits too
+        }
+        String ext = (String) m.invoke(null, "\u6F22".repeat(180) + ".pdf");
+        assertTrue(ext.endsWith(".pdf"), ext);
+    }
 }

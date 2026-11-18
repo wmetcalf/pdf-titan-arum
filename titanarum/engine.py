@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -722,16 +723,37 @@ def _distinct_first(hits: list[Any]) -> list[Any]:
     return first + rest
 
 
-def _split_distinct(ws: list[Warning]) -> tuple[list[Warning], list[Warning]]:
-    """(one warning per distinct (code, message), in order; the repeats)."""
+def _split_distinct(ws: Iterable[Warning], keep: int) -> list[list[Warning]]:
+    """[first warning of each distinct code, the other distinct (code, message), the repeats],
+    each holding at most ``keep`` (no more can be used under the cap): an attacker-sized finding
+    array is streamed through, never materialised as Warnings."""
+    codes: set[str] = set()
     seen: set[tuple[str, str]] = set()
-    first: list[Warning] = []
-    rest: list[Warning] = []
+    out: list[list[Warning]] = [[], [], []]
     for w in ws:
         key = (w.code, w.message)
-        (rest if key in seen else first).append(w)
-        seen.add(key)
-    return first, rest
+        level = 2 if key in seen else (1 if w.code in codes else 0)
+        if len(out[level]) < keep:
+            out[level].append(w)
+            seen.add(key)
+            codes.add(w.code)
+        if all(len(t) >= keep for t in out):
+            break
+    return out
+
+
+_RISKY_LAUNCH = re.compile(
+    r"\.(exe|com|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|hta|scr|pif|lnk|msi|dll|cpl)$", re.I)
+
+
+def _launch_rank(hit: Any) -> int:
+    """A /Launch with parameters, or of an executable / script, ahead of plain document opens: N
+    distinct decoy opens must not displace the one that runs a command."""
+    if not isinstance(hit, dict):
+        return 1
+    risky = bool(str(hit.get("parameters") or "").strip()) or bool(
+        _RISKY_LAUNCH.search(str(hit.get("file") or "").strip()))
+    return 0 if risky else 1
 
 
 def _structural_rank(hit: Any) -> int:
@@ -770,14 +792,15 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
          lambda i: Warning(code=_clip(f"js_indicator.{i.get('type','')}", 64),
                            message=_clip(f"{i.get('indicator','')}: {i.get('detail','')}", 2000),
                            context=_clip(i.get("context", ""), 255) or None)),
-        (report.get("launchActions"),
+        (_ranked(report.get("launchActions"), _launch_rank),
          lambda i: Warning(code="launch_action",
                            message=_clip(f"{i.get('operation','')} {i.get('file','')} "
                                          f"{i.get('parameters','')}", 2000))),
         (report.get("actions"),
          lambda i: Warning(code=_clip(f"action.{i.get('type','')}", 64),
                            message=_clip(i.get("target") or i.get("submitUrl")
-                                         or i.get("remoteFile") or "", 2000))),
+                                         or i.get("remoteFile") or i.get("importFile")
+                                         or i.get("embeddedTarget") or "", 2000))),
         ([e for e in (report.get("embeddedFiles") or []) if e.get("mimeTypeMismatch")],
          lambda i: Warning(code="embedded_mismatch",
                            message=_clip(f"{i.get('originalName','')}: "
@@ -817,22 +840,20 @@ def _build_warnings(report: dict, *, cap: int = 200) -> list[Warning]:
     # /Launch or /URI dict referenced from N annotations yields N identical hits, which must not
     # displace a different finding of the same family or of a lower-severity one.
     slots = max(cap - 1 - len(warns), 0)
-    split = [_split_distinct([make(it) for it in items]) for items, make in families]
+    # Tiers, each in severity (family) order: one per family, then one per distinct CODE (a new
+    # action / js type), then every other distinct (code, message), then the repeats -- so neither
+    # identical hits (one dict referenced from N annotations) nor N distinct decoys of one code
+    # (N different URI links) can displace a finding of another code.
+    tiers = [_split_distinct((make(it) for it in items), keep=slots) for items, make in families]
     taken: list[list[Warning]] = [[] for _ in families]
-    for i, (first, _) in enumerate(split):        # 1. one per non-empty family
-        if first and slots:
-            taken[i].append(first[0])
-            slots -= 1
-    for i, (first, _) in enumerate(split):        # 2. the other distinct findings
-        n = min(len(first) - len(taken[i]), slots)
-        if n > 0:
-            taken[i].extend(first[len(taken[i]):len(taken[i]) + n])
-            slots -= n
-    for i, (_, rest) in enumerate(split):         # 3. the repeats
-        n = min(len(rest), slots)
-        if n > 0:
-            taken[i].extend(rest[:n])
-            slots -= n
+    pools = ([t[0][:1] for t in tiers], [t[0][1:] for t in tiers],   # floor; other new codes
+             [t[1] for t in tiers], [t[2] for t in tiers])          # other messages; repeats
+    for level in pools:
+        for i, pool in enumerate(level):
+            n = min(len(pool), slots)
+            if n > 0:
+                taken[i].extend(pool[:n])
+                slots -= n
     for t in taken:
         warns.extend(t)
     if cap > 0:

@@ -147,7 +147,7 @@ schema_version = "1"
 code = "js_indicator.*"
 severity = "high"
 source = "warnings[].code = 'js_indicator.' + report.jsIndicators[].type (suspicious_api, jseff_obfuscation, cve_detection, executable_dropper, suspicious_action, suspicious_structure)"
-description = "JavaScript indicator; message is '<indicator>: <detail>', context the matched snippet."
+description = "JavaScript indicator; message is '<indicator>: <detail>', context the script's location label (e.g. catalog.openAction, formField[x].decodedPayload), not the matched code."
 
 [[detections]]
 code = "launch_action"
@@ -219,7 +219,7 @@ description = "The JVM watchdog fired; the report is partial."
 code = "warnings_truncated"
 severity = "info"
 source = "warnings[].code == 'warnings_truncated' (last entry, when the 200-entry warning cap was hit)"
-description = "Over the cap, every non-empty finding family keeps at least one entry, then every distinct finding (code + message) in severity order, then the repeats (within js_indicator: one hit per distinct indicator before any repeat, cve_detection and executable_dropper first, suspicious_api last; within structural, budget trips first); the dropped findings remain in report.json."
+description = "Over the cap, every non-empty finding family keeps at least one entry, then one per distinct code, then every other distinct finding (code + message), each in severity order, then the repeats (within js_indicator: one hit per distinct indicator before any repeat, cve_detection and executable_dropper first, suspicious_api last; within structural, budget trips first); the dropped findings remain in report.json."
 
 # --- gaps ------------------------------------------------------------------------------------
 [[gaps]]
@@ -240,7 +240,7 @@ description = "The blastbox host trust gate seals with its Limits defaults (max_
 
 [[gaps]]
 id = "artifact-counts-uncapped"
-description = "Only the image budget (screenshots + images, TITANARUM_MAX_IMAGES_EXTRACTED, default 2000) and the page selection (MAX_PAGES_ALL = 1000, for 'all' and explicit ranges alike) bound a count. Attachments, scripts, XFA and launch-action files have no count cap; no family but scripts/xfa/attachments/original image bytes has a byte cap, and report.json has none. Left for an owner decision on the cap values (Loadout's tighter limits are being fixed consumer-side)."
+description = "The image families' max_count values assume the DEFAULT image budget (TITANARUM_MAX_IMAGES_EXTRACTED=2000): an operator who raises it must raise them with it, or the checker refuses conformant output. Only the image budget (screenshots + images, TITANARUM_MAX_IMAGES_EXTRACTED, default 2000) and the page selection (MAX_PAGES_ALL = 1000, for 'all' and explicit ranges alike) bound a count. Attachments, scripts, XFA and launch-action files have no count cap; no family but scripts/xfa/attachments/original image bytes has a byte cap, and report.json has none. Left for an owner decision on the cap values (Loadout's tighter limits are being fixed consumer-side)."
 
 [[gaps]]
 id = "revision-renders-not-pages"

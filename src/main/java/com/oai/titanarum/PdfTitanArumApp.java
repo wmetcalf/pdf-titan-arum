@@ -1765,6 +1765,7 @@ private boolean skipQrScan;
      */
     private List<FormFieldHit> extractFormFields(PDDocument document, Path scriptsDir) throws IOException {
         List<FormFieldHit> hits = new ArrayList<>();
+        Map<String, String> decodedTextBySha = new HashMap<>();
         PDAcroForm acroForm = document.getDocumentCatalog().getAcroForm();
         if (acroForm == null) return hits;
 
@@ -1837,12 +1838,20 @@ private boolean skipQrScan;
                                 break;
                             }
                         }
+                        // The FULL payload is analysed from memory (the artifact file is capped at
+                        // MAX_SCRIPT_BYTES), decoded leniently for text AND binary payloads: one invalid
+                        // byte inside a JS comment must not hide the code around it. Fields that share one
+                        // payload (/V through an indirect reference) share ONE String, so the heap stays
+                        // O(distinct payloads), not O(fields x payload).
+                        hit.decodedText = decodedTextBySha.computeIfAbsent(hit.decodedSha256,
+                                k -> new String(decoded, StandardCharsets.UTF_8));
                         if (looksText) {
-                            hit.decodedText = new String(decoded, StandardCharsets.UTF_8);
                             hit.decodedArtifact = writeCappedTextArtifact(scriptsDir, artifactName + ".js.txt",
                                 hit.decodedText, MAX_SCRIPT_BYTES);
                         } else {
-                            Path binPath = scriptsDir.resolve(artifactName + ".bin");
+                            // uniquePath, like the text branch: two field names that sanitise alike
+                            // overwrote one .bin, and the first payload was lost
+                            Path binPath = uniquePath(scriptsDir, artifactName + ".bin");
                             Files.write(binPath, decoded.length > MAX_SCRIPT_BYTES
                                     ? java.util.Arrays.copyOf(decoded, MAX_SCRIPT_BYTES) : decoded);
                             hit.decodedArtifact = relativePath(binPath);
@@ -3756,7 +3765,13 @@ for (int pageNum : pagesToProcess) {
         if (cleaned.isBlank()) {
             cleaned = "artifact";
         }
-        return cleaned.length() > 180 ? cleaned.substring(0, 180) : cleaned;
+        if (cleaned.length() <= 180) return cleaned;
+        // Truncate the STEM and keep a short extension: the extension is what the artifact
+        // families match on (images_*/*-original.j?? vs a .png decode), and a cut that dropped
+        // '.png' let a hostile name end in '-original.jpg'.
+        int dot = cleaned.lastIndexOf('.');
+        String ext = (dot > 0 && cleaned.length() - dot <= 16) ? cleaned.substring(dot) : "";
+        return cleaned.substring(0, 180 - ext.length()) + ext;
     }
 
     private static String normalizeUrl(String raw) {

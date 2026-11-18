@@ -86,7 +86,9 @@ def test_detection_is_a_type_and_a_mime():
 
 
 def test_detection_of_a_non_pdf_is_not_pdf():
-    det = eng._build_detection(_report(fileMagic="Zip archive (DOCX/XLSX/JAR/APK)"))
+    # a non-PDF is the JVM's "no %PDF header in the first 1024 bytes" report
+    det = eng._build_detection(_report(fileMagic="Zip archive (DOCX/XLSX/JAR/APK)",
+                                       parseError="File does not contain a PDF header"))
     assert (det.label, det.mime, det.confidence) == ("unknown", "application/octet-stream", 0.0)
     det = eng._build_detection(_report(fileMagic=""))
     assert det.label == "unknown"
@@ -144,3 +146,12 @@ def test_detection_of_a_pdf_behind_leading_junk_is_pdf():
                               "offset": 7}]))
     assert (det.label, det.mime) == ("pdf", "application/pdf")
     assert 0.0 < det.confidence < 1.0
+
+
+def test_detection_of_a_junk_prefixed_pdf_that_stopped_early_is_pdf():
+    # encrypted / parse-error reports return before the structural anomalies are computed, so they
+    # carry no header_offset; the JVM still found %PDF (else parseError says there is no header)
+    det = eng._build_detection(_report(
+        fileMagic="unknown (magic: 4a 55 4e 4b)",
+        parseError="PDF is password-protected (use --password to supply one)"))
+    assert (det.label, det.mime) == ("pdf", "application/pdf") and det.confidence < 1.0

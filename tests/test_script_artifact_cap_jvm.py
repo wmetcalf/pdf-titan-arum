@@ -67,8 +67,10 @@ def test_a_javascript_string_over_the_cap_is_written_capped(tmp_path, monkeypatc
 
 
 @pytest.mark.jvm
-def test_a_form_payload_past_the_cap_is_still_analysed(tmp_path, monkeypatch):
-    payload = b" " * (CAP + 3) + b"this.exportDataObject({cName:'x'});"
+# a \x01 in the first 512 bytes classifies the payload binary (.bin)
+@pytest.mark.parametrize("lead", [b"", b"\x01"])
+def test_a_form_payload_past_the_cap_is_still_analysed(tmp_path, monkeypatch, lead):
+    payload = lead + b" " * (CAP + 3) + b"this.exportDataObject({cName:'x'});"
     payload += b" " * (-len(payload) % 3)
     name = base64.b64encode(payload).replace(b"/", b"#2F").replace(b"+", b"#2B")
     titan, report = _run(tmp_path, monkeypatch, _pdf([
@@ -83,3 +85,40 @@ def test_a_form_payload_past_the_cap_is_still_analysed(tmp_path, monkeypatch):
             if j.get("indicator") == "exportDataObject"
             and "decodedPayload" in (j.get("context") or "")]
     assert hits, report.get("jsIndicators")
+
+
+def _form_pdf(fields: list[tuple[bytes, bytes]]) -> bytes:
+    """A one-page PDF whose AcroForm fields are (/T name, /V Name payload) widgets."""
+    refs = b" ".join(b"%d 0 R" % (4 + i) for i in range(len(fields)))
+    objs = [b"<</Type/Catalog/Pages 2 0 R/AcroForm<</Fields[" + refs + b"]>>>>",
+            b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Annots[" + refs + b"]>>"]
+    for t, payload in fields:
+        name = base64.b64encode(payload).replace(b"/", b"#2F").replace(b"+", b"#2B")
+        objs.append(b"<</Type/Annot/Subtype/Widget/FT/Tx/T(" + t
+                    + b")/Rect[0 0 0 0]/P 3 0 R/V/" + name + b">>")
+    return _pdf(objs)
+
+
+def _indicators(report: dict, field: str) -> set[str]:
+    return {j.get("indicator") for j in report.get("jsIndicators") or []
+            if f"formField[{field}]" in (j.get("context") or "")}
+
+
+@pytest.mark.jvm
+def test_a_binary_payload_with_invalid_utf8_is_still_analysed(tmp_path, monkeypatch):
+    # a control byte makes it .bin; an invalid UTF-8 byte inside a JS comment made the strict
+    # re-read throw, so the payload was not analysed at all
+    payload = b"/*\x01\xff*/ this.exportDataObject({cName:'x', nLaunch:2});" + b" " * 64
+    _, report = _run(tmp_path, monkeypatch, _form_pdf([(b"p", payload)]))
+    assert "exportDataObject" in _indicators(report, "p")
+
+
+@pytest.mark.jvm
+def test_same_named_binary_payloads_keep_both_files(tmp_path, monkeypatch):
+    a = b"/*\x01*/ this.exportDataObject({cName:'x'});" + b" " * 64
+    b = b"/*\x01*/ var x = 1;" + b" " * 64
+    titan, report = _run(tmp_path, monkeypatch, _form_pdf([(b"a b", a), (b"a_b", b)]))
+    arts = [f.get("decodedArtifact") for f in report.get("formFields") or []]
+    assert len(arts) == 2 and len(set(arts)) == 2, arts
+    assert "exportDataObject" in _indicators(report, "a b")

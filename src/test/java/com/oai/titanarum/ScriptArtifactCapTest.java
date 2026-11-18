@@ -65,4 +65,17 @@ class ScriptArtifactCapTest {
         assertTrue(Files.isRegularFile(out));
         assertEquals(1024, Files.size(out));
     }
+
+    @Test
+    void longNamesKeepTheirExtensionWhenTruncated() throws Exception {
+        // a cut at 180 that dropped '.png' let a hostile XObject name end the decode's file name in
+        // '-original.jpg', moving an uncapped PNG into the original-codestream family
+        Method m = PdfTitanArumApp.class.getDeclaredMethod("sanitizeFileName", String.class);
+        m.setAccessible(true);
+        String name = "resource-page-0001--original" + "A".repeat(139) + "-original.jpgZZZZ.png";
+        String out = (String) m.invoke(null, name);
+        assertTrue(out.length() <= 180, out);
+        assertTrue(out.endsWith(".png"), out);
+        assertEquals("short.png", m.invoke(null, "short.png"));
+    }
 }

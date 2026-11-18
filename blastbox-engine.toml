@@ -79,7 +79,7 @@ kind = "script"
 max_count = 0
 max_bytes = 10485760
 role = "javascript"
-description = "Each JavaScript action/name-tree/form-field script (and decoded base64 form payload), its written bytes truncated at MAX_SCRIPT_BYTES by the writer; the report hit's sha256 is of the untruncated code."
+description = "Each JavaScript action/name-tree/form-field script (and decoded base64 form payload), its written bytes truncated at MAX_SCRIPT_BYTES by the writer. A COSString script's hit sha256 is of the untruncated code; a /JS stream is read only up to MAX_SCRIPT_BYTES, so its hit (code and sha256) is already truncated, and nothing in the report marks that."
 
 [[artifacts]]
 id = "titan_xfa_*"
@@ -228,6 +228,10 @@ description = "Every finding is a blastbox Warning: no severity, no confidence, 
 [[gaps]]
 id = "payload-omits-report"
 description = "The payload carries only a counts summary, embedded-file nodes and screenshot Pages. URLs, page text, phone numbers, emails, tables, scripts, actions, revisions and resource images exist only in titan/report.json, which a consumer must fetch and parse itself. Left: Loadout reads these from report.json today; duplicating them as typed nodes is a payload-budget design decision."
+
+[[gaps]]
+id = "host-trust-gate-caps"
+description = "The blastbox host trust gate seals with its Limits defaults (max_artifacts 1000, max_artifact_bytes 50 MiB, 500 MiB total) and this repo's deploy configs raise only BLASTBOX_MAX_METADATA. A result inside this contract (up to 4000 image files, 100 MiB attachments / original codestreams) can therefore be refused whole by the host before any consumer sees it. Owner decision: raise BLASTBOX_MAX_ARTIFACTS / _ARTIFACT_BYTES / _TOTAL_BYTES in the deploy configs, or tighten the engine's budgets to the host's."
 
 [[gaps]]
 id = "artifact-counts-uncapped"

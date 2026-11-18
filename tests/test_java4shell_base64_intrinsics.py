@@ -87,6 +87,10 @@ def test_runtime_images_set_java_tool_options(dockerfile):
     final = re.split(r"^FROM\b", text, flags=re.M)[-1]
     values = re.findall(r'^ENV JAVA_TOOL_OPTIONS="([^"]*)"', final, re.M)   # Docker keeps the LAST
     assert values and _last_setting(values[-1].split()) == FLAG, dockerfile
+    # any other spelling (multi-key ENV, unquoted, `ENV KEY value`) would be invisible to the
+    # regex above: allow only the canonical form in the runtime stage
+    code = [ln for ln in final.splitlines() if not ln.lstrip().startswith("#")]
+    assert sum(ln.count("JAVA_TOOL_OPTIONS") for ln in code) == len(values), dockerfile
 
 
 def test_cli_entrypoint_disables_the_intrinsic():
@@ -100,6 +104,24 @@ def test_server_entrypoint_disables_the_intrinsic():
     text = (REPO / "docker-entrypoint.sh").read_text()
     launches = [ln for ln in text.splitlines() if re.match(r"\s*exec java\b", ln)]
     assert launches and all(_last_setting(_before_jar(ln.split())) == FLAG for ln in launches)
+
+
+@pytest.mark.parametrize("given", [None, "-Xss2m -XX:+UseBASE64Intrinsics"])
+def test_server_entrypoint_reasserts_the_flag_in_underscore_java_options(tmp_path, given):
+    # HotSpot applies _JAVA_OPTIONS after argv: the server (C2, long-lived, decodes hostile PDFs
+    # in-process) must end it with the OFF flag when it is set, and leave it unset otherwise
+    fake = tmp_path / "java"
+    fake.write_text('#!/bin/sh\nprintf "%s" "${_JAVA_OPTIONS-<unset>}"\n')
+    fake.chmod(0o755)
+    env = {"PATH": f"{tmp_path}:/usr/bin:/bin", "DB_URL": "x", "DB_USER": "x", "DB_PASSWORD": "x"}
+    if given is not None:
+        env["_JAVA_OPTIONS"] = given
+    out = subprocess.run(["sh", str(REPO / "docker-entrypoint.sh")], env=env, capture_output=True,
+                         text=True, timeout=30, check=True).stdout
+    if given is None:
+        assert out == "<unset>"
+    else:
+        assert out.startswith(given) and out.split()[-1] == FLAG
 
 
 def test_fc_guest_env_sets_java_tool_options():
